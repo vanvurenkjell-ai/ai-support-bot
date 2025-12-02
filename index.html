@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Advantum Support Bot</title>
+  <style>
+    :root {
+      /* These default values will be overwritten by /widget-config */
+      --primary-color: #2563eb;
+      --accent-color: #16a34a;
+    }
+
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 0;
+      background: #f4f4f5;
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .chat-card {
+      width: 100%;
+      max-width: 420px;
+      background: #ffffff;
+      border-radius: 16px;
+      box-shadow: 0 10px 40px rgba(15, 23, 42, 0.18);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .chat-header {
+      padding: 14px 18px;
+      background: var(--primary-color);
+      color: #ffffff;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .chat-title {
+      font-size: 15px;
+      font-weight: 600;
+    }
+
+    .chat-subtitle {
+      font-size: 11px;
+      opacity: 0.85;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent-color);
+      margin-left: 5px;
+    }
+
+    .chat-body {
+      padding: 12px 16px;
+      background: #f9fafb;
+      border-bottom: 1px solid #e4e4e7;
+    }
+
+    #chat-box {
+      background: #ffffff;
+      padding: 12px 16px;
+      height: 320px;
+      overflow-y: auto;
+    }
+
+    .message {
+      margin-bottom: 16px;
+      line-height: 1.4;
+      font-size: 13px;
+    }
+
+    .user-label,
+    .bot-label {
+      font-size: 11px;
+      font-weight: 600;
+      margin-bottom: 4px;
+      color: #0f172a;
+    }
+
+    .user-message {
+      background: #e0f2fe;
+      padding: 8px 10px;
+      border-radius: 10px;
+      display: inline-block;
+      max-width: 90%;
+    }
+
+    .bot-message {
+      background: #dcfce7;
+      padding: 8px 10px;
+      border-radius: 10px;
+      display: inline-block;
+      max-width: 90%;
+    }
+
+    #input-row {
+      display: flex;
+      gap: 8px;
+      padding: 10px;
+      background: #f9fafb;
+      border-top: 1px solid #e4e4e7;
+    }
+
+    #message-input {
+      flex: 1;
+      padding: 8px 10px;
+      border-radius: 999px;
+      border: 1px solid #d4d4d8;
+      font-size: 13px;
+    }
+
+    #message-input:focus {
+      border-color: var(--primary-color);
+      outline: none;
+    }
+
+    #send-button {
+      padding: 8px 16px;
+      border-radius: 999px;
+      border: none;
+      background: var(--primary-color);
+      color: white;
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    #send-button:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+  </style>
+</head>
+<body>
+  <div class="chat-card">
+    <div class="chat-header">
+      <div>
+        <div class="chat-title" id="chat-title">Support</div>
+        <div class="chat-subtitle" id="chat-subtitle">AI assistant</div>
+      </div>
+      <div style="display:flex;align-items:center;">
+        <span style="font-size:11px;">Online</span>
+        <span class="status-dot"></span>
+      </div>
+    </div>
+
+    <div class="chat-body">
+      <p id="chat-greeting">
+        Ask anything about orders, shipping, returns or how to use our equipment.
+      </p>
+    </div>
+
+    <div id="chat-box"></div>
+
+    <div id="input-row">
+      <input id="message-input" type="text" placeholder="Type your question…" />
+      <button id="send-button">Send</button>
+    </div>
+  </div>
+
+  <script>
+    const chatBox = document.getElementById("chat-box");
+    const input = document.getElementById("message-input");
+    const sendButton = document.getElementById("send-button");
+
+    const titleEl = document.getElementById("chat-title");
+    const subtitleEl = document.getElementById("chat-subtitle");
+    const greetingEl = document.getElementById("chat-greeting");
+
+    // Client ID for this widget (important for multi-client backend)
+    const clientId = "Advantum";
+    // Generate a sessionId that stays the same while this page is open
+    const sessionId =
+      (window.crypto && window.crypto.randomUUID)
+        ? window.crypto.randomUUID()
+        : Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+    // ---- Load widget config from backend (title, greeting, colors) ----
+    async function loadWidgetConfig() {
+      try {
+        const res = await fetch(
+          "http://localhost:3001/widget-config?client=" + encodeURIComponent(clientId)
+        );
+        const cfg = await res.json();
+
+        // Set text
+        titleEl.textContent = cfg.widgetTitle || "Support";
+        subtitleEl.textContent = cfg.brandName || "Support";
+        greetingEl.textContent =
+          cfg.widgetGreeting ||
+          "Ask anything about orders, shipping, returns or how to use our equipment.";
+
+        // Set colors via CSS variables
+        const root = document.documentElement;
+        if (cfg.primaryColor) {
+          root.style.setProperty("--primary-color", cfg.primaryColor);
+        }
+        if (cfg.accentColor) {
+          root.style.setProperty("--accent-color", cfg.accentColor);
+        }
+      } catch (err) {
+        console.error("Error loading widget config:", err);
+        // If it fails, we just keep the default design
+      }
+    }
+
+    function addMessage(who, text) {
+      const div = document.createElement("div");
+      div.classList.add("message");
+
+      const label = document.createElement("div");
+      label.classList.add(who === "You" ? "user-label" : "bot-label");
+      label.textContent = who === "You" ? "You" : titleEl.textContent + " Assistant";
+
+      const bubble = document.createElement("div");
+      bubble.classList.add(who === "You" ? "user-message" : "bot-message");
+      bubble.textContent = text;
+
+      div.appendChild(label);
+      div.appendChild(bubble);
+
+      chatBox.appendChild(div);
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    async function sendMessage() {
+      const text = input.value.trim();
+      if (!text) return;
+
+      addMessage("You", text);
+      input.value = "";
+      sendButton.disabled = true;
+
+      try {
+        const response = await fetch(
+          "http://localhost:3001/chat?client=" + encodeURIComponent(clientId),
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: text, sessionId }),
+          }
+        );
+
+        const data = await response.json();
+        const reply = data.reply || data.error || "Unexpected error from server.";
+        addMessage("Bot", reply);
+      } catch (err) {
+        console.error(err);
+        addMessage("Bot", "Network error talking to the backend.");
+      }
+
+      sendButton.disabled = false;
+      input.focus();
+    }
+
+    sendButton.addEventListener("click", sendMessage);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") sendMessage();
+    });
+
+    // Load config on page load
+    loadWidgetConfig();
+  </script>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+

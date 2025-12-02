@@ -1,0 +1,9 @@
+{
+  "brandName": "testbrand",
+  "supportEmail": "support@testbrand.com",
+  "contactFormUrl": "https://testbrand.com/contact",
+  "widgetTitle": "testbrand Support",
+  "widgetGreeting": "Welcome to testbrand. How can we help you?",
+  "primaryColor": "#ff0000",
+  "accentColor": "#00ff00"
+}

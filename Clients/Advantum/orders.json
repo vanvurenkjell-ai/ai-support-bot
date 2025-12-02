@@ -1,0 +1,20 @@
+[
+  {
+    "orderNumber": "12345",
+    "email": "testcustomer1@example.com",
+    "name": "Test Customer One",
+    "status": "Shipped",
+    "carrier": "PostNL",
+    "tracking": "3SKAB1234567",
+    "expectedDelivery": "2025-12-01"
+  },
+  {
+    "orderNumber": "98765",
+    "email": "testcustomer2@example.com",
+    "name": "Test Customer Two",
+    "status": "Processing",
+    "carrier": null,
+    "tracking": null,
+    "expectedDelivery": null
+  }
+]

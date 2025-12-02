@@ -1,0 +1,22 @@
+[
+  {
+    "timestamp": "2025-11-27T16:30:52.049Z",
+    "message": "wie ben jij",
+    "intent": "general",
+    "orderNumber": "",
+    "trackingCode": "",
+    "responseLength": 139,
+    "durationMs": 1971,
+    "error": false
+  },
+  {
+    "timestamp": "2025-11-27T16:31:05.222Z",
+    "message": "waar is order 12345",
+    "intent": "shipping_or_order",
+    "orderNumber": "12345",
+    "trackingCode": "",
+    "responseLength": 144,
+    "durationMs": 3333,
+    "error": false
+  }
+]

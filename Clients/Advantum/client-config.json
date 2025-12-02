@@ -1,0 +1,9 @@
+{
+  "brandName": "Advantum",
+  "supportEmail": "info@advantum.nl",
+  "contactFormUrl": "https://advantum.nl/pages/contact", 
+  "widgetTitle": "Advantum Support",
+  "widgetGreeting": "Hi, I'm the Advantum support assistant. Ask me anything about your order, shipping, returns or how to use our equipment.",
+  "primaryColor": "#000000",
+  "accentColor": "#2563eb"
+}
