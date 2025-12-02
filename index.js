@@ -5,7 +5,8 @@ require("dotenv").config();
 const OpenAI = require("openai");
 
 const app = express();
-const port = 3001;
+// use host-provided PORT in production, 3001 locally
+const port = process.env.PORT || 3001;
 
 app.use(cors());
 app.use(express.json());
@@ -78,7 +79,8 @@ async function loadClientData(clientId) {
     return clients[clientId];
   }
 
-  const basePath = `../Clients/${clientId}`;
+  // IMPORTANT: index.js and Clients folder are in same directory
+  const basePath = `./Clients/${clientId}`;
 
   try {
     const faq = fs.readFileSync(`${basePath}/FAQ.md`, "utf8");
@@ -93,7 +95,11 @@ async function loadClientData(clientId) {
     try {
       const ordersRaw = fs.readFileSync(`${basePath}/orders.json`, "utf8");
       orders = JSON.parse(ordersRaw);
-      console.log(`[${clientId}] Loaded orders.json with`, orders.length, "orders.");
+      console.log(
+        `[${clientId}] Loaded orders.json with`,
+        orders.length,
+        "orders."
+      );
     } catch (err) {
       console.warn(
         `[${clientId}] No orders.json found or invalid JSON. Offline order lookup disabled.`,
@@ -168,8 +174,13 @@ async function loadClientData(clientId) {
 async function getRelevantContext(question, topK, clientId) {
   const clientData = await loadClientData(clientId);
 
-  if (!clientData.knowledgeEmbeddings || clientData.knowledgeEmbeddings.length === 0) {
-    console.warn(`[${clientId}] No embeddings available → returning empty context.`);
+  if (
+    !clientData.knowledgeEmbeddings ||
+    clientData.knowledgeEmbeddings.length === 0
+  ) {
+    console.warn(
+      `[${clientId}] No embeddings available → returning empty context.`
+    );
     return "";
   }
 
@@ -303,7 +314,8 @@ function findOrder(orderNumber, clientData) {
 // ---------- ANALYTICS LOGGING (JSON PER CLIENT) ----------
 
 function logAnalytics(clientId, entry) {
-  const basePath = `../Clients/${clientId}`;
+  // same base folder logic as loadClientData
+  const basePath = `./Clients/${clientId}`;
   const filePath = `${basePath}/analytics.json`;
 
   try {
