@@ -25,8 +25,8 @@ function loadClient(clientId) {
 
   const faq = fs.readFileSync(`${basePath}/FAQ.md`, "utf8");
   const policies = fs.readFileSync(`${basePath}/Policies.md`, "utf8");
-  const products = fs.readFileSync(`${basePath}/Product Samples.md`, "utf8`);
-  const brandVoice = fs.readFileSync(`${basePath}/Brand voice.md`, "utf8`);
+  const products = fs.readFileSync(`${basePath}/Product Samples.md`, "utf8");
+  const brandVoice = fs.readFileSync(`${basePath}/Brand voice.md`, "utf8");
   const clientConfig = JSON.parse(
     fs.readFileSync(`${basePath}/client-config.json`, "utf8")
   );
