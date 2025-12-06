@@ -87,9 +87,13 @@ function detectIntent(userMessage) {
   const hasReturn = returnKeywords.some((k) => text.includes(k));
   const hasUse = useKeywords.some((k) => text.includes(k));
 
-  // VERY SIMPLE: find a chunk containing digits (we'll improve later)
-  const orderMatch = userMessage.match(/[A-Z0-9][A-Z0-9\- ]{2,}[0-9]/i);
-  const orderNumber = orderMatch ? orderMatch[0].trim() : "";
+  // Extract an order-like number:
+  // take the last number sequence (with optional spaces/dashes)
+  let orderNumber = "";
+  const numberMatches = userMessage.match(/(\d[\d\- ]*\d)/g);
+  if (numberMatches && numberMatches.length > 0) {
+    orderNumber = numberMatches[numberMatches.length - 1].trim();
+  }
 
   let mainIntent = "general";
   if (hasShipping || orderNumber) mainIntent = "shipping_or_order";
@@ -113,6 +117,11 @@ async function lookupShopifyOrder(orderNumber) {
   }
   if (!orderNumber) return null;
 
+  // Shopify "name" is usually like "#1055"
+  const nameParam = orderNumber.startsWith("#")
+    ? orderNumber
+    : `#${orderNumber}`;
+
   try {
     const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/orders.json`;
     const res = await axios.get(url, {
@@ -120,7 +129,7 @@ async function lookupShopifyOrder(orderNumber) {
         "X-Shopify-Access-Token": SHOPIFY_API_TOKEN,
       },
       params: {
-        name: orderNumber, // search by order "name" like #1001 / 1001
+        name: nameParam,
         status: "any",
       },
     });
@@ -130,17 +139,22 @@ async function lookupShopifyOrder(orderNumber) {
 
     const order = orders[0];
 
-    const fulfillment = order.fulfillments && order.fulfillments[0]
-      ? order.fulfillments[0]
-      : null;
+    const fulfillment =
+      order.fulfillments && order.fulfillments[0]
+        ? order.fulfillments[0]
+        : null;
 
-    const tracking = fulfillment && fulfillment.tracking_numbers && fulfillment.tracking_numbers[0]
-      ? fulfillment.tracking_numbers[0]
-      : null;
+    const tracking =
+      fulfillment &&
+      fulfillment.tracking_numbers &&
+      fulfillment.tracking_numbers[0]
+        ? fulfillment.tracking_numbers[0]
+        : null;
 
-    const trackingUrl = fulfillment && fulfillment.tracking_urls && fulfillment.tracking_urls[0]
-      ? fulfillment.tracking_urls[0]
-      : null;
+    const trackingUrl =
+      fulfillment && fulfillment.tracking_urls && fulfillment.tracking_urls[0]
+        ? fulfillment.tracking_urls[0]
+        : null;
 
     return {
       orderName: order.name || null,
@@ -225,6 +239,7 @@ ${data.products}
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
+
 
 
 
