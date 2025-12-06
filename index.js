@@ -16,12 +16,13 @@ if (!process.env.OPENAI_API_KEY) {
 }
 
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
 // ---- Load client files ----
 function loadClient(clientId) {
-  const basePath = `../Clients/${clientId}`;
+  // IMPORTANT: Clients folder is in the SAME directory as index.js
+  const basePath = `./Clients/${clientId}`;
 
   const faq = fs.readFileSync(`${basePath}/FAQ.md`, "utf8");
   const policies = fs.readFileSync(`${basePath}/Policies.md`, "utf8");
@@ -44,7 +45,6 @@ app.post("/chat", async (req, res) => {
   const clientId = req.query.client || "Advantum";
 
   try {
-    // Load data
     const data = loadClient(clientId);
 
     const systemPrompt = `
@@ -70,14 +70,13 @@ ${data.products}
       model: "gpt-4.1-mini",
       messages: [
         { role: "system", content: systemPrompt },
-        { role: "user", content: message }
-      ]
+        { role: "user", content: message },
+      ],
     });
 
     return res.json({
-      reply: response.choices[0].message.content
+      reply: response.choices[0].message.content,
     });
-
   } catch (err) {
     console.error("Chat error:", err.message);
     return res.status(500).json({ error: "Server error" });
@@ -87,7 +86,6 @@ ${data.products}
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
-
 
 
 
