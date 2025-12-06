@@ -21,7 +21,7 @@ const openai = new OpenAI({
 
 // ---- Load client files ----
 function loadClient(clientId) {
-  // IMPORTANT: Clients folder is in the SAME directory as index.js
+  // Clients folder is in the SAME directory as index.js
   const basePath = `./Clients/${clientId}`;
 
   const faq = fs.readFileSync(`${basePath}/FAQ.md`, "utf8");
@@ -35,6 +35,72 @@ function loadClient(clientId) {
   return { faq, policies, products, brandVoice, clientConfig };
 }
 
+// ---- Simple intent + order detection ----
+function detectIntent(userMessage) {
+  const text = (userMessage || "").toLowerCase();
+
+  const shippingKeywords = [
+    "verzending",
+    "bezorging",
+    "bezorgd",
+    "pakket",
+    "track",
+    "trace",
+    "where is my order",
+    "waar is mijn bestelling",
+    "zending",
+    "levering",
+    "shipment",
+    "delivery",
+    "shipping",
+  ];
+
+  const returnKeywords = [
+    "retour",
+    "retourneren",
+    "terugsturen",
+    "omruilen",
+    "herroepingsrecht",
+    "bedenktijd",
+    "refund",
+    "geld terug",
+    "money back",
+  ];
+
+  const useKeywords = [
+    "hoe gebruik ik",
+    "hoe moet ik",
+    "hoe doe ik",
+    "how do i use",
+    "how to use",
+    "gebruiken",
+    "uitleg",
+    "tutorial",
+  ];
+
+  const hasShipping = shippingKeywords.some((k) => text.includes(k));
+  const hasReturn = returnKeywords.some((k) => text.includes(k));
+  const hasUse = useKeywords.some((k) => text.includes(k));
+
+  // Try to find something that looks like an order number:
+  //  - 3+ digits, optionally mixed with letters, spaces, or dashes
+  const orderMatch = userMessage.match(/[A-Z0-9][A-Z0-9\- ]{2,}/i);
+  const orderNumber = orderMatch ? orderMatch[0].trim() : "";
+
+  let mainIntent = "general";
+  if (hasShipping || orderNumber) mainIntent = "shipping_or_order";
+  if (hasReturn) mainIntent = "return_or_withdrawal";
+  if (hasUse && !hasShipping && !hasReturn) mainIntent = "product_usage";
+
+  return {
+    mainIntent,
+    hasShipping,
+    hasReturn,
+    hasUse,
+    orderNumber,
+  };
+}
+
 // ---- Routes ----
 app.get("/", (req, res) => {
   res.send("AI support backend running.");
@@ -46,23 +112,30 @@ app.post("/chat", async (req, res) => {
 
   try {
     const data = loadClient(clientId);
+    const intent = detectIntent(message);
 
     const systemPrompt = `
 You are the AI support bot for ${data.clientConfig.brandName}.
-Use the same language as the user.
-No emojis.
-Keep answers correct and polite.
+Use the same language as the user. No emojis.
+Be honest and clear. If something is not in the context, say you are not sure.
 
-Client voice:
+INTENT_HINT:
+- mainIntent: ${intent.mainIntent}
+- hasShipping: ${intent.hasShipping}
+- hasReturn: ${intent.hasReturn}
+- hasUse: ${intent.hasUse}
+- orderNumber: ${intent.orderNumber || "none"}
+
+CLIENT VOICE:
 ${data.brandVoice}
 
 FAQ:
 ${data.faq}
 
-Policies:
+POLICIES:
 ${data.policies}
 
-Products:
+PRODUCTS:
 ${data.products}
 `;
 
@@ -76,6 +149,7 @@ ${data.products}
 
     return res.json({
       reply: response.choices[0].message.content,
+      intent,
     });
   } catch (err) {
     console.error("Chat error:", err.message);
