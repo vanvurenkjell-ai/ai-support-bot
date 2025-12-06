@@ -84,7 +84,7 @@ function detectIntent(userMessage) {
 
   // Try to find something that looks like an order number:
   //  - 3+ digits, optionally mixed with letters, spaces, or dashes
-  const orderMatch = userMessage.match(/[A-Z0-9][A-Z0-9\- ]{2,}/i);
+  const orderMatch = userMessage.match(/[A-Z0-9][A-Z0-9\- ]{2,}[A-Z0-9]/i);
   const orderNumber = orderMatch ? orderMatch[0].trim() : "";
 
   let mainIntent = "general";
