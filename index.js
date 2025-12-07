@@ -11,6 +11,7 @@ const port = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
+// ---- OpenAI setup ----
 if (!process.env.OPENAI_API_KEY) {
   console.error("Missing OPENAI_API_KEY");
   process.exit(1);
@@ -25,19 +26,100 @@ const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
 const SHOPIFY_API_TOKEN = process.env.SHOPIFY_API_TOKEN;
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-01";
 
-// ---- Load client files ----
-function loadClient(clientId) {
-  const basePath = `./Clients/${clientId}`;
-
-  const faq = fs.readFileSync(`${basePath}/FAQ.md`, "utf8");
-  const policies = fs.readFileSync(`${basePath}/Policies.md`, "utf8");
-  const products = fs.readFileSync(`${basePath}/Product Samples.md`, "utf8");
-  const brandVoice = fs.readFileSync(`${basePath}/Brand voice.md`, "utf8");
-  const clientConfig = JSON.parse(
-    fs.readFileSync(`${basePath}/client-config.json`, "utf8")
+// preconfigured axios client for Shopify (with timeout)
+let shopifyClient = null;
+if (SHOPIFY_STORE_DOMAIN && SHOPIFY_API_TOKEN) {
+  shopifyClient = axios.create({
+    baseURL: `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}`,
+    timeout: 5000,
+    headers: {
+      "X-Shopify-Access-Token": SHOPIFY_API_TOKEN,
+    },
+  });
+} else {
+  console.warn(
+    "Shopify env vars missing; order lookup will be disabled until they are set."
   );
+}
 
-  return { faq, policies, products, brandVoice, clientConfig };
+// ---- Simple sanitizers / limits ----
+const MAX_USER_MESSAGE_LENGTH = 1000; // chars
+
+function sanitizeUserMessage(input) {
+  let text = "";
+  try {
+    text = String(input || "");
+  } catch {
+    text = "";
+  }
+
+  // strip control chars
+  text = text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  text = text.trim();
+
+  if (text.length > MAX_USER_MESSAGE_LENGTH) {
+    text = text.slice(0, MAX_USER_MESSAGE_LENGTH);
+  }
+  return text;
+}
+
+function sanitizeClientId(id) {
+  const fallback = "Advantum";
+  if (!id) return fallback;
+
+  const cleaned = String(id).trim();
+
+  // allow only letters, numbers, _ and -
+  if (!/^[A-Za-z0-9_-]+$/.test(cleaned)) {
+    return fallback;
+  }
+  return cleaned;
+}
+
+function sanitizeOrderNumber(orderNumber) {
+  if (!orderNumber) return "";
+  let text = String(orderNumber);
+
+  // keep only digits, letters, #, -, space
+  text = text.replace(/[^A-Za-z0-9#\- ]/g, "").trim();
+
+  // short sanity limit
+  if (text.length > 40) {
+    text = text.slice(0, 40);
+  }
+
+  return text;
+}
+
+// ---- Load client files (safe) ----
+function loadClient(clientId) {
+  const safeClientId = sanitizeClientId(clientId);
+  const basePath = `./Clients/${safeClientId}`;
+
+  if (!fs.existsSync(basePath)) {
+    throw new Error(`Client folder not found for id: ${safeClientId}`);
+  }
+
+  try {
+    const faq = fs.readFileSync(`${basePath}/FAQ.md`, "utf8");
+    const policies = fs.readFileSync(`${basePath}/Policies.md`, "utf8");
+    const products = fs.readFileSync(
+      `${basePath}/Product Samples.md`,
+      "utf8"
+    );
+    const brandVoice = fs.readFileSync(
+      `${basePath}/Brand voice.md`,
+      "utf8"
+    );
+    const clientConfig = JSON.parse(
+      fs.readFileSync(`${basePath}/client-config.json`, "utf8")
+    );
+
+    return { faq, policies, products, brandVoice, clientConfig };
+  } catch (err) {
+    console.error(`Error loading client data for ${safeClientId}:`, err.message);
+    throw new Error("Failed to load client data");
+  }
 }
 
 // ---- Simple intent + order detection ----
@@ -88,12 +170,13 @@ function detectIntent(userMessage) {
   const hasUse = useKeywords.some((k) => text.includes(k));
 
   // Extract an order-like number:
-  // take the last number sequence (with optional spaces/dashes)
+  // last number sequence (with optional spaces/dashes)
   let orderNumber = "";
-  const numberMatches = userMessage.match(/(\d[\d\- ]*\d)/g);
+  const numberMatches = (userMessage || "").match(/(\d[\d\- ]*\d)/g);
   if (numberMatches && numberMatches.length > 0) {
     orderNumber = numberMatches[numberMatches.length - 1].trim();
   }
+  orderNumber = sanitizeOrderNumber(orderNumber);
 
   let mainIntent = "general";
   if (hasShipping || orderNumber) mainIntent = "shipping_or_order";
@@ -110,11 +193,13 @@ function detectIntent(userMessage) {
 }
 
 // ---- Shopify order lookup ----
-async function lookupShopifyOrder(orderNumber) {
-  if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_API_TOKEN) {
-    console.warn("Shopify env vars missing, skipping lookup.");
+async function lookupShopifyOrder(orderNumberRaw) {
+  if (!shopifyClient) {
+    console.warn("Shopify client not configured, skipping lookup.");
     return null;
   }
+
+  const orderNumber = sanitizeOrderNumber(orderNumberRaw);
   if (!orderNumber) return null;
 
   // Shopify "name" is usually like "#1055"
@@ -123,11 +208,7 @@ async function lookupShopifyOrder(orderNumber) {
     : `#${orderNumber}`;
 
   try {
-    const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/orders.json`;
-    const res = await axios.get(url, {
-      headers: {
-        "X-Shopify-Access-Token": SHOPIFY_API_TOKEN,
-      },
+    const res = await shopifyClient.get("/orders.json", {
       params: {
         name: nameParam,
         status: "any",
@@ -152,13 +233,15 @@ async function lookupShopifyOrder(orderNumber) {
         : null;
 
     const trackingUrl =
-      fulfillment && fulfillment.tracking_urls && fulfillment.tracking_urls[0]
+      fulfillment &&
+      fulfillment.tracking_urls &&
+      fulfillment.tracking_urls[0]
         ? fulfillment.tracking_urls[0]
         : null;
 
     return {
       orderName: order.name || null,
-      orderNumber: orderNumber,
+      orderNumber,
       fulfillmentStatus: order.fulfillment_status || "unfulfilled",
       financialStatus: order.financial_status || null,
       tracking,
@@ -177,8 +260,14 @@ app.get("/", (req, res) => {
 });
 
 app.post("/chat", async (req, res) => {
-  const message = req.body.message || "";
-  const clientId = req.query.client || "Advantum";
+  const rawMessage = req.body.message;
+  const message = sanitizeUserMessage(rawMessage);
+
+  if (!message) {
+    return res.status(400).json({ error: "Empty or invalid message." });
+  }
+
+  const clientId = sanitizeClientId(req.query.client || "Advantum");
 
   try {
     const data = loadClient(clientId);
