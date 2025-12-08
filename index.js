@@ -45,6 +45,24 @@ if (SHOPIFY_STORE_DOMAIN && SHOPIFY_API_TOKEN) {
 // ---- Simple sanitizers / limits ----
 const MAX_USER_MESSAGE_LENGTH = 1000; // chars
 
+// Strip dangerous HTML, scripts, styles
+function stripHtml(input) {
+  if (!input) return "";
+
+  let text = String(input);
+
+  // Remove <script>...</script> blocks
+  text = text.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "");
+
+  // Remove <style>...</style> blocks
+  text = text.replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, "");
+
+  // Remove any remaining HTML tags
+  text = text.replace(/<\/?[^>]+(>|$)/g, "");
+
+  return text;
+}
+
 function sanitizeUserMessage(input) {
   let text = "";
   try {
@@ -53,13 +71,20 @@ function sanitizeUserMessage(input) {
     text = "";
   }
 
+  // remove HTML, script, and style tags
+  text = stripHtml(text);
+
   // strip control chars
   text = text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
-  text = text.trim();
 
+  // collapse multiple spaces/newlines
+  text = text.replace(/\s+/g, " ").trim();
+
+  // enforce max length
   if (text.length > MAX_USER_MESSAGE_LENGTH) {
     text = text.slice(0, MAX_USER_MESSAGE_LENGTH);
   }
+
   return text;
 }
 
@@ -328,7 +353,6 @@ ${data.products}
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
-
 
 
 
