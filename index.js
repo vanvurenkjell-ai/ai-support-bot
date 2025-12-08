@@ -271,15 +271,14 @@ async function lookupShopifyOrder(orderNumberRaw) {
 
   const isAllDigits = /^[0-9]+$/.test(compact);
 
-  // Try numeric Shopify order ID if it looks like a long pure ID
+  // 1) Try numeric Shopify order ID if it looks like a long pure ID
   if (isAllDigits && compact.length >= 8) {
     try {
       const resById = await shopifyClient.get(`/orders/${compact}.json`, {
         params: { status: "any" },
       });
-      const order = resById.data && resById.data.order
-        ? resById.data.order
-        : null;
+      const order =
+        resById.data && resById.data.order ? resById.data.order : null;
 
       if (order) {
         const fulfillment =
@@ -316,54 +315,71 @@ async function lookupShopifyOrder(orderNumberRaw) {
     }
   }
 
-  // Fallback: try by Shopify order name (with # prefix)
-  const nameParam = compact.startsWith("#") ? compact : `#${compact}`;
+  // 2) Fallback: try by Shopify order name with multiple variants
+  const nameCandidates = [];
 
-  try {
-    const res = await shopifyClient.get("/orders.json", {
-      params: {
-        name: nameParam,
-        status: "any",
-      },
-    });
-
-    const orders = res.data && res.data.orders ? res.data.orders : [];
-    if (!orders.length) return null;
-
-    const order = orders[0];
-
-    const fulfillment =
-      order.fulfillments && order.fulfillments[0]
-        ? order.fulfillments[0]
-        : null;
-
-    const tracking =
-      fulfillment &&
-      fulfillment.tracking_numbers &&
-      fulfillment.tracking_numbers[0]
-        ? fulfillment.tracking_numbers[0]
-        : null;
-
-    const trackingUrl =
-      fulfillment &&
-      fulfillment.tracking_urls &&
-      fulfillment.tracking_urls[0]
-        ? fulfillment.tracking_urls[0]
-        : null;
-
-    return {
-      orderName: order.name || null,
-      orderNumber: cleaned,
-      fulfillmentStatus: order.fulfillment_status || "unfulfilled",
-      financialStatus: order.financial_status || null,
-      tracking,
-      trackingUrl,
-      createdAt: order.created_at || null,
-    };
-  } catch (err) {
-    console.error("Shopify lookup error:", err.message);
-    return null;
+  if (compact.startsWith("#")) {
+    nameCandidates.push(compact);              // "#1055"
+    nameCandidates.push(compact.slice(1));     // "1055"
+  } else {
+    nameCandidates.push(`#${compact}`);        // "#1055"
+    nameCandidates.push(compact);              // "1055"
   }
+
+  for (const nameParam of nameCandidates) {
+    try {
+      const res = await shopifyClient.get("/orders.json", {
+        params: {
+          name: nameParam,
+          status: "any",
+        },
+      });
+
+      const orders = res.data && res.data.orders ? res.data.orders : [];
+      if (!orders.length) {
+        continue;
+      }
+
+      const order = orders[0];
+
+      const fulfillment =
+        order.fulfillments && order.fulfillments[0]
+          ? order.fulfillments[0]
+          : null;
+
+      const tracking =
+        fulfillment &&
+        fulfillment.tracking_numbers &&
+        fulfillment.tracking_numbers[0]
+          ? fulfillment.tracking_numbers[0]
+          : null;
+
+      const trackingUrl =
+        fulfillment &&
+        fulfillment.tracking_urls &&
+        fulfillment.tracking_urls[0]
+          ? fulfillment.tracking_urls[0]
+          : null;
+
+      return {
+        orderName: order.name || null,
+        orderNumber: cleaned,
+        fulfillmentStatus: order.fulfillment_status || "unfulfilled",
+        financialStatus: order.financial_status || null,
+        tracking,
+        trackingUrl,
+        createdAt: order.created_at || null,
+      };
+    } catch (err) {
+      console.warn(
+        `Shopify lookup by name "${nameParam}" failed, trying next variant:`,
+        err.message
+      );
+    }
+  }
+
+  console.warn("Shopify lookup: no order found for:", cleaned);
+  return null;
 }
 
 // ---- Routes ----
