@@ -108,12 +108,56 @@ function sanitizeOrderNumber(orderNumber) {
   // keep only digits, letters, #, -, space
   text = text.replace(/[^A-Za-z0-9#\- ]/g, "").trim();
 
+  // collapse multiple spaces
+  text = text.replace(/\s+/g, " ");
+
   // short sanity limit
   if (text.length > 40) {
     text = text.slice(0, 40);
   }
 
   return text;
+}
+
+// Extract an order-like candidate from the user message
+// Supports: #1055, ADV-2024-001, AB-123-456, 123 456, long numeric IDs
+function extractOrderCandidate(userMessage) {
+  if (!userMessage) return "";
+
+  const text = String(userMessage);
+  const tokens = text.split(/\s+/);
+
+  const cleanedTokens = tokens.map((t) =>
+    t.replace(/[^A-Za-z0-9#\-]/g, "")
+  );
+
+  const candidates = [];
+
+  // Single-token candidates (must contain at least one digit, length >= 3)
+  cleanedTokens.forEach((tok) => {
+    if (tok && tok.length >= 3 && /\d/.test(tok)) {
+      candidates.push(tok);
+    }
+  });
+
+  // Two-token combined candidates to support "123 456" style
+  for (let i = 0; i < cleanedTokens.length - 1; i++) {
+    const a = cleanedTokens[i];
+    const b = cleanedTokens[i + 1];
+    if (!a || !b) continue;
+    const bothHaveDigit = /\d/.test(a) || /\d/.test(b);
+    if (!bothHaveDigit) continue;
+
+    const combined = `${a} ${b}`.trim();
+    if (combined.length >= 3 && combined.length <= 40) {
+      candidates.push(combined);
+    }
+  }
+
+  if (!candidates.length) return "";
+
+  // Prefer the last candidate (closest to end of message)
+  return candidates[candidates.length - 1];
 }
 
 // ---- Load client files (safe) ----
@@ -194,14 +238,9 @@ function detectIntent(userMessage) {
   const hasReturn = returnKeywords.some((k) => text.includes(k));
   const hasUse = useKeywords.some((k) => text.includes(k));
 
-  // Extract an order-like number:
-  // last number sequence (with optional spaces/dashes)
-  let orderNumber = "";
-  const numberMatches = (userMessage || "").match(/(\d[\d\- ]*\d)/g);
-  if (numberMatches && numberMatches.length > 0) {
-    orderNumber = numberMatches[numberMatches.length - 1].trim();
-  }
-  orderNumber = sanitizeOrderNumber(orderNumber);
+  // Advanced order-like detection
+  let orderCandidate = extractOrderCandidate(userMessage);
+  const orderNumber = sanitizeOrderNumber(orderCandidate);
 
   let mainIntent = "general";
   if (hasShipping || orderNumber) mainIntent = "shipping_or_order";
@@ -224,13 +263,61 @@ async function lookupShopifyOrder(orderNumberRaw) {
     return null;
   }
 
-  const orderNumber = sanitizeOrderNumber(orderNumberRaw);
-  if (!orderNumber) return null;
+  const cleaned = sanitizeOrderNumber(orderNumberRaw);
+  if (!cleaned) return null;
 
-  // Shopify "name" is usually like "#1055"
-  const nameParam = orderNumber.startsWith("#")
-    ? orderNumber
-    : `#${orderNumber}`;
+  const compact = cleaned.replace(/\s+/g, "");
+  if (!compact) return null;
+
+  const isAllDigits = /^[0-9]+$/.test(compact);
+
+  // Try numeric Shopify order ID if it looks like a long pure ID
+  if (isAllDigits && compact.length >= 8) {
+    try {
+      const resById = await shopifyClient.get(`/orders/${compact}.json`, {
+        params: { status: "any" },
+      });
+      const order = resById.data && resById.data.order
+        ? resById.data.order
+        : null;
+
+      if (order) {
+        const fulfillment =
+          order.fulfillments && order.fulfillments[0]
+            ? order.fulfillments[0]
+            : null;
+
+        const tracking =
+          fulfillment &&
+          fulfillment.tracking_numbers &&
+          fulfillment.tracking_numbers[0]
+            ? fulfillment.tracking_numbers[0]
+            : null;
+
+        const trackingUrl =
+          fulfillment &&
+          fulfillment.tracking_urls &&
+          fulfillment.tracking_urls[0]
+            ? fulfillment.tracking_urls[0]
+            : null;
+
+        return {
+          orderName: order.name || null,
+          orderNumber: cleaned,
+          fulfillmentStatus: order.fulfillment_status || "unfulfilled",
+          financialStatus: order.financial_status || null,
+          tracking,
+          trackingUrl,
+          createdAt: order.created_at || null,
+        };
+      }
+    } catch (err) {
+      console.warn("Shopify lookup by ID failed, will try by name:", err.message);
+    }
+  }
+
+  // Fallback: try by Shopify order name (with # prefix)
+  const nameParam = compact.startsWith("#") ? compact : `#${compact}`;
 
   try {
     const res = await shopifyClient.get("/orders.json", {
@@ -266,7 +353,7 @@ async function lookupShopifyOrder(orderNumberRaw) {
 
     return {
       orderName: order.name || null,
-      orderNumber,
+      orderNumber: cleaned,
       fulfillmentStatus: order.fulfillment_status || "unfulfilled",
       financialStatus: order.financial_status || null,
       tracking,
@@ -353,6 +440,7 @@ ${data.products}
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
+
 
 
 
