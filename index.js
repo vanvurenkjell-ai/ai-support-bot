@@ -116,7 +116,18 @@ function sanitizeOrderNumber(orderNumber) {
   return text;
 }
 
-// ---- Load client files (safe) ----
+// ---- Load client files (safe + supports extra md files) ----
+function readFileIfExists(path) {
+  try {
+    if (fs.existsSync(path)) {
+      return fs.readFileSync(path, "utf8");
+    }
+  } catch (e) {
+    console.warn(`Could not read file: ${path} (${e.message})`);
+  }
+  return "";
+}
+
 function loadClient(clientId) {
   const safeClientId = sanitizeClientId(clientId);
   const basePath = `./Clients/${safeClientId}`;
@@ -126,21 +137,45 @@ function loadClient(clientId) {
   }
 
   try {
-    const faq = fs.readFileSync(`${basePath}/FAQ.md`, "utf8");
-    const policies = fs.readFileSync(`${basePath}/Policies.md`, "utf8");
-    const products = fs.readFileSync(
-      `${basePath}/Product Samples.md`,
-      "utf8"
-    );
-    const brandVoice = fs.readFileSync(
-      `${basePath}/Brand voice.md`,
-      "utf8"
-    );
-    const clientConfig = JSON.parse(
-      fs.readFileSync(`${basePath}/client-config.json`, "utf8")
-    );
+    // Core files (expected)
+    const faq = readFileIfExists(`${basePath}/FAQ.md`);
+    const policies = readFileIfExists(`${basePath}/Policies.md`);
+    const brandVoice = readFileIfExists(`${basePath}/Brand voice.md`);
 
-    return { faq, policies, products, brandVoice, clientConfig };
+    // IMPORTANT: your folder has Products.md now (not Product Samples.md)
+    // We keep a fallback to Product Samples.md just in case older clients still use it.
+    let products = readFileIfExists(`${basePath}/Products.md`);
+    if (!products) {
+      products = readFileIfExists(`${basePath}/Product Samples.md`);
+    }
+
+    const clientConfigRaw = readFileIfExists(`${basePath}/client-config.json`);
+    const clientConfig = clientConfigRaw ? JSON.parse(clientConfigRaw) : {};
+
+    // Extra knowledge files (optional)
+    // Add any files you want the bot to use here.
+    const extraFiles = [
+      "Company overview.md",
+      "Customer support rules.md",
+      "Legal.md",
+      "Product tutorials.md",
+      "Promotions & discounts.md",
+      "Shipping matrix.md",
+      "Troubleshooting.md",
+      // You can add more filenames here later if needed.
+    ];
+
+    const extraKnowledgeSections = [];
+    for (const filename of extraFiles) {
+      const content = readFileIfExists(`${basePath}/${filename}`);
+      if (content && content.trim()) {
+        extraKnowledgeSections.push(`### ${filename}\n${content.trim()}`);
+      }
+    }
+
+    const extraKnowledge = extraKnowledgeSections.join("\n\n");
+
+    return { faq, policies, products, brandVoice, extraKnowledge, clientConfig };
   } catch (err) {
     console.error(`Error loading client data for ${safeClientId}:`, err.message);
     throw new Error("Failed to load client data");
@@ -303,8 +338,10 @@ app.post("/chat", async (req, res) => {
       shopifyData = await lookupShopifyOrder(intent.orderNumber);
     }
 
+    const brandName = data.clientConfig.brandName || clientId;
+
     const systemPrompt = `
-You are the AI support bot for ${data.clientConfig.brandName}.
+You are the AI support bot for ${brandName}.
 Use the same language as the user. No emojis.
 Be honest and clear. If something is not in the context, say you are not sure.
 
@@ -319,16 +356,19 @@ ORDER_LOOKUP_DATA (from Shopify, if available):
 ${shopifyData ? JSON.stringify(shopifyData, null, 2) : "none"}
 
 CLIENT VOICE:
-${data.brandVoice}
+${data.brandVoice || ""}
+
+CUSTOMER SUPPORT RULES / EXTRA KNOWLEDGE:
+${data.extraKnowledge || ""}
 
 FAQ:
-${data.faq}
+${data.faq || ""}
 
 POLICIES:
-${data.policies}
+${data.policies || ""}
 
 PRODUCTS:
-${data.products}
+${data.products || ""}
 `;
 
     const response = await openai.chat.completions.create({
