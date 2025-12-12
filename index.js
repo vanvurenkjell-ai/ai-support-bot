@@ -12,11 +12,6 @@ app.use(cors());
 app.use(express.json());
 
 // ---- OpenAI setup ----
-if (!process.env.OPENAI_API_KEY) {
-  console.error("Missing OPENAI_API_KEY");
-  process.exit(1);
-}
-
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
@@ -26,7 +21,6 @@ const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
 const SHOPIFY_API_TOKEN = process.env.SHOPIFY_API_TOKEN;
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-01";
 
-// preconfigured axios client for Shopify (with timeout)
 let shopifyClient = null;
 if (SHOPIFY_STORE_DOMAIN && SHOPIFY_API_TOKEN) {
   shopifyClient = axios.create({
@@ -36,363 +30,156 @@ if (SHOPIFY_STORE_DOMAIN && SHOPIFY_API_TOKEN) {
       "X-Shopify-Access-Token": SHOPIFY_API_TOKEN,
     },
   });
-} else {
-  console.warn(
-    "Shopify env vars missing; order lookup will be disabled until they are set."
-  );
 }
 
-// ---- Simple sanitizers / limits ----
-const MAX_USER_MESSAGE_LENGTH = 1000; // chars
-
-// Strip dangerous HTML, scripts, styles
-function stripHtml(input) {
-  if (!input) return "";
-
-  let text = String(input);
-
-  // Remove <script>...</script> blocks
-  text = text.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "");
-
-  // Remove <style>...</style> blocks
-  text = text.replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, "");
-
-  // Remove any remaining HTML tags
-  text = text.replace(/<\/?[^>]+(>|$)/g, "");
-
-  return text;
-}
+// ---- Helpers ----
+const MAX_USER_MESSAGE_LENGTH = 1000;
 
 function sanitizeUserMessage(input) {
-  let text = "";
-  try {
-    text = String(input || "");
-  } catch {
-    text = "";
-  }
-
-  // remove HTML, script, and style tags
-  text = stripHtml(text);
-
-  // strip control chars
-  text = text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
-
-  // collapse multiple spaces/newlines
+  let text = String(input || "");
+  text = text.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "");
+  text = text.replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, "");
+  text = text.replace(/<\/?[^>]+(>|$)/g, "");
   text = text.replace(/\s+/g, " ").trim();
-
-  // enforce max length
   if (text.length > MAX_USER_MESSAGE_LENGTH) {
     text = text.slice(0, MAX_USER_MESSAGE_LENGTH);
   }
-
   return text;
 }
 
-function sanitizeClientId(id) {
-  const fallback = "Advantum";
-  if (!id) return fallback;
-
-  const cleaned = String(id).trim();
-
-  // allow only letters, numbers, _ and -
-  if (!/^[A-Za-z0-9_-]+$/.test(cleaned)) {
-    return fallback;
-  }
-  return cleaned;
-}
-
-function sanitizeOrderNumber(orderNumber) {
-  if (!orderNumber) return "";
-  let text = String(orderNumber);
-
-  // keep only digits, letters, #, -, space
-  text = text.replace(/[^A-Za-z0-9#\- ]/g, "").trim();
-
-  // short sanity limit
-  if (text.length > 40) {
-    text = text.slice(0, 40);
-  }
-
-  return text;
-}
-
-// ---- Load client files (safe + supports extra md files) ----
 function readFileIfExists(path) {
-  try {
-    if (fs.existsSync(path)) {
-      return fs.readFileSync(path, "utf8");
-    }
-  } catch (e) {
-    console.warn(`Could not read file: ${path} (${e.message})`);
+  if (fs.existsSync(path)) {
+    return fs.readFileSync(path, "utf8");
   }
   return "";
 }
 
+// ---- Load client knowledge ----
 function loadClient(clientId) {
-  const safeClientId = sanitizeClientId(clientId);
-  const basePath = `./Clients/${safeClientId}`;
+  const basePath = `./Clients/${clientId}`;
 
-  if (!fs.existsSync(basePath)) {
-    throw new Error(`Client folder not found for id: ${safeClientId}`);
-  }
-
-  try {
-    // Core files (expected)
-    const faq = readFileIfExists(`${basePath}/FAQ.md`);
-    const policies = readFileIfExists(`${basePath}/Policies.md`);
-    const brandVoice = readFileIfExists(`${basePath}/Brand voice.md`);
-
-    // IMPORTANT: your folder has Products.md now (not Product Samples.md)
-    // We keep a fallback to Product Samples.md just in case older clients still use it.
-    let products = readFileIfExists(`${basePath}/Products.md`);
-    if (!products) {
-      products = readFileIfExists(`${basePath}/Product Samples.md`);
-    }
-
-    const clientConfigRaw = readFileIfExists(`${basePath}/client-config.json`);
-    const clientConfig = clientConfigRaw ? JSON.parse(clientConfigRaw) : {};
-
-    // Extra knowledge files (optional)
-    // Add any files you want the bot to use here.
-    const extraFiles = [
+  const files = {
+    brandVoice: "Brand voice.md",
+    faq: "FAQ.md",
+    policies: "Policies.md",
+    products: "Products.md",
+    supportRules: "Customer support rules.md",
+    extras: [
       "Company overview.md",
-      "Customer support rules.md",
       "Legal.md",
       "Product tutorials.md",
       "Promotions & discounts.md",
       "Shipping matrix.md",
       "Troubleshooting.md",
-      // You can add more filenames here later if needed.
-    ];
+    ],
+  };
 
-    const extraKnowledgeSections = [];
-    for (const filename of extraFiles) {
-      const content = readFileIfExists(`${basePath}/${filename}`);
-      if (content && content.trim()) {
-        extraKnowledgeSections.push(`### ${filename}\n${content.trim()}`);
+  const knowledgeChunks = [];
+
+  function chunkText(source, text) {
+    const parts = text.split(/\n{2,}/);
+    for (const part of parts) {
+      if (part.trim().length > 50) {
+        knowledgeChunks.push({
+          source,
+          text: part.trim(),
+        });
       }
     }
-
-    const extraKnowledge = extraKnowledgeSections.join("\n\n");
-
-    return { faq, policies, products, brandVoice, extraKnowledge, clientConfig };
-  } catch (err) {
-    console.error(`Error loading client data for ${safeClientId}:`, err.message);
-    throw new Error("Failed to load client data");
   }
-}
 
-// ---- Simple intent + order detection ----
-function detectIntent(userMessage) {
-  const text = (userMessage || "").toLowerCase();
+  const brandVoice = readFileIfExists(`${basePath}/${files.brandVoice}`);
+  const supportRules = readFileIfExists(`${basePath}/${files.supportRules}`);
 
-  const shippingKeywords = [
-    "verzending",
-    "bezorging",
-    "bezorgd",
-    "pakket",
-    "track",
-    "trace",
-    "where is my order",
-    "waar is mijn bestelling",
-    "zending",
-    "levering",
-    "shipment",
-    "delivery",
-    "shipping",
-  ];
+  chunkText("FAQ", readFileIfExists(`${basePath}/${files.faq}`));
+  chunkText("Policies", readFileIfExists(`${basePath}/${files.policies}`));
+  chunkText("Products", readFileIfExists(`${basePath}/${files.products}`));
 
-  const returnKeywords = [
-    "retour",
-    "retourneren",
-    "terugsturen",
-    "omruilen",
-    "herroepingsrecht",
-    "bedenktijd",
-    "refund",
-    "geld terug",
-    "money back",
-  ];
-
-  const useKeywords = [
-    "hoe gebruik ik",
-    "hoe moet ik",
-    "hoe doe ik",
-    "how do i use",
-    "how to use",
-    "gebruiken",
-    "uitleg",
-    "tutorial",
-  ];
-
-  const hasShipping = shippingKeywords.some((k) => text.includes(k));
-  const hasReturn = returnKeywords.some((k) => text.includes(k));
-  const hasUse = useKeywords.some((k) => text.includes(k));
-
-  // Extract an order-like number:
-  // last number sequence (with optional spaces/dashes)
-  let orderNumber = "";
-  const numberMatches = (userMessage || "").match(/(\d[\d\- ]*\d)/g);
-  if (numberMatches && numberMatches.length > 0) {
-    orderNumber = numberMatches[numberMatches.length - 1].trim();
+  for (const file of files.extras) {
+    chunkText(file, readFileIfExists(`${basePath}/${file}`));
   }
-  orderNumber = sanitizeOrderNumber(orderNumber);
 
-  let mainIntent = "general";
-  if (hasShipping || orderNumber) mainIntent = "shipping_or_order";
-  if (hasReturn) mainIntent = "return_or_withdrawal";
-  if (hasUse && !hasShipping && !hasReturn) mainIntent = "product_usage";
+  const clientConfig = JSON.parse(
+    readFileIfExists(`${basePath}/client-config.json`) || "{}"
+  );
 
   return {
-    mainIntent,
-    hasShipping,
-    hasReturn,
-    hasUse,
-    orderNumber,
+    brandVoice,
+    supportRules,
+    knowledgeChunks,
+    clientConfig,
   };
 }
 
-// ---- Shopify order lookup ----
-async function lookupShopifyOrder(orderNumberRaw) {
-  if (!shopifyClient) {
-    console.warn("Shopify client not configured, skipping lookup.");
-    return null;
+// ---- Relevance scoring ----
+function scoreChunk(chunkText, query) {
+  const words = query.toLowerCase().split(" ");
+  let score = 0;
+  for (const word of words) {
+    if (word.length > 3 && chunkText.toLowerCase().includes(word)) {
+      score++;
+    }
   }
+  return score;
+}
 
-  const orderNumber = sanitizeOrderNumber(orderNumberRaw);
-  if (!orderNumber) return null;
-
-  // Shopify "name" is usually like "#1055"
-  const nameParam = orderNumber.startsWith("#")
-    ? orderNumber
-    : `#${orderNumber}`;
-
-  try {
-    const res = await shopifyClient.get("/orders.json", {
-      params: {
-        name: nameParam,
-        status: "any",
-      },
-    });
-
-    const orders = res.data && res.data.orders ? res.data.orders : [];
-    if (!orders.length) return null;
-
-    const order = orders[0];
-
-    const fulfillment =
-      order.fulfillments && order.fulfillments[0]
-        ? order.fulfillments[0]
-        : null;
-
-    const tracking =
-      fulfillment &&
-      fulfillment.tracking_numbers &&
-      fulfillment.tracking_numbers[0]
-        ? fulfillment.tracking_numbers[0]
-        : null;
-
-    const trackingUrl =
-      fulfillment &&
-      fulfillment.tracking_urls &&
-      fulfillment.tracking_urls[0]
-        ? fulfillment.tracking_urls[0]
-        : null;
-
-    return {
-      orderName: order.name || null,
-      orderNumber,
-      fulfillmentStatus: order.fulfillment_status || "unfulfilled",
-      financialStatus: order.financial_status || null,
-      tracking,
-      trackingUrl,
-      createdAt: order.created_at || null,
-    };
-  } catch (err) {
-    console.error("Shopify lookup error:", err.message);
-    return null;
-  }
+function selectTopChunks(chunks, query, limit = 5) {
+  return chunks
+    .map(c => ({ ...c, score: scoreChunk(c.text, query) }))
+    .filter(c => c.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
 }
 
 // ---- Routes ----
-app.get("/", (req, res) => {
-  res.send("AI support backend running.");
-});
-
 app.post("/chat", async (req, res) => {
-  const rawMessage = req.body.message;
-  const message = sanitizeUserMessage(rawMessage);
-
+  const message = sanitizeUserMessage(req.body.message);
   if (!message) {
-    return res.status(400).json({ error: "Empty or invalid message." });
+    return res.status(400).json({ error: "Invalid message" });
   }
 
-  const clientId = sanitizeClientId(req.query.client || "Advantum");
+  const clientId = req.query.client || "Advantum";
+  const data = loadClient(clientId);
 
-  try {
-    const data = loadClient(clientId);
-    const intent = detectIntent(message);
+  const topChunks = selectTopChunks(data.knowledgeChunks, message);
 
-    let shopifyData = null;
-    if (intent.mainIntent === "shipping_or_order" && intent.orderNumber) {
-      shopifyData = await lookupShopifyOrder(intent.orderNumber);
-    }
+  const context = topChunks
+    .map(c => `### ${c.source}\n${c.text}`)
+    .join("\n\n");
 
-    const brandName = data.clientConfig.brandName || clientId;
-
-    const systemPrompt = `
-You are the AI support bot for ${brandName}.
+  const systemPrompt = `
+You are the AI support bot for ${data.clientConfig.brandName || clientId}.
 Use the same language as the user. No emojis.
-Be honest and clear. If something is not in the context, say you are not sure.
+Never guess policies, prices, or shipping rules.
+If the answer is not in the context, say you are not sure.
 
-INTENT_HINT:
-- mainIntent: ${intent.mainIntent}
-- hasShipping: ${intent.hasShipping}
-- hasReturn: ${intent.hasReturn}
-- hasUse: ${intent.hasUse}
-- orderNumber: ${intent.orderNumber || "none"}
-
-ORDER_LOOKUP_DATA (from Shopify, if available):
-${shopifyData ? JSON.stringify(shopifyData, null, 2) : "none"}
-
-CLIENT VOICE:
+BRAND VOICE:
 ${data.brandVoice || ""}
 
-CUSTOMER SUPPORT RULES / EXTRA KNOWLEDGE:
-${data.extraKnowledge || ""}
+CUSTOMER SUPPORT RULES:
+${data.supportRules || ""}
 
-FAQ:
-${data.faq || ""}
-
-POLICIES:
-${data.policies || ""}
-
-PRODUCTS:
-${data.products || ""}
+RELEVANT KNOWLEDGE:
+${context}
 `;
 
-    const response = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: message },
-      ],
-    });
+  const response = await openai.chat.completions.create({
+    model: "gpt-4.1-mini",
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: message },
+    ],
+  });
 
-    return res.json({
-      reply: response.choices[0].message.content,
-      intent,
-      shopify: shopifyData,
-    });
-  } catch (err) {
-    console.error("Chat error:", err.message);
-    return res.status(500).json({ error: "Server error" });
-  }
+  res.json({
+    reply: response.choices[0].message.content,
+  });
 });
 
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
+
 
 
 
