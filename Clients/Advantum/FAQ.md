@@ -1,83 +1,107 @@
-Advantum – Frequently Asked Questions
+# Advantum – Frequently Asked Questions (FAQ)
 
-General
+This FAQ provides quick answers to the most common questions about Advantum, our products, and our services.
 
-Q: How long does delivery take?
-A: We aim to deliver your package within 1–3 days in the Netherlands and Belgium.
+---
 
-Q: What are the shipping costs?
-A: Shipping within the Netherlands is €5.95 and shipping to Belgium is €8.95. Free shipping applies within the Netherlands on orders above €50.
+## Shipping & Delivery
 
-Q: Do you ship internationally?
-A: Currently we ship throughout the Netherlands and Belgium.
+### How fast is your delivery?
+**Short answer:** Orders are shipped the same day and usually delivered within 1–3 business days.
 
-Q: How can I contact customer support?
-A: You can reach us at info@advantum.nl.
+**Details:**  
+All orders placed on business days are dispatched the same day after payment confirmation. Delivery times are estimates and may vary due to external carrier factors.
 
--------------------------------------------
+---
 
-Returns & Refunds
+### Do you ship to Germany?
+**Short answer:** No, we currently do not ship to Germany.
 
-Q: Can I return my order?
-A: Yes. You may return your order within 14 days of receiving it, as long as the product is unused and in its original condition.
+**Details:**  
+Advantum only ships within the Netherlands and Belgium at this time.
 
-Q: Who pays for return shipping?
-A: Return shipping costs are paid by the customer. Original shipping costs will not be reimbursed.
+---
 
-Q: How long does it take to receive my refund?
-A: Refunds are processed within 14 days after your return is approved and we have received the product or proof of shipment.
+### Do you ship to Luxembourg?
+**Short answer:** No, shipping to Luxembourg is not available.
 
-Q: How do I start a return?
-A: Email us a clear statement of withdrawal or use the model form. You will receive confirmation and instructions on how to return the product.
+**Details:**  
+Shipping is limited to the Netherlands and Belgium unless explicitly stated otherwise.
 
--------------------------------------------
+---
 
-Product Use & Training Questions
+### Why do you not offer free shipping?
+**Short answer:** We choose transparent pricing and fair shipping costs for every order.
 
-Q: What exercises can I use the Omnirope for?
-A: The Omnirope is ideal for tricep exercises, lat pullovers, rear-delt face pulls, and ab crunches. Its three grip positions allow for optimal biomechanics and comfort.
+**Details:**  
+Advantum does not offer free shipping, regardless of order value. This allows us to maintain consistent pricing and reliable service without hidden costs.
 
-Q: Is the Omnirope one size fits all?
-A: Yes. The three different holding points make it suitable for smaller and larger users.
+---
 
-Q: How do I grip the Omnirope correctly?
-A: Place your hands inside the loops, rest your wrists on the material, and perform the movement without over-gripping. This improves biomechanics and reduces wrist strain.
+## Returns & Issues
 
-Q: What exercises is the Glute Strap designed for?
-A: The Glute Strap is specifically designed for cable kickbacks to optimally target the glutes.
+### How long can I return my package?
+**Short answer:** You can return your order within 14 days of receiving it.
 
-Q: How do I put on the Glute Strap?
-A: A full instructional video is available on the product page. The strap attaches to your ankle and heel for maximum stability.
+**Details:**  
+The 14-day withdrawal period starts the day after you receive your product. Returned items must meet the conditions outlined in our Return Policy.
 
-Q: Can the Swipe Grip be used on any attachment?
-A: Yes. It fits on most standard gym attachments for rows, lat pulldowns, and similar movements.
+---
 
-Q: Why would I adjust the width of an attachment using the Swipe Grip?
-A: Adjusting the width allows you to personalize the movement to your body mechanics, which improves muscle activation and reduces injury risk.
+### What if my product arrives damaged?
+**Short answer:** Contact us as soon as possible with clear photos of the damage.
 
--------------------------------------------
+**Details:**  
+If a product arrives damaged, please report it promptly so we can assess the situation and determine an appropriate solution according to our policy.
 
-Orders & Changes
+---
 
-Q: Can I change my delivery address after ordering?
-A: Yes, if the order has not been shipped yet. Please contact us as soon as possible with your correct address.
+## Payments
 
-Q: Can I cancel my order?
-A: Orders can be cancelled before they are shipped. If the order has shipped, you can return it under our standard return policy.
+### Which payment methods do you accept?
+**Short answer:** We accept iDEAL, Credit Card, Apple Pay, PayPal, and Bancontact.
 
--------------------------------------------
+**Details:**  
+All payments must be completed in full before an order is processed or shipped.
 
-Payments
+---
 
-Q: What payment methods do you accept?
-A: We accept Creditcard, Apple Pay, and iDEAL.
+## About Advantum
 
--------------------------------------------
+### What is Advantum?
+**Short answer:** Advantum is a fitness-focused brand offering products designed to support performance and lifestyle.
 
-Other
+**Details:**  
+Advantum operates as an online store, combining high-quality fitness products with a strong focus on consistency, discipline, and long-term improvement.
 
-Q: What if my package is delayed?
-A: If your order has not arrived within 10 days of shipment, please reach out to us so we can investigate with the carrier.
+---
 
-Q: What if my product arrives damaged?
-A: Contact us immediately with your order number and photos. We will resolve the issue quickly.
+### What is your goal as a company?
+**Short answer:** Our goal is to help people improve their performance through structure, quality, and discipline.
+
+**Details:**  
+Advantum is built around the idea that sustainable results come from consistency and informed choices, not shortcuts or hype.
+
+---
+
+## Contact & Support
+
+### How can I contact you?
+**Short answer:** You can contact us by email.
+
+**Details:**  
+Customer support is available via:  
+**Email:** info@advantum.nl  
+We aim to respond within a reasonable timeframe on business days.
+
+---
+
+## Additional Notes
+
+- Advantum does not make promises regarding discounts, special refunds, or policy exceptions.
+- All answers are subject to our official policies.
+- For case-specific questions, customers should always contact customer support.
+
+---
+
+End of FAQ.
