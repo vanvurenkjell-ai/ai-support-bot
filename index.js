@@ -76,7 +76,7 @@ function sanitizeSessionId(id) {
   return raw.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 80);
 }
 
-// ---- Session memory + lightweight flow state ----
+// ---- Session memory + flow state ----
 const SESSION_HISTORY_LIMIT = 10; // total messages (user + assistant)
 const SESSION_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
 
@@ -226,6 +226,7 @@ function normalizeText(s) {
     .trim();
 }
 
+// stopwords
 const STOPWORDS = new Set([
   "de","het","een","en","of","maar","want","dus","dat","dit","die","des","der",
   "ik","jij","je","u","hij","zij","ze","wij","we","jullie","hun","hen","mijn","jouw","uw",
@@ -479,82 +480,116 @@ function buildWidgetConfig(clientConfig, clientId) {
   };
 }
 
-// ---- NEW: Smart follow-up router (slot filling) ----
+// ---- Smart follow-up router (existing) ----
 function isTroubleshootingLike(message) {
   const t = normalizeText(message);
-  const keys = ["werkt niet", "doet het niet", "kapot", "probleem", "storing", "error", "fout", "werkt", "broken", "doesnt work", "doesn't work"];
+  const keys = ["werkt niet", "doet het niet", "kapot", "probleem", "storing", "error", "fout", "broken", "doesnt work", "doesn't work"];
   return keys.some((k) => t.includes(k));
 }
 
-function buildFollowUpQuestion(language, intent, slot, brandName) {
-  // Keep it short, one question, no emojis.
+function buildFollowUpQuestion(language, intent, slot) {
   const nl = {
     orderNumber: "Wat is je bestelnummer? Bijvoorbeeld #1055.",
     emailOrOrder: "Wat is je bestelnummer? Als je die niet hebt: met welk e-mailadres heb je besteld?",
     productName: "Welk product bedoel je precies?",
-    problemDetails: "Wat gaat er precies mis, en wat heb je al geprobeerd?",
   };
-
   const en = {
     orderNumber: "What is your order number? For example #1055.",
     emailOrOrder: "What is your order number? If you don’t have it: what email address did you order with?",
     productName: "Which product is it exactly?",
-    problemDetails: "What exactly is going wrong, and what have you tried already?",
   };
-
-  const dict = (String(language || "nl").toLowerCase().startsWith("en")) ? en : nl;
-
-  // slot -> text
+  const dict = String(language || "nl").toLowerCase().startsWith("en") ? en : nl;
   if (slot && dict[slot]) return dict[slot];
-
-  // fallback per intent
   if (intent === "shipping_or_order") return dict.orderNumber;
   if (intent === "return_or_withdrawal") return dict.emailOrOrder;
-  if (intent === "product_usage") return dict.problemDetails;
-
-  // general fallback
-  return (String(language || "nl").toLowerCase().startsWith("en"))
-    ? `How can I help you with your ${brandName} question?`
-    : `Waar kan ik je mee helpen?`;
+  return dict.productName;
 }
 
-function maybeHandleWithRouter({ sessionId, message, intent, clientConfig, brandName }) {
+function maybeHandleWithRouter({ sessionId, message, intent, clientConfig }) {
   const lang = clientConfig.language || "nl";
-
   const meta = getMeta(sessionId);
   const expected = meta.expectedSlot || "";
 
-  // If we were expecting a specific slot, treat user message as that slot and continue (no immediate follow-up response here).
-  // We just clear the slot so the model can move to the next step.
   if (expected) {
     clearExpectedSlot(sessionId);
     return { handled: false };
   }
 
-  // Decide if we need to ask a follow-up BEFORE calling the model
-  // 1) Shipping/order: require order number (for best assistance)
   if (intent.mainIntent === "shipping_or_order" && !intent.orderNumber) {
     setMeta(sessionId, { expectedSlot: "orderNumber", lastIntent: intent.mainIntent });
-    const q = buildFollowUpQuestion(lang, intent.mainIntent, "orderNumber", brandName);
-    return { handled: true, reply: q };
+    return { handled: true, reply: buildFollowUpQuestion(lang, intent.mainIntent, "orderNumber") };
   }
 
-  // 2) Returns: ask order number or email if missing
   if (intent.mainIntent === "return_or_withdrawal" && !intent.orderNumber) {
     setMeta(sessionId, { expectedSlot: "emailOrOrder", lastIntent: intent.mainIntent });
-    const q = buildFollowUpQuestion(lang, intent.mainIntent, "emailOrOrder", brandName);
-    return { handled: true, reply: q };
+    return { handled: true, reply: buildFollowUpQuestion(lang, intent.mainIntent, "emailOrOrder") };
   }
 
-  // 3) Troubleshooting-like: ask product name first if user didn't provide detail
-  // We keep this conservative: only trigger when user is clearly describing a problem.
   if ((intent.mainIntent === "product_usage" || intent.mainIntent === "general") && isTroubleshootingLike(message)) {
     setMeta(sessionId, { expectedSlot: "productName", lastIntent: "product_troubleshooting" });
-    const q = buildFollowUpQuestion(lang, "product_usage", "productName", brandName);
-    return { handled: true, reply: q };
+    return { handled: true, reply: buildFollowUpQuestion(lang, "product_usage", "productName") };
   }
 
   return { handled: false };
+}
+
+// ---- NEW: Angry / urgent detection ----
+function detectAngryOrUrgent(message) {
+  const t = normalizeText(message);
+
+  const urgent = [
+    "urgent", "met spoed", "direct", "nu hulp", "nu meteen", "asap", "immediately"
+  ];
+
+  const angry = [
+    "boos", "woest", "geïrriteerd", "geirriteerd", "kut", "belachelijk", "ridiculous",
+    "slecht", "waardeloos", "oplichter", "scam", "fraude", "ik ben er klaar mee",
+    "ik wil nu", "ik ben kwaad", "this is unacceptable", "i am angry", "i'm angry"
+  ];
+
+  const hasUrgent = urgent.some((k) => t.includes(k));
+  const hasAngry = angry.some((k) => t.includes(k));
+
+  return { hasUrgent, hasAngry, shouldEscalate: hasUrgent || hasAngry };
+}
+
+function buildEscalationReply(clientConfig, clientId) {
+  const lang = clientConfig.language || "nl";
+  const brandName = clientConfig.brandName || clientId;
+
+  const email =
+    (clientConfig.support && clientConfig.support.email) ||
+    clientConfig.supportEmail ||
+    "";
+
+  const contactUrl =
+    (clientConfig.support && clientConfig.support.contactFormUrl) ||
+    clientConfig.contactFormUrl ||
+    "";
+
+  const custom =
+    (clientConfig.support && clientConfig.support.escalationMessage) ||
+    "";
+
+  if (custom && String(custom).trim()) {
+    // If they defined their own escalation text, use it as-is (and append contact if missing)
+    let msg = String(custom).trim();
+    if (email && !msg.includes(email)) msg += `\n\nE-mail: ${email}`;
+    if (contactUrl && !msg.includes(contactUrl)) msg += `\nContact: ${contactUrl}`;
+    return msg;
+  }
+
+  if (String(lang).toLowerCase().startsWith("en")) {
+    let msg = `I’m sorry this has been frustrating. For urgent help, please contact ${brandName} support.`;
+    if (email) msg += `\n\nEmail: ${email}`;
+    if (contactUrl) msg += `\nContact form: ${contactUrl}`;
+    return msg;
+  }
+
+  let msg = `Het spijt me dat dit frustrerend is. Voor snelle hulp kun je direct contact opnemen met ${brandName} support.`;
+  if (email) msg += `\n\nE-mail: ${email}`;
+  if (contactUrl) msg += `\nContactformulier: ${contactUrl}`;
+  return msg;
 }
 
 // ---- Routes ----
@@ -586,26 +621,39 @@ app.post("/chat", async (req, res) => {
   const intent = detectIntent(message);
   setMeta(sessionId, { lastIntent: intent.mainIntent });
 
-  // ---- NEW: router follow-up (only when key info is missing) ----
+  // Always append user message to history
+  appendToHistory(sessionId, "user", message);
+
+  // ---- NEW: escalation check (before router + before model) ----
+  const escalation = detectAngryOrUrgent(message);
+  if (escalation.shouldEscalate) {
+    const reply = buildEscalationReply(data.clientConfig || {}, data.clientId);
+    appendToHistory(sessionId, "assistant", reply);
+    return res.json({
+      reply,
+      intent: { ...intent, mainIntent: "support_escalation" },
+      shopify: null,
+      routed: true,
+      escalated: true,
+    });
+  }
+
+  // ---- Existing: router follow-up (only when key info missing) ----
   const router = maybeHandleWithRouter({
     sessionId,
     message,
     intent,
     clientConfig: data.clientConfig || {},
-    brandName: data.clientConfig.brandName || data.clientId,
   });
 
-  // Always append user message to history
-  appendToHistory(sessionId, "user", message);
-
   if (router.handled) {
-    // Router returns a follow-up question WITHOUT calling OpenAI
     appendToHistory(sessionId, "assistant", router.reply);
     return res.json({
       reply: router.reply,
       intent,
       shopify: null,
       routed: true,
+      escalated: false,
     });
   }
 
@@ -624,7 +672,6 @@ app.post("/chat", async (req, res) => {
   const historyMessages = buildHistoryMessages(sessionId);
   const meta = getMeta(sessionId);
 
-  // Extra hint for the model about what’s going on (helps a lot)
   const flowHint = meta.expectedSlot
     ? `EXPECTED_USER_INPUT: The user is answering the bot's question. Slot expected: ${meta.expectedSlot}.`
     : "EXPECTED_USER_INPUT: none";
@@ -675,6 +722,7 @@ ${context || "No relevant knowledge matched."}
       intent,
       shopify,
       routed: false,
+      escalated: false,
     });
   } catch (e) {
     console.error("Chat error:", e.message);
@@ -685,3 +733,4 @@ ${context || "No relevant knowledge matched."}
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
+
