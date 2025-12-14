@@ -66,12 +66,80 @@ function sanitizeClientId(id) {
   const fallback = "Advantum";
   const raw = String(id || "").trim();
   if (!raw) return fallback;
-  // Only allow letters/numbers/_/-
   if (!/^[A-Za-z0-9_-]+$/.test(raw)) return fallback;
   return raw;
 }
 
-// ---- Intent detection (simple baseline, unchanged) ----
+function sanitizeSessionId(id) {
+  // Session IDs come from widget; keep it safe and bounded.
+  const raw = String(id || "").trim();
+  if (!raw) return "";
+  // allow only a-z 0-9 and a few safe chars
+  const cleaned = raw.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 80);
+  return cleaned;
+}
+
+// ---- Session memory (in-memory Map) ----
+// Stores last N messages per sessionId so follow-ups work.
+const SESSION_HISTORY_LIMIT = 10; // total messages (user + assistant)
+const SESSION_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
+
+// sessionId -> { updatedAt: number, messages: [{role, content}] }
+const sessionStore = new Map();
+
+function getSession(sessionId) {
+  if (!sessionId) return null;
+  const existing = sessionStore.get(sessionId);
+  if (!existing) return null;
+
+  // TTL check
+  if (Date.now() - existing.updatedAt > SESSION_TTL_MS) {
+    sessionStore.delete(sessionId);
+    return null;
+  }
+  return existing;
+}
+
+function upsertSession(sessionId, messages) {
+  if (!sessionId) return;
+  sessionStore.set(sessionId, {
+    updatedAt: Date.now(),
+    messages,
+  });
+}
+
+function appendToHistory(sessionId, role, content) {
+  if (!sessionId || !content) return;
+
+  const existing = getSession(sessionId);
+  const history = existing ? existing.messages.slice() : [];
+
+  history.push({ role, content });
+
+  // keep last N
+  const trimmed = history.slice(-SESSION_HISTORY_LIMIT);
+
+  upsertSession(sessionId, trimmed);
+}
+
+function buildHistoryMessages(sessionId) {
+  const existing = getSession(sessionId);
+  if (!existing) return [];
+  // return as-is; already sanitized before storage
+  return existing.messages.slice();
+}
+
+// simple cleanup occasionally
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of sessionStore.entries()) {
+    if (!val || now - val.updatedAt > SESSION_TTL_MS) {
+      sessionStore.delete(key);
+    }
+  }
+}, 1000 * 60 * 15); // every 15 min
+
+// ---- Intent detection (simple baseline) ----
 function detectIntent(message) {
   const text = message.toLowerCase();
 
@@ -106,7 +174,7 @@ function detectIntent(message) {
   return { mainIntent, orderNumber };
 }
 
-// ---- Shopify lookup (working simple version) ----
+// ---- Shopify lookup ----
 async function lookupShopifyOrder(orderNumberRaw) {
   if (!shopifyClient) return null;
 
@@ -165,7 +233,6 @@ function normalizeText(s) {
     .trim();
 }
 
-// small stopword set (NL + EN) to avoid scoring noise
 const STOPWORDS = new Set([
   "de","het","een","en","of","maar","want","dus","dat","dit","die","des","der",
   "ik","jij","je","u","hij","zij","ze","wij","we","jullie","hun","hen","mijn","jouw","uw",
@@ -189,7 +256,6 @@ function extractKeywords(query) {
   return [...new Set(keywords)];
 }
 
-// Chunk markdown by headings + paragraphs.
 function chunkMarkdown(source, markdown, maxChunkChars = 900) {
   const lines = String(markdown || "").split("\n");
 
@@ -335,7 +401,7 @@ function loadClient(clientIdRaw) {
   return { clientId, brandVoice, supportRules, chunks: allChunks, clientConfig };
 }
 
-// ---- Relevance scoring (improved) ----
+// ---- Relevance scoring ----
 function countHits(textNorm, keyword) {
   const k = keyword.trim();
   if (!k) return 0;
@@ -411,11 +477,10 @@ function selectTopChunks(chunks, message, limit = 8, maxTotalChars = 4500) {
   return selected;
 }
 
-// ---- NEW: Widget config endpoint (safe fields only) ----
+// ---- Widget config endpoint (unchanged from your working version) ----
 function buildWidgetConfig(clientConfig, clientId) {
   const brandName = clientConfig.brandName || clientId;
 
-  // support older flat config and new nested config
   const widgetTitle =
     (clientConfig.widget && clientConfig.widget.title) ||
     clientConfig.widgetTitle ||
@@ -434,7 +499,11 @@ function buildWidgetConfig(clientConfig, clientId) {
         primary: clientConfig.colors.primary || clientConfig.primaryColor || "#000000",
         accent: clientConfig.colors.accent || clientConfig.accentColor || "#2563eb",
         background: clientConfig.colors.background || "#ffffff",
-        userBubble: clientConfig.colors.userBubble || clientConfig.colors.primary || clientConfig.primaryColor || "#000000",
+        userBubble:
+          clientConfig.colors.userBubble ||
+          clientConfig.colors.primary ||
+          clientConfig.primaryColor ||
+          "#000000",
         botBubble: clientConfig.colors.botBubble || "#ffffff",
       }
     : {
@@ -449,7 +518,7 @@ function buildWidgetConfig(clientConfig, clientId) {
     brandName,
     assistantName: clientConfig.assistantName || widgetTitle,
     language: clientConfig.language || "nl",
-    noEmojis: clientConfig.noEmojis !== false, // default true
+    noEmojis: clientConfig.noEmojis !== false,
     logoUrl,
     widget: {
       title: widgetTitle,
@@ -475,10 +544,7 @@ app.get("/widget-config", (req, res) => {
   try {
     const data = loadClient(clientId);
     const widgetConfig = buildWidgetConfig(data.clientConfig || {}, data.clientId);
-
-    // Helpful caching (safe): 5 minutes
     res.setHeader("Cache-Control", "public, max-age=300");
-
     return res.json(widgetConfig);
   } catch (e) {
     console.error("widget-config error:", e.message);
@@ -486,12 +552,15 @@ app.get("/widget-config", (req, res) => {
   }
 });
 
+// ---- Chat ----
 app.post("/chat", async (req, res) => {
   const message = sanitizeUserMessage(req.body.message);
   if (!message) return res.status(400).json({ error: "Invalid message" });
 
   const clientId = sanitizeClientId(req.query.client || "Advantum");
+  const sessionId = sanitizeSessionId(req.body.sessionId);
   const data = loadClient(clientId);
+
   const intent = detectIntent(message);
 
   let shopify = null;
@@ -504,11 +573,20 @@ app.post("/chat", async (req, res) => {
     .map((c) => `### ${c.source}${c.heading ? " — " + c.heading : ""}\n${c.text}`)
     .join("\n\n");
 
+  // IMPORTANT: history comes BEFORE the current user message in the messages array
+  const historyMessages = buildHistoryMessages(sessionId);
+
   const systemPrompt = `
 You are the AI support bot for ${data.clientConfig.brandName || data.clientId}.
 Use the same language as the user. No emojis.
 Never guess policies, prices, or shipping rules.
-Only answer using the provided context. If the context does not contain the answer, say you are not sure and ask a short follow-up question.
+Only answer using the provided context.
+
+Conversation handling rules:
+- Use the chat history to understand what the user is answering.
+- If you asked a clarification question and the user answers it (e.g., product name), treat it as an answer and continue troubleshooting.
+- Do NOT respond with a full product description unless the user explicitly asks for product info.
+- Ask only 1 short follow-up question at a time when needed.
 
 BRAND VOICE:
 ${data.brandVoice || ""}
@@ -524,16 +602,27 @@ ${context || "No relevant knowledge matched."}
 `;
 
   try {
+    // Add user message to history BEFORE model call
+    appendToHistory(sessionId, "user", message);
+
     const response = await openai.chat.completions.create({
       model: "gpt-4.1-mini",
       messages: [
         { role: "system", content: systemPrompt },
+        // include previous turns (excluding system)
+        ...historyMessages,
+        // current user message (again) as the final message for the model
         { role: "user", content: message },
       ],
     });
 
+    const reply = response.choices[0].message.content;
+
+    // Save assistant reply to history
+    appendToHistory(sessionId, "assistant", reply);
+
     return res.json({
-      reply: response.choices[0].message.content,
+      reply,
       intent,
       shopify,
     });
@@ -546,3 +635,4 @@ ${context || "No relevant knowledge matched."}
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
+
