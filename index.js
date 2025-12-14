@@ -76,11 +76,25 @@ function sanitizeSessionId(id) {
   return raw.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 80);
 }
 
-// ---- Session memory + flow state ----
+function looksLikeEmail(s) {
+  const t = String(s || "").trim();
+  if (!t) return false;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t);
+}
+
+function extractOrderNumberFromText(message) {
+  const raw = String(message || "");
+  // capture sequences like 1055, 10-55, 10 55, #1055
+  const matches = raw.match(/(#?\d[\d\- ]*\d)/g);
+  if (!matches || !matches.length) return "";
+  return sanitizeOrderNumber(matches[matches.length - 1]);
+}
+
+// ---- Session memory + flow state + facts ----
 const SESSION_HISTORY_LIMIT = 10; // total messages (user + assistant)
 const SESSION_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
 
-// sessionId -> { updatedAt: number, messages: [{role, content}], meta: { expectedSlot?: string, lastIntent?: string } }
+// sessionId -> { updatedAt, messages: [{role, content}], meta: { expectedSlot, lastIntent, facts: {...} } }
 const sessionStore = new Map();
 
 function getSession(sessionId) {
@@ -129,6 +143,19 @@ function setMeta(sessionId, patch) {
   upsertSession(sessionId, messages, merged);
 }
 
+function getFacts(sessionId) {
+  const meta = getMeta(sessionId);
+  const facts = meta && meta.facts ? meta.facts : {};
+  return facts;
+}
+
+function setFacts(sessionId, patch) {
+  const meta = getMeta(sessionId);
+  const facts = meta && meta.facts ? { ...meta.facts } : {};
+  const mergedFacts = { ...facts, ...(patch || {}) };
+  setMeta(sessionId, { facts: mergedFacts });
+}
+
 function clearExpectedSlot(sessionId) {
   setMeta(sessionId, { expectedSlot: "" });
 }
@@ -155,9 +182,7 @@ function detectIntent(message) {
   const returns = ["retour", "refund", "terug", "herroep", "omruil"];
   const usage = ["gebruik", "how", "hoe", "tutorial", "uitleg"];
 
-  let orderNumber = "";
-  const matches = message.match(/(\d[\d\- ]*\d)/g);
-  if (matches) orderNumber = sanitizeOrderNumber(matches[matches.length - 1]);
+  let orderNumber = extractOrderNumberFromText(message);
 
   let mainIntent = "general";
   if (shipping.some((w) => text.includes(w)) || orderNumber) mainIntent = "shipping_or_order";
@@ -226,7 +251,6 @@ function normalizeText(s) {
     .trim();
 }
 
-// stopwords
 const STOPWORDS = new Set([
   "de","het","een","en","of","maar","want","dus","dat","dit","die","des","der",
   "ik","jij","je","u","hij","zij","ze","wij","we","jullie","hun","hen","mijn","jouw","uw",
@@ -427,7 +451,7 @@ function selectTopChunks(chunks, message, limit = 8, maxTotalChars = 4500) {
   return selected;
 }
 
-// ---- Widget config endpoint (unchanged) ----
+// ---- Widget config endpoint ----
 function buildWidgetConfig(clientConfig, clientId) {
   const brandName = clientConfig.brandName || clientId;
 
@@ -480,10 +504,13 @@ function buildWidgetConfig(clientConfig, clientId) {
   };
 }
 
-// ---- Smart follow-up router (existing) ----
+// ---- Smart follow-up router + FACT CAPTURE ----
 function isTroubleshootingLike(message) {
   const t = normalizeText(message);
-  const keys = ["werkt niet", "doet het niet", "kapot", "probleem", "storing", "error", "fout", "broken", "doesnt work", "doesn't work"];
+  const keys = [
+    "werkt niet", "doet het niet", "kapot", "probleem", "storing", "error", "fout",
+    "broken", "doesnt work", "doesn't work"
+  ];
   return keys.some((k) => t.includes(k));
 }
 
@@ -492,59 +519,117 @@ function buildFollowUpQuestion(language, intent, slot) {
     orderNumber: "Wat is je bestelnummer? Bijvoorbeeld #1055.",
     emailOrOrder: "Wat is je bestelnummer? Als je die niet hebt: met welk e-mailadres heb je besteld?",
     productName: "Welk product bedoel je precies?",
+    problemDetails: "Wat gaat er precies mis, en wat heb je al geprobeerd?",
   };
   const en = {
     orderNumber: "What is your order number? For example #1055.",
     emailOrOrder: "What is your order number? If you don’t have it: what email address did you order with?",
     productName: "Which product is it exactly?",
+    problemDetails: "What exactly is going wrong, and what have you tried already?",
   };
+
   const dict = String(language || "nl").toLowerCase().startsWith("en") ? en : nl;
   if (slot && dict[slot]) return dict[slot];
   if (intent === "shipping_or_order") return dict.orderNumber;
   if (intent === "return_or_withdrawal") return dict.emailOrOrder;
-  return dict.productName;
+  return dict.problemDetails;
+}
+
+function captureFactsFromExpectedSlot(sessionId, expectedSlot, userMessage) {
+  const msg = String(userMessage || "").trim();
+  if (!expectedSlot) return;
+
+  if (expectedSlot === "orderNumber") {
+    const order = extractOrderNumberFromText(msg);
+    if (order) setFacts(sessionId, { orderNumber: order });
+    return;
+  }
+
+  if (expectedSlot === "emailOrOrder") {
+    const order = extractOrderNumberFromText(msg);
+    if (order) {
+      setFacts(sessionId, { orderNumber: order });
+      return;
+    }
+    if (looksLikeEmail(msg)) setFacts(sessionId, { email: msg });
+    return;
+  }
+
+  if (expectedSlot === "productName") {
+    // Keep it short and safe
+    const cleaned = msg.slice(0, 80);
+    if (cleaned) setFacts(sessionId, { productName: cleaned });
+    return;
+  }
+
+  if (expectedSlot === "problemDetails") {
+    const cleaned = msg.slice(0, 200);
+    if (cleaned) setFacts(sessionId, { problemDetails: cleaned });
+    return;
+  }
 }
 
 function maybeHandleWithRouter({ sessionId, message, intent, clientConfig }) {
   const lang = clientConfig.language || "nl";
   const meta = getMeta(sessionId);
+  const facts = getFacts(sessionId);
   const expected = meta.expectedSlot || "";
 
+  // If we were expecting something, capture it into facts and continue (no immediate follow-up here)
   if (expected) {
+    captureFactsFromExpectedSlot(sessionId, expected, message);
     clearExpectedSlot(sessionId);
     return { handled: false };
   }
 
-  if (intent.mainIntent === "shipping_or_order" && !intent.orderNumber) {
-    setMeta(sessionId, { expectedSlot: "orderNumber", lastIntent: intent.mainIntent });
-    return { handled: true, reply: buildFollowUpQuestion(lang, intent.mainIntent, "orderNumber") };
+  // Always persist order number if present in any message
+  if (intent.orderNumber) {
+    setFacts(sessionId, { orderNumber: intent.orderNumber });
   }
 
-  if (intent.mainIntent === "return_or_withdrawal" && !intent.orderNumber) {
-    setMeta(sessionId, { expectedSlot: "emailOrOrder", lastIntent: intent.mainIntent });
-    return { handled: true, reply: buildFollowUpQuestion(lang, intent.mainIntent, "emailOrOrder") };
+  // 1) Shipping/order: if no order in this message but we already have it, use it (don’t ask again)
+  if (intent.mainIntent === "shipping_or_order") {
+    const orderKnown = intent.orderNumber || facts.orderNumber;
+    if (!orderKnown) {
+      setMeta(sessionId, { expectedSlot: "orderNumber", lastIntent: intent.mainIntent });
+      return { handled: true, reply: buildFollowUpQuestion(lang, intent.mainIntent, "orderNumber") };
+    }
   }
 
+  // 2) Returns: ask order number or email if both missing
+  if (intent.mainIntent === "return_or_withdrawal") {
+    const orderKnown = intent.orderNumber || facts.orderNumber;
+    const emailKnown = facts.email;
+    if (!orderKnown && !emailKnown) {
+      setMeta(sessionId, { expectedSlot: "emailOrOrder", lastIntent: intent.mainIntent });
+      return { handled: true, reply: buildFollowUpQuestion(lang, intent.mainIntent, "emailOrOrder") };
+    }
+  }
+
+  // 3) Troubleshooting: if problem-like, first ask product name if unknown; otherwise ask problem details if missing
   if ((intent.mainIntent === "product_usage" || intent.mainIntent === "general") && isTroubleshootingLike(message)) {
-    setMeta(sessionId, { expectedSlot: "productName", lastIntent: "product_troubleshooting" });
-    return { handled: true, reply: buildFollowUpQuestion(lang, "product_usage", "productName") };
+    if (!facts.productName) {
+      setMeta(sessionId, { expectedSlot: "productName", lastIntent: "product_troubleshooting" });
+      return { handled: true, reply: buildFollowUpQuestion(lang, "product_usage", "productName") };
+    }
+    if (!facts.problemDetails) {
+      setMeta(sessionId, { expectedSlot: "problemDetails", lastIntent: "product_troubleshooting" });
+      return { handled: true, reply: buildFollowUpQuestion(lang, "product_usage", "problemDetails") };
+    }
   }
 
   return { handled: false };
 }
 
-// ---- NEW: Angry / urgent detection ----
+// ---- Angry / urgent detection ----
 function detectAngryOrUrgent(message) {
   const t = normalizeText(message);
 
-  const urgent = [
-    "urgent", "met spoed", "direct", "nu hulp", "nu meteen", "asap", "immediately"
-  ];
-
+  const urgent = ["urgent", "met spoed", "direct", "nu hulp", "nu meteen", "asap", "immediately"];
   const angry = [
-    "boos", "woest", "geïrriteerd", "geirriteerd", "kut", "belachelijk", "ridiculous",
-    "slecht", "waardeloos", "oplichter", "scam", "fraude", "ik ben er klaar mee",
-    "ik wil nu", "ik ben kwaad", "this is unacceptable", "i am angry", "i'm angry"
+    "boos", "woest", "geïrriteerd", "geirriteerd", "belachelijk", "ridiculous",
+    "waardeloos", "oplichter", "scam", "fraude", "ik ben er klaar mee",
+    "this is unacceptable", "i am angry", "i'm angry"
   ];
 
   const hasUrgent = urgent.some((k) => t.includes(k));
@@ -572,7 +657,6 @@ function buildEscalationReply(clientConfig, clientId) {
     "";
 
   if (custom && String(custom).trim()) {
-    // If they defined their own escalation text, use it as-is (and append contact if missing)
     let msg = String(custom).trim();
     if (email && !msg.includes(email)) msg += `\n\nE-mail: ${email}`;
     if (contactUrl && !msg.includes(contactUrl)) msg += `\nContact: ${contactUrl}`;
@@ -618,31 +702,36 @@ app.post("/chat", async (req, res) => {
   const sessionId = sanitizeSessionId(req.body.sessionId);
   const data = loadClient(clientId);
 
-  const intent = detectIntent(message);
-  setMeta(sessionId, { lastIntent: intent.mainIntent });
+  const intentRaw = detectIntent(message);
+
+  // Persist order number immediately if we see one
+  if (intentRaw.orderNumber) setFacts(sessionId, { orderNumber: intentRaw.orderNumber });
+
+  setMeta(sessionId, { lastIntent: intentRaw.mainIntent });
 
   // Always append user message to history
   appendToHistory(sessionId, "user", message);
 
-  // ---- NEW: escalation check (before router + before model) ----
+  // Escalation check (before router + model)
   const escalation = detectAngryOrUrgent(message);
   if (escalation.shouldEscalate) {
     const reply = buildEscalationReply(data.clientConfig || {}, data.clientId);
     appendToHistory(sessionId, "assistant", reply);
     return res.json({
       reply,
-      intent: { ...intent, mainIntent: "support_escalation" },
+      intent: { ...intentRaw, mainIntent: "support_escalation" },
       shopify: null,
       routed: true,
       escalated: true,
+      facts: getFacts(sessionId),
     });
   }
 
-  // ---- Existing: router follow-up (only when key info missing) ----
+  // Router follow-up + fact capture
   const router = maybeHandleWithRouter({
     sessionId,
     message,
-    intent,
+    intent: intentRaw,
     clientConfig: data.clientConfig || {},
   });
 
@@ -650,21 +739,34 @@ app.post("/chat", async (req, res) => {
     appendToHistory(sessionId, "assistant", router.reply);
     return res.json({
       reply: router.reply,
-      intent,
+      intent: intentRaw,
       shopify: null,
       routed: true,
       escalated: false,
+      facts: getFacts(sessionId),
     });
   }
 
-  // ---- Shopify lookup ----
+  // Build effective intent/order using stored facts
+  const facts = getFacts(sessionId);
+  const effectiveIntent = {
+    ...intentRaw,
+    orderNumber: intentRaw.orderNumber || facts.orderNumber || "",
+  };
+
+  // Shopify lookup using effective order number
   let shopify = null;
-  if (intent.mainIntent === "shipping_or_order" && intent.orderNumber) {
-    shopify = await lookupShopifyOrder(intent.orderNumber);
+  if (effectiveIntent.mainIntent === "shipping_or_order" && effectiveIntent.orderNumber) {
+    shopify = await lookupShopifyOrder(effectiveIntent.orderNumber);
   }
 
-  // ---- Context ----
-  const topChunks = selectTopChunks(data.chunks, message, 8, 4500);
+  // Improve retrieval when user message is short and we already know the product
+  const retrievalQuery =
+    (message.length < 30 && facts.productName)
+      ? `${message} ${facts.productName}`
+      : message;
+
+  const topChunks = selectTopChunks(data.chunks, retrievalQuery, 8, 4500);
   const context = topChunks
     .map((c) => `### ${c.source}${c.heading ? " — " + c.heading : ""}\n${c.text}`)
     .join("\n\n");
@@ -676,6 +778,14 @@ app.post("/chat", async (req, res) => {
     ? `EXPECTED_USER_INPUT: The user is answering the bot's question. Slot expected: ${meta.expectedSlot}.`
     : "EXPECTED_USER_INPUT: none";
 
+  const factsBlock = `
+FACTS WE ALREADY KNOW (persisted from earlier messages):
+- productName: ${facts.productName || "unknown"}
+- orderNumber: ${facts.orderNumber || "unknown"}
+- email: ${facts.email || "unknown"}
+- problemDetails: ${facts.problemDetails || "unknown"}
+`.trim();
+
   const systemPrompt = `
 You are the AI support bot for ${data.clientConfig.brandName || data.clientId}.
 Use the same language as the user. No emojis.
@@ -683,12 +793,14 @@ Never guess policies, prices, or shipping rules.
 Only answer using the provided context.
 
 Conversation handling rules:
-- Use the chat history to understand what the user is answering.
+- Use the chat history and FACTS WE ALREADY KNOW to understand what the user is answering.
 - If the user is answering a clarification question (e.g., product name, order number), treat it as an answer and continue.
 - Ask only 1 short follow-up question at a time when needed.
 - Do NOT respond with a full product description unless the user explicitly asks for product info.
 
 ${flowHint}
+
+${factsBlock}
 
 BRAND VOICE:
 ${data.brandVoice || ""}
@@ -714,15 +826,15 @@ ${context || "No relevant knowledge matched."}
     });
 
     const reply = response.choices[0].message.content;
-
     appendToHistory(sessionId, "assistant", reply);
 
     return res.json({
       reply,
-      intent,
+      intent: effectiveIntent,
       shopify,
       routed: false,
       escalated: false,
+      facts: getFacts(sessionId),
     });
   } catch (e) {
     console.error("Chat error:", e.message);
@@ -733,4 +845,3 @@ ${context || "No relevant knowledge matched."}
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
-
