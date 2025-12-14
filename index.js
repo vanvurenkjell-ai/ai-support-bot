@@ -71,28 +71,22 @@ function sanitizeClientId(id) {
 }
 
 function sanitizeSessionId(id) {
-  // Session IDs come from widget; keep it safe and bounded.
   const raw = String(id || "").trim();
   if (!raw) return "";
-  // allow only a-z 0-9 and a few safe chars
-  const cleaned = raw.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 80);
-  return cleaned;
+  return raw.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 80);
 }
 
-// ---- Session memory (in-memory Map) ----
-// Stores last N messages per sessionId so follow-ups work.
+// ---- Session memory + lightweight flow state ----
 const SESSION_HISTORY_LIMIT = 10; // total messages (user + assistant)
 const SESSION_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
 
-// sessionId -> { updatedAt: number, messages: [{role, content}] }
+// sessionId -> { updatedAt: number, messages: [{role, content}], meta: { expectedSlot?: string, lastIntent?: string } }
 const sessionStore = new Map();
 
 function getSession(sessionId) {
   if (!sessionId) return null;
   const existing = sessionStore.get(sessionId);
   if (!existing) return null;
-
-  // TTL check
   if (Date.now() - existing.updatedAt > SESSION_TTL_MS) {
     sessionStore.delete(sessionId);
     return null;
@@ -100,76 +94,75 @@ function getSession(sessionId) {
   return existing;
 }
 
-function upsertSession(sessionId, messages) {
+function upsertSession(sessionId, messages, meta) {
   if (!sessionId) return;
   sessionStore.set(sessionId, {
     updatedAt: Date.now(),
     messages,
+    meta: meta || {},
   });
 }
 
 function appendToHistory(sessionId, role, content) {
   if (!sessionId || !content) return;
-
   const existing = getSession(sessionId);
   const history = existing ? existing.messages.slice() : [];
+  const meta = existing ? { ...(existing.meta || {}) } : {};
 
   history.push({ role, content });
-
-  // keep last N
   const trimmed = history.slice(-SESSION_HISTORY_LIMIT);
 
-  upsertSession(sessionId, trimmed);
+  upsertSession(sessionId, trimmed, meta);
+}
+
+function getMeta(sessionId) {
+  const s = getSession(sessionId);
+  return s && s.meta ? s.meta : {};
+}
+
+function setMeta(sessionId, patch) {
+  if (!sessionId) return;
+  const existing = getSession(sessionId);
+  const messages = existing ? existing.messages.slice() : [];
+  const meta = existing ? { ...(existing.meta || {}) } : {};
+  const merged = { ...meta, ...(patch || {}) };
+  upsertSession(sessionId, messages, merged);
+}
+
+function clearExpectedSlot(sessionId) {
+  setMeta(sessionId, { expectedSlot: "" });
 }
 
 function buildHistoryMessages(sessionId) {
   const existing = getSession(sessionId);
   if (!existing) return [];
-  // return as-is; already sanitized before storage
   return existing.messages.slice();
 }
 
-// simple cleanup occasionally
+// periodic cleanup
 setInterval(() => {
   const now = Date.now();
   for (const [key, val] of sessionStore.entries()) {
-    if (!val || now - val.updatedAt > SESSION_TTL_MS) {
-      sessionStore.delete(key);
-    }
+    if (!val || now - val.updatedAt > SESSION_TTL_MS) sessionStore.delete(key);
   }
-}, 1000 * 60 * 15); // every 15 min
+}, 1000 * 60 * 15);
 
-// ---- Intent detection (simple baseline) ----
+// ---- Intent detection (baseline) ----
 function detectIntent(message) {
   const text = message.toLowerCase();
 
-  const shipping = [
-    "verzending",
-    "bezorg",
-    "track",
-    "order",
-    "shipping",
-    "delivery",
-  ];
+  const shipping = ["verzending", "bezorg", "track", "order", "shipping", "delivery"];
   const returns = ["retour", "refund", "terug", "herroep", "omruil"];
   const usage = ["gebruik", "how", "hoe", "tutorial", "uitleg"];
 
   let orderNumber = "";
   const matches = message.match(/(\d[\d\- ]*\d)/g);
-  if (matches) {
-    orderNumber = sanitizeOrderNumber(matches[matches.length - 1]);
-  }
+  if (matches) orderNumber = sanitizeOrderNumber(matches[matches.length - 1]);
 
   let mainIntent = "general";
-  if (shipping.some((w) => text.includes(w)) || orderNumber) {
-    mainIntent = "shipping_or_order";
-  }
-  if (returns.some((w) => text.includes(w))) {
-    mainIntent = "return_or_withdrawal";
-  }
-  if (usage.some((w) => text.includes(w)) && mainIntent === "general") {
-    mainIntent = "product_usage";
-  }
+  if (shipping.some((w) => text.includes(w)) || orderNumber) mainIntent = "shipping_or_order";
+  if (returns.some((w) => text.includes(w))) mainIntent = "return_or_withdrawal";
+  if (usage.some((w) => text.includes(w)) && mainIntent === "general") mainIntent = "product_usage";
 
   return { mainIntent, orderNumber };
 }
@@ -215,7 +208,7 @@ async function lookupShopifyOrder(orderNumberRaw) {
   }
 }
 
-// ---- Knowledge loading + improved structure ----
+// ---- Knowledge loading ----
 function readFile(path) {
   try {
     return fs.existsSync(path) ? fs.readFileSync(path, "utf8") : "";
@@ -272,11 +265,7 @@ function chunkMarkdown(source, markdown, maxChunkChars = 900) {
     if (!text) return;
 
     if (text.length <= maxChunkChars) {
-      chunks.push({
-        source,
-        heading: [h1, h2, h3].filter(Boolean).join(" > "),
-        text,
-      });
+      chunks.push({ source, heading: [h1, h2, h3].filter(Boolean).join(" > "), text });
       return;
     }
 
@@ -287,23 +276,13 @@ function chunkMarkdown(source, markdown, maxChunkChars = 900) {
       if (!part) continue;
 
       if ((current + "\n\n" + part).trim().length > maxChunkChars && current.trim()) {
-        chunks.push({
-          source,
-          heading: [h1, h2, h3].filter(Boolean).join(" > "),
-          text: current.trim(),
-        });
+        chunks.push({ source, heading: [h1, h2, h3].filter(Boolean).join(" > "), text: current.trim() });
         current = part;
       } else {
         current = (current ? current + "\n\n" : "") + part;
       }
     }
-    if (current.trim()) {
-      chunks.push({
-        source,
-        heading: [h1, h2, h3].filter(Boolean).join(" > "),
-        text: current.trim(),
-      });
-    }
+    if (current.trim()) chunks.push({ source, heading: [h1, h2, h3].filter(Boolean).join(" > "), text: current.trim() });
   }
 
   for (const raw of lines) {
@@ -312,24 +291,9 @@ function chunkMarkdown(source, markdown, maxChunkChars = 900) {
     const h2m = line.match(/^##\s+(.+)/);
     const h3m = line.match(/^###\s+(.+)/);
 
-    if (h1m) {
-      flushBuffer();
-      h1 = h1m[1].trim();
-      h2 = "";
-      h3 = "";
-      continue;
-    }
-    if (h2m) {
-      flushBuffer();
-      h2 = h2m[1].trim();
-      h3 = "";
-      continue;
-    }
-    if (h3m) {
-      flushBuffer();
-      h3 = h3m[1].trim();
-      continue;
-    }
+    if (h1m) { flushBuffer(); h1 = h1m[1].trim(); h2 = ""; h3 = ""; continue; }
+    if (h2m) { flushBuffer(); h2 = h2m[1].trim(); h3 = ""; continue; }
+    if (h3m) { flushBuffer(); h3 = h3m[1].trim(); continue; }
 
     buffer += line + "\n";
   }
@@ -386,13 +350,7 @@ function loadClient(clientIdRaw) {
     if (!content || !content.trim()) continue;
 
     const chunks = chunkMarkdown(file, content, 900);
-    for (const c of chunks) {
-      allChunks.push({
-        source: file,
-        heading: c.heading || "",
-        text: c.text,
-      });
-    }
+    for (const c of chunks) allChunks.push({ source: file, heading: c.heading || "", text: c.text });
   }
 
   const clientConfigRaw = readFile(`${base}/client-config.json`) || "{}";
@@ -422,13 +380,10 @@ function scoreChunk(chunk, queryKeywords) {
   let score = 0;
 
   for (const kw of queryKeywords) {
-    const hitsText = countHits(textNorm, kw);
-    const hitsHeading = headingNorm ? countHits(headingNorm, kw) : 0;
-    score += hitsText * 2 + hitsHeading * 4;
+    score += countHits(textNorm, kw) * 2 + (headingNorm ? countHits(headingNorm, kw) * 4 : 0);
   }
 
-  const weight = SOURCE_WEIGHT[chunk.source] || 1;
-  return score * weight;
+  return score * (SOURCE_WEIGHT[chunk.source] || 1);
 }
 
 function isPolicyLikeQuestion(msgNorm) {
@@ -446,19 +401,15 @@ function selectTopChunks(chunks, message, limit = 8, maxTotalChars = 4500) {
   const keywords = extractKeywords(message);
 
   const scored = chunks
-    .map((c) => ({
-      ...c,
-      score: scoreChunk(c, keywords),
-    }))
+    .map((c) => ({ ...c, score: scoreChunk(c, keywords) }))
     .filter((c) => c.score > 0)
     .sort((a, b) => b.score - a.score);
 
   if (!scored.length && isPolicyLikeQuestion(msgNorm)) {
-    const fallback = chunks
+    return chunks
       .filter((c) => c.source === "Policies.md" || c.source === "Shipping matrix.md")
       .slice(0, limit)
       .map((c) => ({ ...c, score: 1 }));
-    return fallback;
   }
 
   const selected = [];
@@ -467,17 +418,15 @@ function selectTopChunks(chunks, message, limit = 8, maxTotalChars = 4500) {
   for (const c of scored) {
     const block = `### ${c.source}${c.heading ? " — " + c.heading : ""}\n${c.text}\n`;
     if (total + block.length > maxTotalChars) continue;
-
     selected.push(c);
     total += block.length;
-
     if (selected.length >= limit) break;
   }
 
   return selected;
 }
 
-// ---- Widget config endpoint (unchanged from your working version) ----
+// ---- Widget config endpoint (unchanged) ----
 function buildWidgetConfig(clientConfig, clientId) {
   const brandName = clientConfig.brandName || clientId;
 
@@ -520,10 +469,7 @@ function buildWidgetConfig(clientConfig, clientId) {
     language: clientConfig.language || "nl",
     noEmojis: clientConfig.noEmojis !== false,
     logoUrl,
-    widget: {
-      title: widgetTitle,
-      greeting: widgetGreeting,
-    },
+    widget: { title: widgetTitle, greeting: widgetGreeting },
     colors,
     support: {
       email: clientConfig.supportEmail || null,
@@ -533,6 +479,84 @@ function buildWidgetConfig(clientConfig, clientId) {
   };
 }
 
+// ---- NEW: Smart follow-up router (slot filling) ----
+function isTroubleshootingLike(message) {
+  const t = normalizeText(message);
+  const keys = ["werkt niet", "doet het niet", "kapot", "probleem", "storing", "error", "fout", "werkt", "broken", "doesnt work", "doesn't work"];
+  return keys.some((k) => t.includes(k));
+}
+
+function buildFollowUpQuestion(language, intent, slot, brandName) {
+  // Keep it short, one question, no emojis.
+  const nl = {
+    orderNumber: "Wat is je bestelnummer? Bijvoorbeeld #1055.",
+    emailOrOrder: "Wat is je bestelnummer? Als je die niet hebt: met welk e-mailadres heb je besteld?",
+    productName: "Welk product bedoel je precies?",
+    problemDetails: "Wat gaat er precies mis, en wat heb je al geprobeerd?",
+  };
+
+  const en = {
+    orderNumber: "What is your order number? For example #1055.",
+    emailOrOrder: "What is your order number? If you don’t have it: what email address did you order with?",
+    productName: "Which product is it exactly?",
+    problemDetails: "What exactly is going wrong, and what have you tried already?",
+  };
+
+  const dict = (String(language || "nl").toLowerCase().startsWith("en")) ? en : nl;
+
+  // slot -> text
+  if (slot && dict[slot]) return dict[slot];
+
+  // fallback per intent
+  if (intent === "shipping_or_order") return dict.orderNumber;
+  if (intent === "return_or_withdrawal") return dict.emailOrOrder;
+  if (intent === "product_usage") return dict.problemDetails;
+
+  // general fallback
+  return (String(language || "nl").toLowerCase().startsWith("en"))
+    ? `How can I help you with your ${brandName} question?`
+    : `Waar kan ik je mee helpen?`;
+}
+
+function maybeHandleWithRouter({ sessionId, message, intent, clientConfig, brandName }) {
+  const lang = clientConfig.language || "nl";
+
+  const meta = getMeta(sessionId);
+  const expected = meta.expectedSlot || "";
+
+  // If we were expecting a specific slot, treat user message as that slot and continue (no immediate follow-up response here).
+  // We just clear the slot so the model can move to the next step.
+  if (expected) {
+    clearExpectedSlot(sessionId);
+    return { handled: false };
+  }
+
+  // Decide if we need to ask a follow-up BEFORE calling the model
+  // 1) Shipping/order: require order number (for best assistance)
+  if (intent.mainIntent === "shipping_or_order" && !intent.orderNumber) {
+    setMeta(sessionId, { expectedSlot: "orderNumber", lastIntent: intent.mainIntent });
+    const q = buildFollowUpQuestion(lang, intent.mainIntent, "orderNumber", brandName);
+    return { handled: true, reply: q };
+  }
+
+  // 2) Returns: ask order number or email if missing
+  if (intent.mainIntent === "return_or_withdrawal" && !intent.orderNumber) {
+    setMeta(sessionId, { expectedSlot: "emailOrOrder", lastIntent: intent.mainIntent });
+    const q = buildFollowUpQuestion(lang, intent.mainIntent, "emailOrOrder", brandName);
+    return { handled: true, reply: q };
+  }
+
+  // 3) Troubleshooting-like: ask product name first if user didn't provide detail
+  // We keep this conservative: only trigger when user is clearly describing a problem.
+  if ((intent.mainIntent === "product_usage" || intent.mainIntent === "general") && isTroubleshootingLike(message)) {
+    setMeta(sessionId, { expectedSlot: "productName", lastIntent: "product_troubleshooting" });
+    const q = buildFollowUpQuestion(lang, "product_usage", "productName", brandName);
+    return { handled: true, reply: q };
+  }
+
+  return { handled: false };
+}
+
 // ---- Routes ----
 app.get("/", (req, res) => {
   res.send("AI support backend running.");
@@ -540,7 +564,6 @@ app.get("/", (req, res) => {
 
 app.get("/widget-config", (req, res) => {
   const clientId = sanitizeClientId(req.query.client || "Advantum");
-
   try {
     const data = loadClient(clientId);
     const widgetConfig = buildWidgetConfig(data.clientConfig || {}, data.clientId);
@@ -552,7 +575,6 @@ app.get("/widget-config", (req, res) => {
   }
 });
 
-// ---- Chat ----
 app.post("/chat", async (req, res) => {
   const message = sanitizeUserMessage(req.body.message);
   if (!message) return res.status(400).json({ error: "Invalid message" });
@@ -562,19 +584,50 @@ app.post("/chat", async (req, res) => {
   const data = loadClient(clientId);
 
   const intent = detectIntent(message);
+  setMeta(sessionId, { lastIntent: intent.mainIntent });
 
+  // ---- NEW: router follow-up (only when key info is missing) ----
+  const router = maybeHandleWithRouter({
+    sessionId,
+    message,
+    intent,
+    clientConfig: data.clientConfig || {},
+    brandName: data.clientConfig.brandName || data.clientId,
+  });
+
+  // Always append user message to history
+  appendToHistory(sessionId, "user", message);
+
+  if (router.handled) {
+    // Router returns a follow-up question WITHOUT calling OpenAI
+    appendToHistory(sessionId, "assistant", router.reply);
+    return res.json({
+      reply: router.reply,
+      intent,
+      shopify: null,
+      routed: true,
+    });
+  }
+
+  // ---- Shopify lookup ----
   let shopify = null;
   if (intent.mainIntent === "shipping_or_order" && intent.orderNumber) {
     shopify = await lookupShopifyOrder(intent.orderNumber);
   }
 
+  // ---- Context ----
   const topChunks = selectTopChunks(data.chunks, message, 8, 4500);
   const context = topChunks
     .map((c) => `### ${c.source}${c.heading ? " — " + c.heading : ""}\n${c.text}`)
     .join("\n\n");
 
-  // IMPORTANT: history comes BEFORE the current user message in the messages array
   const historyMessages = buildHistoryMessages(sessionId);
+  const meta = getMeta(sessionId);
+
+  // Extra hint for the model about what’s going on (helps a lot)
+  const flowHint = meta.expectedSlot
+    ? `EXPECTED_USER_INPUT: The user is answering the bot's question. Slot expected: ${meta.expectedSlot}.`
+    : "EXPECTED_USER_INPUT: none";
 
   const systemPrompt = `
 You are the AI support bot for ${data.clientConfig.brandName || data.clientId}.
@@ -584,9 +637,11 @@ Only answer using the provided context.
 
 Conversation handling rules:
 - Use the chat history to understand what the user is answering.
-- If you asked a clarification question and the user answers it (e.g., product name), treat it as an answer and continue troubleshooting.
-- Do NOT respond with a full product description unless the user explicitly asks for product info.
+- If the user is answering a clarification question (e.g., product name, order number), treat it as an answer and continue.
 - Ask only 1 short follow-up question at a time when needed.
+- Do NOT respond with a full product description unless the user explicitly asks for product info.
+
+${flowHint}
 
 BRAND VOICE:
 ${data.brandVoice || ""}
@@ -602,29 +657,24 @@ ${context || "No relevant knowledge matched."}
 `;
 
   try {
-    // Add user message to history BEFORE model call
-    appendToHistory(sessionId, "user", message);
-
     const response = await openai.chat.completions.create({
       model: "gpt-4.1-mini",
       messages: [
         { role: "system", content: systemPrompt },
-        // include previous turns (excluding system)
         ...historyMessages,
-        // current user message (again) as the final message for the model
         { role: "user", content: message },
       ],
     });
 
     const reply = response.choices[0].message.content;
 
-    // Save assistant reply to history
     appendToHistory(sessionId, "assistant", reply);
 
     return res.json({
       reply,
       intent,
       shopify,
+      routed: false,
     });
   } catch (e) {
     console.error("Chat error:", e.message);
@@ -635,4 +685,3 @@ ${context || "No relevant knowledge matched."}
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
-
