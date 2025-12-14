@@ -1,9 +1,34 @@
 {
+  "version": "1.0.0",
+
   "brandName": "Advantum",
+  "assistantName": "Advantum klantenservice assistent",
+
+  "logoUrl": "https://cdn.shopify.com/s/files/1/0823/3631/7768/files/advantum-logo-favicon.png?v=1747808684",
+
+  "language": "nl",
+  "noEmojis": true,
+
   "supportEmail": "info@advantum.nl",
-  "contactFormUrl": "https://advantum.nl/pages/contact", 
-  "widgetTitle": "Advantum Support",
-  "widgetGreeting": "Hi, I'm the Advantum support assistant. Ask me anything about your order, shipping, returns or how to use our equipment.",
-  "primaryColor": "#000000",
-  "accentColor": "#2563eb"
+  "contactFormUrl": "https://advantum.nl/pages/contact",
+
+  "widget": {
+    "title": "Advantum klantenservice assistent",
+    "greeting": "Hallo! Ik ben de Advantum klantenservice assistent. Fijn dat je er bent. Waar kan ik je mee helpen?"
+  },
+
+  "colors": {
+    "primary": "#000000",
+    "accent": "#2563eb",
+    "background": "#ffffff",
+    "userBubble": "#000000",
+    "botBubble": "#ffffff"
+  },
+
+  "features": {
+    "orderLookup": true,
+    "returns": true,
+    "productAdvice": true,
+    "humanHandoff": true
+  }
 }
