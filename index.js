@@ -62,11 +62,27 @@ function sanitizeOrderNumber(orderNumber) {
     .slice(0, 40);
 }
 
+function sanitizeClientId(id) {
+  const fallback = "Advantum";
+  const raw = String(id || "").trim();
+  if (!raw) return fallback;
+  // Only allow letters/numbers/_/-
+  if (!/^[A-Za-z0-9_-]+$/.test(raw)) return fallback;
+  return raw;
+}
+
 // ---- Intent detection (simple baseline, unchanged) ----
 function detectIntent(message) {
   const text = message.toLowerCase();
 
-  const shipping = ["verzending", "bezorg", "track", "order", "shipping", "delivery"];
+  const shipping = [
+    "verzending",
+    "bezorg",
+    "track",
+    "order",
+    "shipping",
+    "delivery",
+  ];
   const returns = ["retour", "refund", "terug", "herroep", "omruil"];
   const usage = ["gebruik", "how", "hoe", "tutorial", "uitleg"];
 
@@ -104,22 +120,25 @@ async function lookupShopifyOrder(orderNumberRaw) {
       params: { name: nameParam, status: "any" },
     });
 
-    const orders = (res.data && res.data.orders) ? res.data.orders : [];
+    const orders = res.data && res.data.orders ? res.data.orders : [];
     if (!orders.length) return null;
 
     const order = orders[0];
-    const fulfillment = order.fulfillments && order.fulfillments[0] ? order.fulfillments[0] : null;
+    const fulfillment =
+      order.fulfillments && order.fulfillments[0] ? order.fulfillments[0] : null;
 
     return {
       orderName: order.name || null,
       fulfillmentStatus: order.fulfillment_status || null,
       financialStatus: order.financial_status || null,
-      tracking: fulfillment && fulfillment.tracking_numbers && fulfillment.tracking_numbers[0]
-        ? fulfillment.tracking_numbers[0]
-        : null,
-      trackingUrl: fulfillment && fulfillment.tracking_urls && fulfillment.tracking_urls[0]
-        ? fulfillment.tracking_urls[0]
-        : null,
+      tracking:
+        fulfillment && fulfillment.tracking_numbers && fulfillment.tracking_numbers[0]
+          ? fulfillment.tracking_numbers[0]
+          : null,
+      trackingUrl:
+        fulfillment && fulfillment.tracking_urls && fulfillment.tracking_urls[0]
+          ? fulfillment.tracking_urls[0]
+          : null,
       createdAt: order.created_at || null,
     };
   } catch (e) {
@@ -167,12 +186,10 @@ function extractKeywords(query) {
     if (STOPWORDS.has(p)) continue;
     keywords.push(p);
   }
-  // de-dupe while preserving order
   return [...new Set(keywords)];
 }
 
 // Chunk markdown by headings + paragraphs.
-// Each chunk keeps its "heading path" for better context.
 function chunkMarkdown(source, markdown, maxChunkChars = 900) {
   const lines = String(markdown || "").split("\n");
 
@@ -188,7 +205,6 @@ function chunkMarkdown(source, markdown, maxChunkChars = 900) {
     buffer = "";
     if (!text) return;
 
-    // split oversized buffers into smaller parts
     if (text.length <= maxChunkChars) {
       chunks.push({
         source,
@@ -198,7 +214,6 @@ function chunkMarkdown(source, markdown, maxChunkChars = 900) {
       return;
     }
 
-    // hard split by paragraphs
     const paras = text.split(/\n{2,}/);
     let current = "";
     for (const p of paras) {
@@ -254,13 +269,9 @@ function chunkMarkdown(source, markdown, maxChunkChars = 900) {
   }
 
   flushBuffer();
-
-  // drop tiny chunks (noise)
   return chunks.filter((c) => c.text && c.text.trim().length >= 80);
 }
 
-// source weighting (structure improvement)
-// policies/shipping matrix should win when query matches those topics
 const SOURCE_WEIGHT = {
   "Policies.md": 3,
   "Shipping matrix.md": 3,
@@ -274,7 +285,17 @@ const SOURCE_WEIGHT = {
   "Legal.md": 1,
 };
 
-function loadClient(clientId) {
+function safeJsonParse(raw, fallback = {}) {
+  try {
+    const obj = JSON.parse(raw);
+    return obj && typeof obj === "object" ? obj : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function loadClient(clientIdRaw) {
+  const clientId = sanitizeClientId(clientIdRaw);
   const base = `./Clients/${clientId}`;
 
   const brandVoice = readFile(`${base}/Brand voice.md`);
@@ -308,15 +329,14 @@ function loadClient(clientId) {
     }
   }
 
-  const clientConfig = JSON.parse(readFile(`${base}/client-config.json`) || "{}");
+  const clientConfigRaw = readFile(`${base}/client-config.json`) || "{}";
+  const clientConfig = safeJsonParse(clientConfigRaw, {});
 
-  return { brandVoice, supportRules, chunks: allChunks, clientConfig };
+  return { clientId, brandVoice, supportRules, chunks: allChunks, clientConfig };
 }
 
 // ---- Relevance scoring (improved) ----
 function countHits(textNorm, keyword) {
-  // simple whole-word-ish match
-  // we avoid expensive regex; we score by occurrences of " keyword " boundaries
   const k = keyword.trim();
   if (!k) return 0;
   let count = 0;
@@ -338,15 +358,11 @@ function scoreChunk(chunk, queryKeywords) {
   for (const kw of queryKeywords) {
     const hitsText = countHits(textNorm, kw);
     const hitsHeading = headingNorm ? countHits(headingNorm, kw) : 0;
-
-    // heading hits are more important than body hits
     score += hitsText * 2 + hitsHeading * 4;
   }
 
   const weight = SOURCE_WEIGHT[chunk.source] || 1;
-  score = score * weight;
-
-  return score;
+  return score * weight;
 }
 
 function isPolicyLikeQuestion(msgNorm) {
@@ -359,7 +375,6 @@ function isPolicyLikeQuestion(msgNorm) {
   return keys.some((k) => msgNorm.includes(k));
 }
 
-// Select top chunks with a hard cap on total context size
 function selectTopChunks(chunks, message, limit = 8, maxTotalChars = 4500) {
   const msgNorm = normalizeText(message);
   const keywords = extractKeywords(message);
@@ -372,7 +387,6 @@ function selectTopChunks(chunks, message, limit = 8, maxTotalChars = 4500) {
     .filter((c) => c.score > 0)
     .sort((a, b) => b.score - a.score);
 
-  // If policy-like and nothing matched, still pick a few from Policies/Shipping
   if (!scored.length && isPolicyLikeQuestion(msgNorm)) {
     const fallback = chunks
       .filter((c) => c.source === "Policies.md" || c.source === "Shipping matrix.md")
@@ -397,12 +411,86 @@ function selectTopChunks(chunks, message, limit = 8, maxTotalChars = 4500) {
   return selected;
 }
 
-// ---- Route ----
+// ---- NEW: Widget config endpoint (safe fields only) ----
+function buildWidgetConfig(clientConfig, clientId) {
+  const brandName = clientConfig.brandName || clientId;
+
+  // support older flat config and new nested config
+  const widgetTitle =
+    (clientConfig.widget && clientConfig.widget.title) ||
+    clientConfig.widgetTitle ||
+    clientConfig.assistantName ||
+    brandName;
+
+  const widgetGreeting =
+    (clientConfig.widget && clientConfig.widget.greeting) ||
+    clientConfig.widgetGreeting ||
+    `Hallo! Ik ben de ${brandName} klantenservice assistent. Waar kan ik je mee helpen?`;
+
+  const logoUrl = clientConfig.logoUrl || null;
+
+  const colors = clientConfig.colors
+    ? {
+        primary: clientConfig.colors.primary || clientConfig.primaryColor || "#000000",
+        accent: clientConfig.colors.accent || clientConfig.accentColor || "#2563eb",
+        background: clientConfig.colors.background || "#ffffff",
+        userBubble: clientConfig.colors.userBubble || clientConfig.colors.primary || clientConfig.primaryColor || "#000000",
+        botBubble: clientConfig.colors.botBubble || "#ffffff",
+      }
+    : {
+        primary: clientConfig.primaryColor || "#000000",
+        accent: clientConfig.accentColor || "#2563eb",
+        background: "#ffffff",
+        userBubble: clientConfig.primaryColor || "#000000",
+        botBubble: "#ffffff",
+      };
+
+  return {
+    brandName,
+    assistantName: clientConfig.assistantName || widgetTitle,
+    language: clientConfig.language || "nl",
+    noEmojis: clientConfig.noEmojis !== false, // default true
+    logoUrl,
+    widget: {
+      title: widgetTitle,
+      greeting: widgetGreeting,
+    },
+    colors,
+    support: {
+      email: clientConfig.supportEmail || null,
+      contactFormUrl: clientConfig.contactFormUrl || null,
+    },
+    version: clientConfig.version || null,
+  };
+}
+
+// ---- Routes ----
+app.get("/", (req, res) => {
+  res.send("AI support backend running.");
+});
+
+app.get("/widget-config", (req, res) => {
+  const clientId = sanitizeClientId(req.query.client || "Advantum");
+
+  try {
+    const data = loadClient(clientId);
+    const widgetConfig = buildWidgetConfig(data.clientConfig || {}, data.clientId);
+
+    // Helpful caching (safe): 5 minutes
+    res.setHeader("Cache-Control", "public, max-age=300");
+
+    return res.json(widgetConfig);
+  } catch (e) {
+    console.error("widget-config error:", e.message);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
 app.post("/chat", async (req, res) => {
   const message = sanitizeUserMessage(req.body.message);
   if (!message) return res.status(400).json({ error: "Invalid message" });
 
-  const clientId = req.query.client || "Advantum";
+  const clientId = sanitizeClientId(req.query.client || "Advantum");
   const data = loadClient(clientId);
   const intent = detectIntent(message);
 
@@ -417,7 +505,7 @@ app.post("/chat", async (req, res) => {
     .join("\n\n");
 
   const systemPrompt = `
-You are the AI support bot for ${data.clientConfig.brandName || clientId}.
+You are the AI support bot for ${data.clientConfig.brandName || data.clientId}.
 Use the same language as the user. No emojis.
 Never guess policies, prices, or shipping rules.
 Only answer using the provided context. If the context does not contain the answer, say you are not sure and ask a short follow-up question.
@@ -455,18 +543,6 @@ ${context || "No relevant knowledge matched."}
   }
 });
 
-app.get("/", (req, res) => {
-  res.send("AI support backend running.");
-});
-
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
-
-
-
-
-
-
-
-
