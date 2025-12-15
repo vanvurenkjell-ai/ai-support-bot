@@ -143,7 +143,7 @@ function sanitizeUserMessage(input) {
 
 function sanitizeOrderNumber(orderNumber) {
   if (!orderNumber) return "";
-  // Allow letters, digits, #, dash, underscore, and spaces (we later normalize spaces)
+  // Allow letters, digits, #, dash, underscore, and spaces
   return String(orderNumber)
     .replace(/[^A-Za-z0-9#\-_ ]/g, "")
     .trim()
@@ -173,7 +173,7 @@ function looksLikeEmail(s) {
 function looksLikeShopifyOrderName(orderNumberRaw) {
   const t = sanitizeOrderNumber(orderNumberRaw).replace(/\s+/g, "");
   if (!t) return false;
-  // Shopify "name" lookups in your current implementation only work reliably for numeric names like #1055 / 1055
+  // In your current Shopify lookup, "name" works reliably for numeric names like #1055 / 1055
   if (/^#\d{3,12}$/.test(t)) return true;
   if (/^\d{3,12}$/.test(t)) return true;
   return false;
@@ -182,29 +182,13 @@ function looksLikeShopifyOrderName(orderNumberRaw) {
 // Better extraction:
 // - Captures numeric (#1055, 1055, 10-55, 10 55)
 // - Captures common custom formats (ADV-2024-001, AB-123-456, ORD_98231, etc.)
-// - Prefers explicit "order/bestelnummer" mentions when present
 function extractOrderNumberFromText(message) {
   const raw = String(message || "");
   if (!raw.trim()) return "";
 
   const candidates = [];
 
-  // 1) Prefer explicit mentions: "order number is X", "bestelnummer: X"
-  // Capture a reasonable token after common keywords.
-  const explicit = raw.match(
-    /\b(?:order(?:nummer|number)?|bestel(?:nummer|ling)?|purchase(?:\s*order)?|ord(?:er)?\s*(?:id|nr|no)?)\b[\s:#-]*([A-Za-z0-9][A-Za-z0-9#\-_ ]{2,60})/gi
-  );
-  if (explicit && explicit.length) {
-    for (const m of explicit) {
-      // take the part after the keyword block by splitting on common separators
-      const parts = m.split(/[\s:#-]+/);
-      const tail = parts.slice(-3).join(" ").trim();
-      if (tail) candidates.push(tail);
-    }
-  }
-
-  // 2) Strong patterns (custom references)
-  // Examples: ADV-2024-001, AB-123-456, ORD_98231, PO-12345
+  // Strong patterns (custom references)
   const customMatches =
     raw.match(/\b[A-Za-z]{2,12}[-_]\d{2,8}(?:[-_]\d{1,8})+\b/g) || [];
   for (const m of customMatches) candidates.push(m);
@@ -213,27 +197,23 @@ function extractOrderNumberFromText(message) {
     raw.match(/\b[A-Za-z]{2,12}[-_]\d{3,12}\b/g) || [];
   for (const m of customShortMatches) candidates.push(m);
 
-  // 3) Numeric Shopify-like: #1055 or 1055 (3-12 digits)
+  // Numeric Shopify-like
   const numericMatches = raw.match(/#\d{3,12}\b/g) || [];
   for (const m of numericMatches) candidates.push(m);
 
   const plainDigits = raw.match(/\b\d{3,12}\b/g) || [];
   for (const m of plainDigits) candidates.push(m);
 
-  // 4) Spaced/dashed numeric: 10-55 / 10 55 / 105-5 (keep conservative)
+  // Spaced/dashed numeric (conservative)
   const splitNumeric = raw.match(/\b\d{2,6}[- ]\d{2,6}\b/g) || [];
   for (const m of splitNumeric) candidates.push(m);
 
   if (!candidates.length) return "";
 
-  // Pick the last candidate in the message (usually the most recent/correct)
   const pickedRaw = candidates[candidates.length - 1];
 
-  // Normalize: trim, remove repeated spaces, but keep separators
   let cleaned = sanitizeOrderNumber(pickedRaw);
   cleaned = cleaned.replace(/\s+/g, " ").trim();
-
-  // Extra guard: must contain at least one digit
   if (!/\d/.test(cleaned)) return "";
 
   return cleaned;
@@ -853,6 +833,18 @@ function buildEscalationReply(clientConfig, clientId) {
   return msg;
 }
 
+// ---- Deterministic reply for "order number not found" ----
+function buildOrderNotFoundReply(clientConfig, clientId, orderNumber) {
+  const lang = (clientConfig && clientConfig.language) || "nl";
+  const n = sanitizeOrderNumber(orderNumber).replace(/\s+/g, " ").trim();
+
+  if (String(lang).toLowerCase().startsWith("en")) {
+    return `I can’t find an order with order number "${n}". Please send the correct Shopify order number (for example #1055). If you don’t have it, share the email address used for the order.`;
+  }
+
+  return `Ik kan geen bestelling vinden met bestelnummer "${n}". Stuur het juiste Shopify bestelnummer (bijvoorbeeld #1055). Als je die niet hebt: met welk e-mailadres heb je besteld?`;
+}
+
 // ---- Routes ----
 app.get("/", (req, res) => {
   res.send("AI support backend running.");
@@ -902,6 +894,7 @@ app.post("/chat", async (req, res) => {
       });
     }
 
+    // Router (standard follow-ups)
     const router = maybeHandleWithRouter({
       sessionId,
       message,
@@ -927,14 +920,47 @@ app.post("/chat", async (req, res) => {
       orderNumber: intentRaw.orderNumber || facts.orderNumber || "",
     };
 
+    // If the user gave an order number, but it's not Shopify-style, tell them it doesn't exist (in Shopify)
+    // and ask for a valid Shopify order number (or email).
+    if (
+      effectiveIntent.mainIntent === "shipping_or_order" &&
+      effectiveIntent.orderNumber &&
+      !looksLikeShopifyOrderName(effectiveIntent.orderNumber)
+    ) {
+      const reply = buildOrderNotFoundReply(data.clientConfig || {}, data.clientId, effectiveIntent.orderNumber);
+      appendToHistory(sessionId, "assistant", reply);
+      return res.json({
+        reply,
+        intent: effectiveIntent,
+        shopify: null,
+        routed: true,
+        escalated: false,
+        facts: getFacts(sessionId),
+      });
+    }
+
+    // Shopify lookup (only numeric Shopify-like)
     let shopify = null;
-    // IMPORTANT: Only attempt Shopify lookup for Shopify-like numeric order names.
     if (
       effectiveIntent.mainIntent === "shipping_or_order" &&
       effectiveIntent.orderNumber &&
       looksLikeShopifyOrderName(effectiveIntent.orderNumber)
     ) {
       shopify = await lookupShopifyOrder(effectiveIntent.orderNumber);
+
+      // If it's Shopify-like but still not found, tell user it doesn't exist and ask for correct number/email.
+      if (!shopify) {
+        const reply = buildOrderNotFoundReply(data.clientConfig || {}, data.clientId, effectiveIntent.orderNumber);
+        appendToHistory(sessionId, "assistant", reply);
+        return res.json({
+          reply,
+          intent: effectiveIntent,
+          shopify: null,
+          routed: true,
+          escalated: false,
+          facts: getFacts(sessionId),
+        });
+      }
     }
 
     const retrievalQuery =
@@ -1022,4 +1048,5 @@ app.use((req, res) => {
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
+
 
