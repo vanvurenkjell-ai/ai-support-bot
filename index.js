@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
+const path = require("path");
 require("dotenv").config();
 const OpenAI = require("openai");
 const axios = require("axios");
@@ -373,9 +374,9 @@ async function lookupShopifyOrder(orderNumberRaw) {
 }
 
 // ---- Knowledge loading ----
-function readFile(path) {
+function readFile(p) {
   try {
-    return fs.existsSync(path) ? fs.readFileSync(path, "utf8") : "";
+    return fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "";
   } catch {
     return "";
   }
@@ -636,6 +637,46 @@ function selectTopChunks(chunks, message, limit = 8, maxTotalChars = 4500) {
   return selected;
 }
 
+// ---- Low-context logging (unknown questions) ----
+// This creates one file per client:
+// logs/<ClientId>/unknown-questions.jsonl
+const UNKNOWN_LOG_BASE_DIR = process.env.UNKNOWN_LOG_BASE_DIR || path.join(".", "logs");
+const UNKNOWN_SCORE_THRESHOLD = Number(process.env.UNKNOWN_SCORE_THRESHOLD || 3);
+
+function ensureLogDirExists(filePath) {
+  try {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    console.error("LOG_DIR_CREATE_ERROR:", e && e.message ? e.message : e);
+  }
+}
+
+function safeAppendJsonLine(filePath, obj) {
+  try {
+    ensureLogDirExists(filePath);
+    fs.appendFileSync(filePath, JSON.stringify(obj) + "\n", "utf8");
+  } catch (e) {
+    console.error("LOG_APPEND_ERROR:", e && e.message ? e.message : e);
+  }
+}
+
+function makeRequestId() {
+  // simple, deterministic, no extra deps
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function shouldLogLowContext(topChunks) {
+  if (!topChunks || !topChunks.length) return true;
+  const maxScore = Math.max(...topChunks.map((c) => Number(c.score || 0)));
+  return maxScore < UNKNOWN_SCORE_THRESHOLD;
+}
+
+function buildUnknownLogPathForClient(clientIdRaw) {
+  const safeClient = sanitizeClientId(clientIdRaw);
+  return path.join(UNKNOWN_LOG_BASE_DIR, safeClient, "unknown-questions.jsonl");
+}
+
 // ---- Widget config endpoint ----
 function buildWidgetConfig(clientConfig, clientId) {
   const brandName = clientConfig.brandName || clientId;
@@ -864,6 +905,8 @@ app.get("/widget-config", (req, res) => {
 });
 
 app.post("/chat", async (req, res) => {
+  const requestId = makeRequestId();
+
   try {
     const message = sanitizeUserMessage(req.body.message);
     if (!message) return res.status(400).json({ error: "Invalid message" });
@@ -885,6 +928,7 @@ app.post("/chat", async (req, res) => {
       const reply = buildEscalationReply(data.clientConfig || {}, data.clientId);
       appendToHistory(sessionId, "assistant", reply);
       return res.json({
+        requestId,
         reply,
         intent: { ...intentRaw, mainIntent: "support_escalation" },
         shopify: null,
@@ -905,6 +949,7 @@ app.post("/chat", async (req, res) => {
     if (router.handled) {
       appendToHistory(sessionId, "assistant", router.reply);
       return res.json({
+        requestId,
         reply: router.reply,
         intent: intentRaw,
         shopify: null,
@@ -927,9 +972,14 @@ app.post("/chat", async (req, res) => {
       effectiveIntent.orderNumber &&
       !looksLikeShopifyOrderName(effectiveIntent.orderNumber)
     ) {
-      const reply = buildOrderNotFoundReply(data.clientConfig || {}, data.clientId, effectiveIntent.orderNumber);
+      const reply = buildOrderNotFoundReply(
+        data.clientConfig || {},
+        data.clientId,
+        effectiveIntent.orderNumber
+      );
       appendToHistory(sessionId, "assistant", reply);
       return res.json({
+        requestId,
         reply,
         intent: effectiveIntent,
         shopify: null,
@@ -950,9 +1000,14 @@ app.post("/chat", async (req, res) => {
 
       // If it's Shopify-like but still not found, tell user it doesn't exist and ask for correct number/email.
       if (!shopify) {
-        const reply = buildOrderNotFoundReply(data.clientConfig || {}, data.clientId, effectiveIntent.orderNumber);
+        const reply = buildOrderNotFoundReply(
+          data.clientConfig || {},
+          data.clientId,
+          effectiveIntent.orderNumber
+        );
         appendToHistory(sessionId, "assistant", reply);
         return res.json({
+          requestId,
           reply,
           intent: effectiveIntent,
           shopify: null,
@@ -964,9 +1019,33 @@ app.post("/chat", async (req, res) => {
     }
 
     const retrievalQuery =
-      (message.length < 30 && facts.productName) ? `${message} ${facts.productName}` : message;
+      message.length < 30 && facts.productName ? `${message} ${facts.productName}` : message;
 
     const topChunks = selectTopChunks(data.chunks, retrievalQuery, 8, 4500);
+
+    // Log low-context events to a per-client file
+    if (shouldLogLowContext(topChunks)) {
+      const maxScore = topChunks.length
+        ? Math.max(...topChunks.map((c) => Number(c.score || 0)))
+        : 0;
+
+      const logPath = buildUnknownLogPathForClient(data.clientId);
+
+      safeAppendJsonLine(logPath, {
+        ts: new Date().toISOString(),
+        requestId,
+        clientId: data.clientId,
+        sessionId: sessionId || null,
+        ip: getClientIp(req),
+        message,
+        retrievalQuery,
+        intent: effectiveIntent,
+        maxScore,
+        chunkCount: topChunks.length,
+        sources: topChunks.map((c) => c.source).slice(0, 8),
+      });
+    }
+
     const context = topChunks
       .map((c) => `### ${c.source}${c.heading ? " — " + c.heading : ""}\n${c.text}`)
       .join("\n\n");
@@ -1028,6 +1107,7 @@ ${context || "No relevant knowledge matched."}
     appendToHistory(sessionId, "assistant", reply);
 
     return res.json({
+      requestId,
       reply,
       intent: effectiveIntent,
       shopify,
@@ -1037,7 +1117,7 @@ ${context || "No relevant knowledge matched."}
     });
   } catch (e) {
     console.error("CHAT_ROUTE_ERROR:", e);
-    return res.status(500).json({ error: "Server error" });
+    return res.status(500).json({ error: "Server error", requestId });
   }
 });
 
