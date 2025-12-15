@@ -1,13 +1,16 @@
 const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
-const path = require("path");
 require("dotenv").config();
 const OpenAI = require("openai");
 const axios = require("axios");
 
 const app = express();
 const port = process.env.PORT || 3001;
+
+// Optional: set this in Render env vars to know exactly what version is deployed
+// Example: BUILD_VERSION=2025-12-15-a
+const BUILD_VERSION = process.env.BUILD_VERSION || "dev";
 
 // IMPORTANT on Render/Proxies: this makes req.ip work properly
 app.set("trust proxy", 1);
@@ -21,6 +24,27 @@ process.on("unhandledRejection", (reason) => {
 });
 process.on("uncaughtException", (err) => {
   console.error("UNCAUGHT_EXCEPTION:", err);
+});
+
+// ---- RequestId + structured logging ----
+function makeRequestId() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function safeLogJson(obj) {
+  try {
+    console.log(JSON.stringify(obj));
+  } catch {
+    console.log(String(obj));
+  }
+}
+
+// attach requestId to every request
+app.use((req, res, next) => {
+  req.requestId = makeRequestId();
+  // helpful for debugging from browser/network tab too
+  res.setHeader("X-Request-Id", req.requestId);
+  next();
 });
 
 // ---- Simple rate limiting / spam protection ----
@@ -63,7 +87,18 @@ function rateLimitChat(req, res, next) {
   if (entry.lastAt && now - entry.lastAt < RL_MIN_GAP_MS) {
     entry.lastAt = now;
     rateLimitStore.set(ip, entry);
+
+    safeLogJson({
+      type: "rate_limit",
+      requestId: req.requestId,
+      ip,
+      path: req.path,
+      rule: "min_gap",
+      at: new Date().toISOString(),
+    });
+
     return res.status(429).json({
+      requestId: req.requestId,
       error: "Too many messages too quickly. Please wait a moment and try again.",
     });
   }
@@ -74,7 +109,19 @@ function rateLimitChat(req, res, next) {
   rateLimitStore.set(ip, entry);
 
   if (entry.count > RL_MAX_REQUESTS_PER_WINDOW) {
+    safeLogJson({
+      type: "rate_limit",
+      requestId: req.requestId,
+      ip,
+      path: req.path,
+      rule: "window_count",
+      count: entry.count,
+      windowMs: RL_WINDOW_MS,
+      at: new Date().toISOString(),
+    });
+
     return res.status(429).json({
+      requestId: req.requestId,
       error: "Too many requests. Please wait a few seconds and try again.",
     });
   }
@@ -174,7 +221,7 @@ function looksLikeEmail(s) {
 function looksLikeShopifyOrderName(orderNumberRaw) {
   const t = sanitizeOrderNumber(orderNumberRaw).replace(/\s+/g, "");
   if (!t) return false;
-  // In your current Shopify lookup, "name" works reliably for numeric names like #1055 / 1055
+  // Shopify name lookups are reliable for numeric names like #1055 / 1055
   if (/^#\d{3,12}$/.test(t)) return true;
   if (/^\d{3,12}$/.test(t)) return true;
   return false;
@@ -189,7 +236,6 @@ function extractOrderNumberFromText(message) {
 
   const candidates = [];
 
-  // Strong patterns (custom references)
   const customMatches =
     raw.match(/\b[A-Za-z]{2,12}[-_]\d{2,8}(?:[-_]\d{1,8})+\b/g) || [];
   for (const m of customMatches) candidates.push(m);
@@ -198,14 +244,12 @@ function extractOrderNumberFromText(message) {
     raw.match(/\b[A-Za-z]{2,12}[-_]\d{3,12}\b/g) || [];
   for (const m of customShortMatches) candidates.push(m);
 
-  // Numeric Shopify-like
   const numericMatches = raw.match(/#\d{3,12}\b/g) || [];
   for (const m of numericMatches) candidates.push(m);
 
   const plainDigits = raw.match(/\b\d{3,12}\b/g) || [];
   for (const m of plainDigits) candidates.push(m);
 
-  // Spaced/dashed numeric (conservative)
   const splitNumeric = raw.match(/\b\d{2,6}[- ]\d{2,6}\b/g) || [];
   for (const m of splitNumeric) candidates.push(m);
 
@@ -374,9 +418,9 @@ async function lookupShopifyOrder(orderNumberRaw) {
 }
 
 // ---- Knowledge loading ----
-function readFile(p) {
+function readFile(path) {
   try {
-    return fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "";
+    return fs.existsSync(path) ? fs.readFileSync(path, "utf8") : "";
   } catch {
     return "";
   }
@@ -485,27 +529,7 @@ const SOURCE_WEIGHT = {
   "Legal.md": 1,
 };
 
-// ---- Client knowledge/config caching (TTL) ----
-const CLIENT_CACHE_TTL_MS = Number(process.env.CLIENT_CACHE_TTL_MS || 60_000); // default 60s
-const CLIENT_CACHE_MAX = Number(process.env.CLIENT_CACHE_MAX || 25); // default 25 clients
-
-// clientId -> { loadedAt, data }
-const clientCache = new Map();
-
-function evictOldestClientCacheEntry() {
-  let oldestKey = null;
-  let oldestAt = Infinity;
-  for (const [k, v] of clientCache.entries()) {
-    if (!v || typeof v.loadedAt !== "number") continue;
-    if (v.loadedAt < oldestAt) {
-      oldestAt = v.loadedAt;
-      oldestKey = k;
-    }
-  }
-  if (oldestKey) clientCache.delete(oldestKey);
-}
-
-function loadClientFromDisk(clientIdRaw) {
+function loadClient(clientIdRaw) {
   const clientId = sanitizeClientId(clientIdRaw);
   const base = `./Clients/${clientId}`;
 
@@ -541,42 +565,6 @@ function loadClientFromDisk(clientIdRaw) {
 
   return { clientId, brandVoice, supportRules, chunks: allChunks, clientConfig };
 }
-
-function loadClient(clientIdRaw) {
-  const clientId = sanitizeClientId(clientIdRaw);
-  const now = Date.now();
-
-  const cached = clientCache.get(clientId);
-  if (cached && cached.data && typeof cached.loadedAt === "number") {
-    if (now - cached.loadedAt <= CLIENT_CACHE_TTL_MS) {
-      return cached.data;
-    }
-  }
-
-  const data = loadClientFromDisk(clientId);
-
-  clientCache.set(clientId, { loadedAt: now, data });
-
-  if (clientCache.size > CLIENT_CACHE_MAX) {
-    evictOldestClientCacheEntry();
-  }
-
-  return data;
-}
-
-// periodic cleanup (extra safety)
-setInterval(() => {
-  const now = Date.now();
-  for (const [clientId, entry] of clientCache.entries()) {
-    if (!entry || typeof entry.loadedAt !== "number") {
-      clientCache.delete(clientId);
-      continue;
-    }
-    if (now - entry.loadedAt > CLIENT_CACHE_TTL_MS * 10) {
-      clientCache.delete(clientId);
-    }
-  }
-}, 60 * 1000);
 
 function countHits(textNorm, keyword) {
   const k = keyword.trim();
@@ -635,46 +623,6 @@ function selectTopChunks(chunks, message, limit = 8, maxTotalChars = 4500) {
   }
 
   return selected;
-}
-
-// ---- Low-context logging (unknown questions) ----
-// This creates one file per client:
-// logs/<ClientId>/unknown-questions.jsonl
-const UNKNOWN_LOG_BASE_DIR = process.env.UNKNOWN_LOG_BASE_DIR || path.join(".", "logs");
-const UNKNOWN_SCORE_THRESHOLD = Number(process.env.UNKNOWN_SCORE_THRESHOLD || 3);
-
-function ensureLogDirExists(filePath) {
-  try {
-    const dir = path.dirname(filePath);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  } catch (e) {
-    console.error("LOG_DIR_CREATE_ERROR:", e && e.message ? e.message : e);
-  }
-}
-
-function safeAppendJsonLine(filePath, obj) {
-  try {
-    ensureLogDirExists(filePath);
-    fs.appendFileSync(filePath, JSON.stringify(obj) + "\n", "utf8");
-  } catch (e) {
-    console.error("LOG_APPEND_ERROR:", e && e.message ? e.message : e);
-  }
-}
-
-function makeRequestId() {
-  // simple, deterministic, no extra deps
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function shouldLogLowContext(topChunks) {
-  if (!topChunks || !topChunks.length) return true;
-  const maxScore = Math.max(...topChunks.map((c) => Number(c.score || 0)));
-  return maxScore < UNKNOWN_SCORE_THRESHOLD;
-}
-
-function buildUnknownLogPathForClient(clientIdRaw) {
-  const safeClient = sanitizeClientId(clientIdRaw);
-  return path.join(UNKNOWN_LOG_BASE_DIR, safeClient, "unknown-questions.jsonl");
 }
 
 // ---- Widget config endpoint ----
@@ -888,37 +836,84 @@ function buildOrderNotFoundReply(clientConfig, clientId, orderNumber) {
 
 // ---- Routes ----
 app.get("/", (req, res) => {
-  res.send("AI support backend running.");
+  return res.json({ ok: true, message: "AI support backend running.", requestId: req.requestId });
+});
+
+// Health endpoint for monitoring + debugging
+app.get("/health", (req, res) => {
+  return res.json({
+    ok: true,
+    requestId: req.requestId,
+    version: BUILD_VERSION,
+    uptimeSec: Math.round(process.uptime()),
+    node: process.version,
+    shopifyEnabled: Boolean(shopifyClient),
+    time: new Date().toISOString(),
+  });
 });
 
 app.get("/widget-config", (req, res) => {
   const clientId = sanitizeClientId(req.query.client || "Advantum");
+  const t0 = Date.now();
+
   try {
     const data = loadClient(clientId);
     const widgetConfig = buildWidgetConfig(data.clientConfig || {}, data.clientId);
     res.setHeader("Cache-Control", "public, max-age=300");
-    return res.json(widgetConfig);
+
+    safeLogJson({
+      type: "widget_config",
+      requestId: req.requestId,
+      clientId: data.clientId,
+      ip: getClientIp(req),
+      ms: Date.now() - t0,
+      at: new Date().toISOString(),
+    });
+
+    return res.json({ requestId: req.requestId, ...widgetConfig });
   } catch (e) {
     console.error("widget-config error:", e.message);
-    return res.status(500).json({ error: "Server error" });
+
+    safeLogJson({
+      type: "widget_config_error",
+      requestId: req.requestId,
+      clientId,
+      ip: getClientIp(req),
+      error: e && e.message ? e.message : String(e),
+      ms: Date.now() - t0,
+      at: new Date().toISOString(),
+    });
+
+    return res.status(500).json({ requestId: req.requestId, error: "Server error" });
   }
 });
 
 app.post("/chat", async (req, res) => {
-  const requestId = makeRequestId();
+  const tAll0 = Date.now();
+  const ip = getClientIp(req);
+
+  let clientId = "Advantum";
+  let sessionId = "";
+  let effectiveIntent = null;
+
+  // Observability fields
+  let shopifyAttempted = false;
+  let shopifyFound = false;
+  let shopifyMs = 0;
+  let openaiMs = 0;
+  let openaiUsage = null;
 
   try {
     const message = sanitizeUserMessage(req.body.message);
-    if (!message) return res.status(400).json({ error: "Invalid message" });
+    if (!message) return res.status(400).json({ requestId: req.requestId, error: "Invalid message" });
 
-    const clientId = sanitizeClientId(req.query.client || "Advantum");
-    const sessionId = sanitizeSessionId(req.body.sessionId);
+    clientId = sanitizeClientId(req.query.client || "Advantum");
+    sessionId = sanitizeSessionId(req.body.sessionId);
+
     const data = loadClient(clientId);
-
     const intentRaw = detectIntent(message);
 
     if (intentRaw.orderNumber) setFacts(sessionId, { orderNumber: intentRaw.orderNumber });
-
     setMeta(sessionId, { lastIntent: intentRaw.mainIntent });
 
     appendToHistory(sessionId, "user", message);
@@ -927,8 +922,25 @@ app.post("/chat", async (req, res) => {
     if (escalation.shouldEscalate) {
       const reply = buildEscalationReply(data.clientConfig || {}, data.clientId);
       appendToHistory(sessionId, "assistant", reply);
+
+      safeLogJson({
+        type: "chat_done",
+        requestId: req.requestId,
+        clientId: data.clientId,
+        sessionId: sessionId || null,
+        ip,
+        intent: { ...intentRaw, mainIntent: "support_escalation" },
+        routed: true,
+        escalated: true,
+        shopifyAttempted: false,
+        shopifyFound: false,
+        openaiMs: 0,
+        totalMs: Date.now() - tAll0,
+        at: new Date().toISOString(),
+      });
+
       return res.json({
-        requestId,
+        requestId: req.requestId,
         reply,
         intent: { ...intentRaw, mainIntent: "support_escalation" },
         shopify: null,
@@ -938,7 +950,6 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    // Router (standard follow-ups)
     const router = maybeHandleWithRouter({
       sessionId,
       message,
@@ -948,8 +959,25 @@ app.post("/chat", async (req, res) => {
 
     if (router.handled) {
       appendToHistory(sessionId, "assistant", router.reply);
+
+      safeLogJson({
+        type: "chat_done",
+        requestId: req.requestId,
+        clientId: data.clientId,
+        sessionId: sessionId || null,
+        ip,
+        intent: intentRaw,
+        routed: true,
+        escalated: false,
+        shopifyAttempted: false,
+        shopifyFound: false,
+        openaiMs: 0,
+        totalMs: Date.now() - tAll0,
+        at: new Date().toISOString(),
+      });
+
       return res.json({
-        requestId,
+        requestId: req.requestId,
         reply: router.reply,
         intent: intentRaw,
         shopify: null,
@@ -960,26 +988,38 @@ app.post("/chat", async (req, res) => {
     }
 
     const facts = getFacts(sessionId);
-    const effectiveIntent = {
+    effectiveIntent = {
       ...intentRaw,
       orderNumber: intentRaw.orderNumber || facts.orderNumber || "",
     };
 
-    // If the user gave an order number, but it's not Shopify-style, tell them it doesn't exist (in Shopify)
-    // and ask for a valid Shopify order number (or email).
+    // Order number exists but not Shopify-style -> deterministic "not found" message
     if (
       effectiveIntent.mainIntent === "shipping_or_order" &&
       effectiveIntent.orderNumber &&
       !looksLikeShopifyOrderName(effectiveIntent.orderNumber)
     ) {
-      const reply = buildOrderNotFoundReply(
-        data.clientConfig || {},
-        data.clientId,
-        effectiveIntent.orderNumber
-      );
+      const reply = buildOrderNotFoundReply(data.clientConfig || {}, data.clientId, effectiveIntent.orderNumber);
       appendToHistory(sessionId, "assistant", reply);
+
+      safeLogJson({
+        type: "chat_done",
+        requestId: req.requestId,
+        clientId: data.clientId,
+        sessionId: sessionId || null,
+        ip,
+        intent: effectiveIntent,
+        routed: true,
+        escalated: false,
+        shopifyAttempted: false,
+        shopifyFound: false,
+        openaiMs: 0,
+        totalMs: Date.now() - tAll0,
+        at: new Date().toISOString(),
+      });
+
       return res.json({
-        requestId,
+        requestId: req.requestId,
         reply,
         intent: effectiveIntent,
         shopify: null,
@@ -996,18 +1036,35 @@ app.post("/chat", async (req, res) => {
       effectiveIntent.orderNumber &&
       looksLikeShopifyOrderName(effectiveIntent.orderNumber)
     ) {
+      shopifyAttempted = true;
+      const tShop0 = Date.now();
       shopify = await lookupShopifyOrder(effectiveIntent.orderNumber);
+      shopifyMs = Date.now() - tShop0;
+      shopifyFound = Boolean(shopify);
 
-      // If it's Shopify-like but still not found, tell user it doesn't exist and ask for correct number/email.
       if (!shopify) {
-        const reply = buildOrderNotFoundReply(
-          data.clientConfig || {},
-          data.clientId,
-          effectiveIntent.orderNumber
-        );
+        const reply = buildOrderNotFoundReply(data.clientConfig || {}, data.clientId, effectiveIntent.orderNumber);
         appendToHistory(sessionId, "assistant", reply);
+
+        safeLogJson({
+          type: "chat_done",
+          requestId: req.requestId,
+          clientId: data.clientId,
+          sessionId: sessionId || null,
+          ip,
+          intent: effectiveIntent,
+          routed: true,
+          escalated: false,
+          shopifyAttempted: true,
+          shopifyFound: false,
+          shopifyMs,
+          openaiMs: 0,
+          totalMs: Date.now() - tAll0,
+          at: new Date().toISOString(),
+        });
+
         return res.json({
-          requestId,
+          requestId: req.requestId,
           reply,
           intent: effectiveIntent,
           shopify: null,
@@ -1019,33 +1076,9 @@ app.post("/chat", async (req, res) => {
     }
 
     const retrievalQuery =
-      message.length < 30 && facts.productName ? `${message} ${facts.productName}` : message;
+      (message.length < 30 && facts.productName) ? `${message} ${facts.productName}` : message;
 
     const topChunks = selectTopChunks(data.chunks, retrievalQuery, 8, 4500);
-
-    // Log low-context events to a per-client file
-    if (shouldLogLowContext(topChunks)) {
-      const maxScore = topChunks.length
-        ? Math.max(...topChunks.map((c) => Number(c.score || 0)))
-        : 0;
-
-      const logPath = buildUnknownLogPathForClient(data.clientId);
-
-      safeAppendJsonLine(logPath, {
-        ts: new Date().toISOString(),
-        requestId,
-        clientId: data.clientId,
-        sessionId: sessionId || null,
-        ip: getClientIp(req),
-        message,
-        retrievalQuery,
-        intent: effectiveIntent,
-        maxScore,
-        chunkCount: topChunks.length,
-        sources: topChunks.map((c) => c.source).slice(0, 8),
-      });
-    }
-
     const context = topChunks
       .map((c) => `### ${c.source}${c.heading ? " — " + c.heading : ""}\n${c.text}`)
       .join("\n\n");
@@ -1094,6 +1127,7 @@ RELEVANT KNOWLEDGE (selected excerpts):
 ${context || "No relevant knowledge matched."}
 `;
 
+    const tAi0 = Date.now();
     const response = await openai.chat.completions.create({
       model: "gpt-4.1-mini",
       messages: [
@@ -1102,12 +1136,34 @@ ${context || "No relevant knowledge matched."}
         { role: "user", content: message },
       ],
     });
+    openaiMs = Date.now() - tAi0;
+
+    // usage is usually available here; if not, it stays null
+    openaiUsage = response && response.usage ? response.usage : null;
 
     const reply = response.choices[0].message.content;
     appendToHistory(sessionId, "assistant", reply);
 
+    safeLogJson({
+      type: "chat_done",
+      requestId: req.requestId,
+      clientId: data.clientId,
+      sessionId: sessionId || null,
+      ip,
+      intent: effectiveIntent,
+      routed: false,
+      escalated: false,
+      shopifyAttempted,
+      shopifyFound,
+      shopifyMs,
+      openaiMs,
+      openaiUsage,
+      totalMs: Date.now() - tAll0,
+      at: new Date().toISOString(),
+    });
+
     return res.json({
-      requestId,
+      requestId: req.requestId,
       reply,
       intent: effectiveIntent,
       shopify,
@@ -1117,7 +1173,24 @@ ${context || "No relevant knowledge matched."}
     });
   } catch (e) {
     console.error("CHAT_ROUTE_ERROR:", e);
-    return res.status(500).json({ error: "Server error", requestId });
+
+    safeLogJson({
+      type: "chat_error",
+      requestId: req.requestId,
+      clientId,
+      sessionId: sessionId || null,
+      ip,
+      intent: effectiveIntent,
+      shopifyAttempted,
+      shopifyFound,
+      shopifyMs,
+      openaiMs,
+      totalMs: Date.now() - tAll0,
+      error: e && e.message ? e.message : String(e),
+      at: new Date().toISOString(),
+    });
+
+    return res.status(500).json({ requestId: req.requestId, error: "Server error" });
   }
 });
 
@@ -1127,6 +1200,13 @@ app.use((req, res) => {
 
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
+  safeLogJson({
+    type: "boot",
+    version: BUILD_VERSION,
+    port,
+    shopifyEnabled: Boolean(shopifyClient),
+    at: new Date().toISOString(),
+  });
 });
 
 
