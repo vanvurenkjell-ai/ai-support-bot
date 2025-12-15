@@ -8,6 +8,9 @@ const axios = require("axios");
 const app = express();
 const port = process.env.PORT || 3001;
 
+// IMPORTANT on Render/Proxies: this makes req.ip work properly
+app.set("trust proxy", 1);
+
 app.use(cors());
 app.use(express.json());
 
@@ -18,6 +21,82 @@ process.on("unhandledRejection", (reason) => {
 process.on("uncaughtException", (err) => {
   console.error("UNCAUGHT_EXCEPTION:", err);
 });
+
+// ---- Simple rate limiting / spam protection ----
+// Goals:
+// 1) Minimum delay between messages per IP (anti "double click spam")
+// 2) Max requests per IP per short time window (anti flooding)
+
+const RL_WINDOW_MS = 10 * 1000; // 10 seconds
+const RL_MAX_REQUESTS_PER_WINDOW = 12; // 12 req / 10s per IP
+const RL_MIN_GAP_MS = 800; // at least 800ms between /chat calls per IP
+
+// ip -> { windowStart, count, lastAt }
+const rateLimitStore = new Map();
+
+function getClientIp(req) {
+  // with trust proxy enabled, req.ip should be correct
+  return req.ip || "unknown";
+}
+
+function rateLimitChat(req, res, next) {
+  // Only protect /chat
+  if (req.path !== "/chat") return next();
+
+  const ip = getClientIp(req);
+  const now = Date.now();
+
+  const entry = rateLimitStore.get(ip) || {
+    windowStart: now,
+    count: 0,
+    lastAt: 0,
+  };
+
+  // reset window if expired
+  if (now - entry.windowStart > RL_WINDOW_MS) {
+    entry.windowStart = now;
+    entry.count = 0;
+  }
+
+  // min-gap rule
+  if (entry.lastAt && now - entry.lastAt < RL_MIN_GAP_MS) {
+    entry.lastAt = now;
+    rateLimitStore.set(ip, entry);
+    return res.status(429).json({
+      error: "Too many messages too quickly. Please wait a moment and try again.",
+    });
+  }
+
+  // window-count rule
+  entry.count += 1;
+  entry.lastAt = now;
+  rateLimitStore.set(ip, entry);
+
+  if (entry.count > RL_MAX_REQUESTS_PER_WINDOW) {
+    return res.status(429).json({
+      error: "Too many requests. Please wait a few seconds and try again.",
+    });
+  }
+
+  return next();
+}
+
+// cleanup store to avoid memory growth
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of rateLimitStore.entries()) {
+    if (!entry) {
+      rateLimitStore.delete(ip);
+      continue;
+    }
+    if (now - entry.windowStart > RL_WINDOW_MS * 6) {
+      rateLimitStore.delete(ip);
+    }
+  }
+}, 60 * 1000);
+
+// apply limiter early (before routes)
+app.use(rateLimitChat);
 
 // ---- OpenAI ----
 if (!process.env.OPENAI_API_KEY) {
@@ -180,16 +259,26 @@ setInterval(() => {
 // ---- Intent detection ----
 function detectIntent(message) {
   const text = message.toLowerCase();
-  const shipping = ["verzending", "bezorg", "track", "order", "shipping", "delivery"];
+  const shipping = [
+    "verzending",
+    "bezorg",
+    "track",
+    "order",
+    "shipping",
+    "delivery",
+  ];
   const returns = ["retour", "refund", "terug", "herroep", "omruil"];
   const usage = ["gebruik", "how", "hoe", "tutorial", "uitleg"];
 
   const orderNumber = extractOrderNumberFromText(message);
 
   let mainIntent = "general";
-  if (shipping.some((w) => text.includes(w)) || orderNumber) mainIntent = "shipping_or_order";
-  if (returns.some((w) => text.includes(w))) mainIntent = "return_or_withdrawal";
-  if (usage.some((w) => text.includes(w)) && mainIntent === "general") mainIntent = "product_usage";
+  if (shipping.some((w) => text.includes(w)) || orderNumber)
+    mainIntent = "shipping_or_order";
+  if (returns.some((w) => text.includes(w)))
+    mainIntent = "return_or_withdrawal";
+  if (usage.some((w) => text.includes(w)) && mainIntent === "general")
+    mainIntent = "product_usage";
 
   return { mainIntent, orderNumber };
 }
@@ -213,14 +302,18 @@ async function lookupShopifyOrder(orderNumberRaw) {
 
     const order = orders[0];
     const fulfillment =
-      order.fulfillments && order.fulfillments[0] ? order.fulfillments[0] : null;
+      order.fulfillments && order.fulfillments[0]
+        ? order.fulfillments[0]
+        : null;
 
     return {
       orderName: order.name || null,
       fulfillmentStatus: order.fulfillment_status || null,
       financialStatus: order.financial_status || null,
       tracking:
-        fulfillment && fulfillment.tracking_numbers && fulfillment.tracking_numbers[0]
+        fulfillment &&
+        fulfillment.tracking_numbers &&
+        fulfillment.tracking_numbers[0]
           ? fulfillment.tracking_numbers[0]
           : null,
       trackingUrl:
@@ -797,7 +890,6 @@ ${context || "No relevant knowledge matched."}
   }
 });
 
-// Helpful to distinguish “server running but route missing”
 app.use((req, res) => {
   res.status(404).send("Not Found");
 });
@@ -805,4 +897,5 @@ app.use((req, res) => {
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
+
 
