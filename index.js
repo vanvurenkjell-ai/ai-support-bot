@@ -440,7 +440,34 @@ const SOURCE_WEIGHT = {
   "Legal.md": 1,
 };
 
-function loadClient(clientIdRaw) {
+// ---- Client knowledge/config caching (TTL) ----
+// Goal: avoid reading + chunking markdown on every request.
+//
+// Behavior:
+// - Each client folder is cached for a short TTL.
+// - After TTL expires, data is reloaded from disk.
+// - Cache has a max size to avoid memory growth with many clients.
+
+const CLIENT_CACHE_TTL_MS = Number(process.env.CLIENT_CACHE_TTL_MS || 60_000); // default 60s
+const CLIENT_CACHE_MAX = Number(process.env.CLIENT_CACHE_MAX || 25); // default 25 clients
+
+// clientId -> { loadedAt, data }
+const clientCache = new Map();
+
+function evictOldestClientCacheEntry() {
+  let oldestKey = null;
+  let oldestAt = Infinity;
+  for (const [k, v] of clientCache.entries()) {
+    if (!v || typeof v.loadedAt !== "number") continue;
+    if (v.loadedAt < oldestAt) {
+      oldestAt = v.loadedAt;
+      oldestKey = k;
+    }
+  }
+  if (oldestKey) clientCache.delete(oldestKey);
+}
+
+function loadClientFromDisk(clientIdRaw) {
   const clientId = sanitizeClientId(clientIdRaw);
   const base = `./Clients/${clientId}`;
 
@@ -476,6 +503,42 @@ function loadClient(clientIdRaw) {
 
   return { clientId, brandVoice, supportRules, chunks: allChunks, clientConfig };
 }
+
+function loadClient(clientIdRaw) {
+  const clientId = sanitizeClientId(clientIdRaw);
+  const now = Date.now();
+
+  const cached = clientCache.get(clientId);
+  if (cached && cached.data && typeof cached.loadedAt === "number") {
+    if (now - cached.loadedAt <= CLIENT_CACHE_TTL_MS) {
+      return cached.data;
+    }
+  }
+
+  const data = loadClientFromDisk(clientId);
+
+  clientCache.set(clientId, { loadedAt: now, data });
+
+  if (clientCache.size > CLIENT_CACHE_MAX) {
+    evictOldestClientCacheEntry();
+  }
+
+  return data;
+}
+
+// periodic cleanup (extra safety)
+setInterval(() => {
+  const now = Date.now();
+  for (const [clientId, entry] of clientCache.entries()) {
+    if (!entry || typeof entry.loadedAt !== "number") {
+      clientCache.delete(clientId);
+      continue;
+    }
+    if (now - entry.loadedAt > CLIENT_CACHE_TTL_MS * 10) {
+      clientCache.delete(clientId);
+    }
+  }
+}, 60 * 1000);
 
 function countHits(textNorm, keyword) {
   const k = keyword.trim();
@@ -897,5 +960,3 @@ app.use((req, res) => {
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
-
-
