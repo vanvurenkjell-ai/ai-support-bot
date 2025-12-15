@@ -143,10 +143,11 @@ function sanitizeUserMessage(input) {
 
 function sanitizeOrderNumber(orderNumber) {
   if (!orderNumber) return "";
+  // Allow letters, digits, #, dash, underscore, and spaces (we later normalize spaces)
   return String(orderNumber)
-    .replace(/[^A-Za-z0-9#\- ]/g, "")
+    .replace(/[^A-Za-z0-9#\-_ ]/g, "")
     .trim()
-    .slice(0, 40);
+    .slice(0, 60);
 }
 
 function sanitizeClientId(id) {
@@ -169,11 +170,73 @@ function looksLikeEmail(s) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t);
 }
 
+function looksLikeShopifyOrderName(orderNumberRaw) {
+  const t = sanitizeOrderNumber(orderNumberRaw).replace(/\s+/g, "");
+  if (!t) return false;
+  // Shopify "name" lookups in your current implementation only work reliably for numeric names like #1055 / 1055
+  if (/^#\d{3,12}$/.test(t)) return true;
+  if (/^\d{3,12}$/.test(t)) return true;
+  return false;
+}
+
+// Better extraction:
+// - Captures numeric (#1055, 1055, 10-55, 10 55)
+// - Captures common custom formats (ADV-2024-001, AB-123-456, ORD_98231, etc.)
+// - Prefers explicit "order/bestelnummer" mentions when present
 function extractOrderNumberFromText(message) {
   const raw = String(message || "");
-  const matches = raw.match(/(#?\d[\d\- ]*\d)/g);
-  if (!matches || !matches.length) return "";
-  return sanitizeOrderNumber(matches[matches.length - 1]);
+  if (!raw.trim()) return "";
+
+  const candidates = [];
+
+  // 1) Prefer explicit mentions: "order number is X", "bestelnummer: X"
+  // Capture a reasonable token after common keywords.
+  const explicit = raw.match(
+    /\b(?:order(?:nummer|number)?|bestel(?:nummer|ling)?|purchase(?:\s*order)?|ord(?:er)?\s*(?:id|nr|no)?)\b[\s:#-]*([A-Za-z0-9][A-Za-z0-9#\-_ ]{2,60})/gi
+  );
+  if (explicit && explicit.length) {
+    for (const m of explicit) {
+      // take the part after the keyword block by splitting on common separators
+      const parts = m.split(/[\s:#-]+/);
+      const tail = parts.slice(-3).join(" ").trim();
+      if (tail) candidates.push(tail);
+    }
+  }
+
+  // 2) Strong patterns (custom references)
+  // Examples: ADV-2024-001, AB-123-456, ORD_98231, PO-12345
+  const customMatches =
+    raw.match(/\b[A-Za-z]{2,12}[-_]\d{2,8}(?:[-_]\d{1,8})+\b/g) || [];
+  for (const m of customMatches) candidates.push(m);
+
+  const customShortMatches =
+    raw.match(/\b[A-Za-z]{2,12}[-_]\d{3,12}\b/g) || [];
+  for (const m of customShortMatches) candidates.push(m);
+
+  // 3) Numeric Shopify-like: #1055 or 1055 (3-12 digits)
+  const numericMatches = raw.match(/#\d{3,12}\b/g) || [];
+  for (const m of numericMatches) candidates.push(m);
+
+  const plainDigits = raw.match(/\b\d{3,12}\b/g) || [];
+  for (const m of plainDigits) candidates.push(m);
+
+  // 4) Spaced/dashed numeric: 10-55 / 10 55 / 105-5 (keep conservative)
+  const splitNumeric = raw.match(/\b\d{2,6}[- ]\d{2,6}\b/g) || [];
+  for (const m of splitNumeric) candidates.push(m);
+
+  if (!candidates.length) return "";
+
+  // Pick the last candidate in the message (usually the most recent/correct)
+  const pickedRaw = candidates[candidates.length - 1];
+
+  // Normalize: trim, remove repeated spaces, but keep separators
+  let cleaned = sanitizeOrderNumber(pickedRaw);
+  cleaned = cleaned.replace(/\s+/g, " ").trim();
+
+  // Extra guard: must contain at least one digit
+  if (!/\d/.test(cleaned)) return "";
+
+  return cleaned;
 }
 
 // ---- Session memory + flow state + facts ----
@@ -290,7 +353,8 @@ async function lookupShopifyOrder(orderNumberRaw) {
   const orderNumber = sanitizeOrderNumber(orderNumberRaw);
   if (!orderNumber) return null;
 
-  const nameParam = orderNumber.startsWith("#") ? orderNumber : `#${orderNumber}`;
+  const compact = orderNumber.replace(/\s+/g, "");
+  const nameParam = compact.startsWith("#") ? compact : `#${compact}`;
 
   try {
     const res = await shopifyClient.get("/orders.json", {
@@ -441,13 +505,6 @@ const SOURCE_WEIGHT = {
 };
 
 // ---- Client knowledge/config caching (TTL) ----
-// Goal: avoid reading + chunking markdown on every request.
-//
-// Behavior:
-// - Each client folder is cached for a short TTL.
-// - After TTL expires, data is reloaded from disk.
-// - Cache has a max size to avoid memory growth with many clients.
-
 const CLIENT_CACHE_TTL_MS = Number(process.env.CLIENT_CACHE_TTL_MS || 60_000); // default 60s
 const CLIENT_CACHE_MAX = Number(process.env.CLIENT_CACHE_MAX || 25); // default 25 clients
 
@@ -871,7 +928,12 @@ app.post("/chat", async (req, res) => {
     };
 
     let shopify = null;
-    if (effectiveIntent.mainIntent === "shipping_or_order" && effectiveIntent.orderNumber) {
+    // IMPORTANT: Only attempt Shopify lookup for Shopify-like numeric order names.
+    if (
+      effectiveIntent.mainIntent === "shipping_or_order" &&
+      effectiveIntent.orderNumber &&
+      looksLikeShopifyOrderName(effectiveIntent.orderNumber)
+    ) {
       shopify = await lookupShopifyOrder(effectiveIntent.orderNumber);
     }
 
@@ -960,3 +1022,4 @@ app.use((req, res) => {
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
+
