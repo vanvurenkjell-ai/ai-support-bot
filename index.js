@@ -11,6 +11,14 @@ const port = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
+// ---- Process-level safety (log crashes) ----
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED_REJECTION:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT_EXCEPTION:", err);
+});
+
 // ---- OpenAI ----
 if (!process.env.OPENAI_API_KEY) {
   console.error("Missing OPENAI_API_KEY");
@@ -84,17 +92,15 @@ function looksLikeEmail(s) {
 
 function extractOrderNumberFromText(message) {
   const raw = String(message || "");
-  // capture sequences like 1055, 10-55, 10 55, #1055
   const matches = raw.match(/(#?\d[\d\- ]*\d)/g);
   if (!matches || !matches.length) return "";
   return sanitizeOrderNumber(matches[matches.length - 1]);
 }
 
 // ---- Session memory + flow state + facts ----
-const SESSION_HISTORY_LIMIT = 10; // total messages (user + assistant)
-const SESSION_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
+const SESSION_HISTORY_LIMIT = 10;
+const SESSION_TTL_MS = 1000 * 60 * 60 * 6;
 
-// sessionId -> { updatedAt, messages: [{role, content}], meta: { expectedSlot, lastIntent, facts: {...} } }
 const sessionStore = new Map();
 
 function getSession(sessionId) {
@@ -145,8 +151,7 @@ function setMeta(sessionId, patch) {
 
 function getFacts(sessionId) {
   const meta = getMeta(sessionId);
-  const facts = meta && meta.facts ? meta.facts : {};
-  return facts;
+  return meta && meta.facts ? meta.facts : {};
 }
 
 function setFacts(sessionId, patch) {
@@ -162,11 +167,9 @@ function clearExpectedSlot(sessionId) {
 
 function buildHistoryMessages(sessionId) {
   const existing = getSession(sessionId);
-  if (!existing) return [];
-  return existing.messages.slice();
+  return existing ? existing.messages.slice() : [];
 }
 
-// periodic cleanup
 setInterval(() => {
   const now = Date.now();
   for (const [key, val] of sessionStore.entries()) {
@@ -174,15 +177,14 @@ setInterval(() => {
   }
 }, 1000 * 60 * 15);
 
-// ---- Intent detection (baseline) ----
+// ---- Intent detection ----
 function detectIntent(message) {
   const text = message.toLowerCase();
-
   const shipping = ["verzending", "bezorg", "track", "order", "shipping", "delivery"];
   const returns = ["retour", "refund", "terug", "herroep", "omruil"];
   const usage = ["gebruik", "how", "hoe", "tutorial", "uitleg"];
 
-  let orderNumber = extractOrderNumberFromText(message);
+  const orderNumber = extractOrderNumberFromText(message);
 
   let mainIntent = "general";
   if (shipping.some((w) => text.includes(w)) || orderNumber) mainIntent = "shipping_or_order";
@@ -242,6 +244,15 @@ function readFile(path) {
   }
 }
 
+function safeJsonParse(raw, fallback = {}) {
+  try {
+    const obj = JSON.parse(raw);
+    return obj && typeof obj === "object" ? obj : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 function normalizeText(s) {
   return String(s || "")
     .toLowerCase()
@@ -252,7 +263,7 @@ function normalizeText(s) {
 }
 
 const STOPWORDS = new Set([
-  "de","het","een","en","of","maar","want","dus","dat","dit","die","des","der",
+  "de","het","een","en","of","maar","want","dus","dat","dit","die",
   "ik","jij","je","u","hij","zij","ze","wij","we","jullie","hun","hen","mijn","jouw","uw",
   "is","zijn","was","waren","ben","bent","wordt","worden","kan","kunnen","zal","zullen",
   "met","voor","van","naar","op","in","aan","bij","als","om","uit","tot","over","onder",
@@ -276,11 +287,7 @@ function extractKeywords(query) {
 
 function chunkMarkdown(source, markdown, maxChunkChars = 900) {
   const lines = String(markdown || "").split("\n");
-
-  let h1 = "";
-  let h2 = "";
-  let h3 = "";
-
+  let h1 = "", h2 = "", h3 = "";
   const chunks = [];
   let buffer = "";
 
@@ -340,18 +347,13 @@ const SOURCE_WEIGHT = {
   "Legal.md": 1,
 };
 
-function safeJsonParse(raw, fallback = {}) {
-  try {
-    const obj = JSON.parse(raw);
-    return obj && typeof obj === "object" ? obj : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
 function loadClient(clientIdRaw) {
   const clientId = sanitizeClientId(clientIdRaw);
   const base = `./Clients/${clientId}`;
+
+  if (!fs.existsSync(base)) {
+    throw new Error(`Client folder not found: ${base}`);
+  }
 
   const brandVoice = readFile(`${base}/Brand voice.md`);
   const supportRules = readFile(`${base}/Customer support rules.md`);
@@ -369,11 +371,9 @@ function loadClient(clientIdRaw) {
   ];
 
   const allChunks = [];
-
   for (const file of files) {
     const content = readFile(`${base}/${file}`);
     if (!content || !content.trim()) continue;
-
     const chunks = chunkMarkdown(file, content, 900);
     for (const c of chunks) allChunks.push({ source: file, heading: c.heading || "", text: c.text });
   }
@@ -384,7 +384,6 @@ function loadClient(clientIdRaw) {
   return { clientId, brandVoice, supportRules, chunks: allChunks, clientConfig };
 }
 
-// ---- Relevance scoring ----
 function countHits(textNorm, keyword) {
   const k = keyword.trim();
   if (!k) return 0;
@@ -403,21 +402,14 @@ function scoreChunk(chunk, queryKeywords) {
   const textNorm = normalizeText(chunk.text);
   const headingNorm = normalizeText(chunk.heading || "");
   let score = 0;
-
   for (const kw of queryKeywords) {
     score += countHits(textNorm, kw) * 2 + (headingNorm ? countHits(headingNorm, kw) * 4 : 0);
   }
-
   return score * (SOURCE_WEIGHT[chunk.source] || 1);
 }
 
 function isPolicyLikeQuestion(msgNorm) {
-  const keys = [
-    "verzend", "shipping", "bezorg", "delivery",
-    "retour", "refund", "garantie", "warranty",
-    "korting", "discount", "promot", "actie",
-    "kosten", "price", "betaling", "payment"
-  ];
+  const keys = ["verzend","shipping","bezorg","delivery","retour","refund","garantie","warranty","korting","discount","promot","actie","kosten","price","betaling","payment"];
   return keys.some((k) => msgNorm.includes(k));
 }
 
@@ -504,13 +496,10 @@ function buildWidgetConfig(clientConfig, clientId) {
   };
 }
 
-// ---- Smart follow-up router + FACT CAPTURE ----
+// ---- Troubleshooting + follow-up router + fact capture ----
 function isTroubleshootingLike(message) {
   const t = normalizeText(message);
-  const keys = [
-    "werkt niet", "doet het niet", "kapot", "probleem", "storing", "error", "fout",
-    "broken", "doesnt work", "doesn't work"
-  ];
+  const keys = ["werkt niet","doet het niet","kapot","probleem","storing","error","fout","broken","doesnt work","doesn't work"];
   return keys.some((k) => t.includes(k));
 }
 
@@ -556,7 +545,6 @@ function captureFactsFromExpectedSlot(sessionId, expectedSlot, userMessage) {
   }
 
   if (expectedSlot === "productName") {
-    // Keep it short and safe
     const cleaned = msg.slice(0, 80);
     if (cleaned) setFacts(sessionId, { productName: cleaned });
     return;
@@ -575,19 +563,14 @@ function maybeHandleWithRouter({ sessionId, message, intent, clientConfig }) {
   const facts = getFacts(sessionId);
   const expected = meta.expectedSlot || "";
 
-  // If we were expecting something, capture it into facts and continue (no immediate follow-up here)
   if (expected) {
     captureFactsFromExpectedSlot(sessionId, expected, message);
     clearExpectedSlot(sessionId);
     return { handled: false };
   }
 
-  // Always persist order number if present in any message
-  if (intent.orderNumber) {
-    setFacts(sessionId, { orderNumber: intent.orderNumber });
-  }
+  if (intent.orderNumber) setFacts(sessionId, { orderNumber: intent.orderNumber });
 
-  // 1) Shipping/order: if no order in this message but we already have it, use it (don’t ask again)
   if (intent.mainIntent === "shipping_or_order") {
     const orderKnown = intent.orderNumber || facts.orderNumber;
     if (!orderKnown) {
@@ -596,7 +579,6 @@ function maybeHandleWithRouter({ sessionId, message, intent, clientConfig }) {
     }
   }
 
-  // 2) Returns: ask order number or email if both missing
   if (intent.mainIntent === "return_or_withdrawal") {
     const orderKnown = intent.orderNumber || facts.orderNumber;
     const emailKnown = facts.email;
@@ -606,7 +588,6 @@ function maybeHandleWithRouter({ sessionId, message, intent, clientConfig }) {
     }
   }
 
-  // 3) Troubleshooting: if problem-like, first ask product name if unknown; otherwise ask problem details if missing
   if ((intent.mainIntent === "product_usage" || intent.mainIntent === "general") && isTroubleshootingLike(message)) {
     if (!facts.productName) {
       setMeta(sessionId, { expectedSlot: "productName", lastIntent: "product_troubleshooting" });
@@ -624,17 +605,10 @@ function maybeHandleWithRouter({ sessionId, message, intent, clientConfig }) {
 // ---- Angry / urgent detection ----
 function detectAngryOrUrgent(message) {
   const t = normalizeText(message);
-
-  const urgent = ["urgent", "met spoed", "direct", "nu hulp", "nu meteen", "asap", "immediately"];
-  const angry = [
-    "boos", "woest", "geïrriteerd", "geirriteerd", "belachelijk", "ridiculous",
-    "waardeloos", "oplichter", "scam", "fraude", "ik ben er klaar mee",
-    "this is unacceptable", "i am angry", "i'm angry"
-  ];
-
+  const urgent = ["urgent","met spoed","direct","nu hulp","nu meteen","asap","immediately"];
+  const angry = ["boos","woest","geïrriteerd","geirriteerd","belachelijk","ridiculous","waardeloos","oplichter","scam","fraude","ik ben er klaar mee","this is unacceptable","i am angry","i'm angry"];
   const hasUrgent = urgent.some((k) => t.includes(k));
   const hasAngry = angry.some((k) => t.includes(k));
-
   return { hasUrgent, hasAngry, shouldEscalate: hasUrgent || hasAngry };
 }
 
@@ -642,19 +616,9 @@ function buildEscalationReply(clientConfig, clientId) {
   const lang = clientConfig.language || "nl";
   const brandName = clientConfig.brandName || clientId;
 
-  const email =
-    (clientConfig.support && clientConfig.support.email) ||
-    clientConfig.supportEmail ||
-    "";
-
-  const contactUrl =
-    (clientConfig.support && clientConfig.support.contactFormUrl) ||
-    clientConfig.contactFormUrl ||
-    "";
-
-  const custom =
-    (clientConfig.support && clientConfig.support.escalationMessage) ||
-    "";
+  const email = (clientConfig.support && clientConfig.support.email) || clientConfig.supportEmail || "";
+  const contactUrl = (clientConfig.support && clientConfig.support.contactFormUrl) || clientConfig.contactFormUrl || "";
+  const custom = (clientConfig.support && clientConfig.support.escalationMessage) || "";
 
   if (custom && String(custom).trim()) {
     let msg = String(custom).trim();
@@ -695,90 +659,82 @@ app.get("/widget-config", (req, res) => {
 });
 
 app.post("/chat", async (req, res) => {
-  const message = sanitizeUserMessage(req.body.message);
-  if (!message) return res.status(400).json({ error: "Invalid message" });
+  try {
+    const message = sanitizeUserMessage(req.body.message);
+    if (!message) return res.status(400).json({ error: "Invalid message" });
 
-  const clientId = sanitizeClientId(req.query.client || "Advantum");
-  const sessionId = sanitizeSessionId(req.body.sessionId);
-  const data = loadClient(clientId);
+    const clientId = sanitizeClientId(req.query.client || "Advantum");
+    const sessionId = sanitizeSessionId(req.body.sessionId);
+    const data = loadClient(clientId);
 
-  const intentRaw = detectIntent(message);
+    const intentRaw = detectIntent(message);
 
-  // Persist order number immediately if we see one
-  if (intentRaw.orderNumber) setFacts(sessionId, { orderNumber: intentRaw.orderNumber });
+    if (intentRaw.orderNumber) setFacts(sessionId, { orderNumber: intentRaw.orderNumber });
 
-  setMeta(sessionId, { lastIntent: intentRaw.mainIntent });
+    setMeta(sessionId, { lastIntent: intentRaw.mainIntent });
 
-  // Always append user message to history
-  appendToHistory(sessionId, "user", message);
+    appendToHistory(sessionId, "user", message);
 
-  // Escalation check (before router + model)
-  const escalation = detectAngryOrUrgent(message);
-  if (escalation.shouldEscalate) {
-    const reply = buildEscalationReply(data.clientConfig || {}, data.clientId);
-    appendToHistory(sessionId, "assistant", reply);
-    return res.json({
-      reply,
-      intent: { ...intentRaw, mainIntent: "support_escalation" },
-      shopify: null,
-      routed: true,
-      escalated: true,
-      facts: getFacts(sessionId),
-    });
-  }
+    const escalation = detectAngryOrUrgent(message);
+    if (escalation.shouldEscalate) {
+      const reply = buildEscalationReply(data.clientConfig || {}, data.clientId);
+      appendToHistory(sessionId, "assistant", reply);
+      return res.json({
+        reply,
+        intent: { ...intentRaw, mainIntent: "support_escalation" },
+        shopify: null,
+        routed: true,
+        escalated: true,
+        facts: getFacts(sessionId),
+      });
+    }
 
-  // Router follow-up + fact capture
-  const router = maybeHandleWithRouter({
-    sessionId,
-    message,
-    intent: intentRaw,
-    clientConfig: data.clientConfig || {},
-  });
-
-  if (router.handled) {
-    appendToHistory(sessionId, "assistant", router.reply);
-    return res.json({
-      reply: router.reply,
+    const router = maybeHandleWithRouter({
+      sessionId,
+      message,
       intent: intentRaw,
-      shopify: null,
-      routed: true,
-      escalated: false,
-      facts: getFacts(sessionId),
+      clientConfig: data.clientConfig || {},
     });
-  }
 
-  // Build effective intent/order using stored facts
-  const facts = getFacts(sessionId);
-  const effectiveIntent = {
-    ...intentRaw,
-    orderNumber: intentRaw.orderNumber || facts.orderNumber || "",
-  };
+    if (router.handled) {
+      appendToHistory(sessionId, "assistant", router.reply);
+      return res.json({
+        reply: router.reply,
+        intent: intentRaw,
+        shopify: null,
+        routed: true,
+        escalated: false,
+        facts: getFacts(sessionId),
+      });
+    }
 
-  // Shopify lookup using effective order number
-  let shopify = null;
-  if (effectiveIntent.mainIntent === "shipping_or_order" && effectiveIntent.orderNumber) {
-    shopify = await lookupShopifyOrder(effectiveIntent.orderNumber);
-  }
+    const facts = getFacts(sessionId);
+    const effectiveIntent = {
+      ...intentRaw,
+      orderNumber: intentRaw.orderNumber || facts.orderNumber || "",
+    };
 
-  // Improve retrieval when user message is short and we already know the product
-  const retrievalQuery =
-    (message.length < 30 && facts.productName)
-      ? `${message} ${facts.productName}`
-      : message;
+    let shopify = null;
+    if (effectiveIntent.mainIntent === "shipping_or_order" && effectiveIntent.orderNumber) {
+      shopify = await lookupShopifyOrder(effectiveIntent.orderNumber);
+    }
 
-  const topChunks = selectTopChunks(data.chunks, retrievalQuery, 8, 4500);
-  const context = topChunks
-    .map((c) => `### ${c.source}${c.heading ? " — " + c.heading : ""}\n${c.text}`)
-    .join("\n\n");
+    const retrievalQuery =
+      (message.length < 30 && facts.productName) ? `${message} ${facts.productName}` : message;
 
-  const historyMessages = buildHistoryMessages(sessionId);
-  const meta = getMeta(sessionId);
+    const topChunks = selectTopChunks(data.chunks, retrievalQuery, 8, 4500);
+    const context = topChunks
+      .map((c) => `### ${c.source}${c.heading ? " — " + c.heading : ""}\n${c.text}`)
+      .join("\n\n");
 
-  const flowHint = meta.expectedSlot
-    ? `EXPECTED_USER_INPUT: The user is answering the bot's question. Slot expected: ${meta.expectedSlot}.`
-    : "EXPECTED_USER_INPUT: none";
+    const historyMessages = buildHistoryMessages(sessionId);
+    const meta = getMeta(sessionId);
 
-  const factsBlock = `
+    const flowHint = meta.expectedSlot
+      ? `EXPECTED_USER_INPUT: The user is answering the bot's question. Slot expected: ${meta.expectedSlot}.`
+      : "EXPECTED_USER_INPUT: none";
+
+    const factsBlock = `
 FACTS WE ALREADY KNOW (persisted from earlier messages):
 - productName: ${facts.productName || "unknown"}
 - orderNumber: ${facts.orderNumber || "unknown"}
@@ -786,7 +742,7 @@ FACTS WE ALREADY KNOW (persisted from earlier messages):
 - problemDetails: ${facts.problemDetails || "unknown"}
 `.trim();
 
-  const systemPrompt = `
+    const systemPrompt = `
 You are the AI support bot for ${data.clientConfig.brandName || data.clientId}.
 Use the same language as the user. No emojis.
 Never guess policies, prices, or shipping rules.
@@ -815,7 +771,6 @@ RELEVANT KNOWLEDGE (selected excerpts):
 ${context || "No relevant knowledge matched."}
 `;
 
-  try {
     const response = await openai.chat.completions.create({
       model: "gpt-4.1-mini",
       messages: [
@@ -837,11 +792,17 @@ ${context || "No relevant knowledge matched."}
       facts: getFacts(sessionId),
     });
   } catch (e) {
-    console.error("Chat error:", e.message);
+    console.error("CHAT_ROUTE_ERROR:", e);
     return res.status(500).json({ error: "Server error" });
   }
+});
+
+// Helpful to distinguish “server running but route missing”
+app.use((req, res) => {
+  res.status(404).send("Not Found");
 });
 
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
+
