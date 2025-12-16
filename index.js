@@ -9,7 +9,7 @@ const app = express();
 const port = process.env.PORT || 3001;
 
 // Optional: set this in Render env vars to know exactly what version is deployed
-// Example: BUILD_VERSION=2025-12-15-a
+// Example: BUILD_VERSION=2025-12-16-a
 const BUILD_VERSION = process.env.BUILD_VERSION || "dev";
 
 // IMPORTANT on Render/Proxies: this makes req.ip work properly
@@ -47,100 +47,272 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- Simple rate limiting / spam protection ----
+// ---- Sanitizing helpers needed early for rate limiting ----
+function sanitizeClientId(id) {
+  const fallback = "Advantum";
+  const raw = String(id || "").trim();
+  if (!raw) return fallback;
+  if (!/^[A-Za-z0-9_-]+$/.test(raw)) return fallback;
+  return raw;
+}
+
+function sanitizeSessionId(id) {
+  const raw = String(id || "").trim();
+  if (!raw) return "";
+  return raw.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 80);
+}
+
+const MAX_USER_MESSAGE_LENGTH = 1000;
+
+function sanitizeUserMessage(input) {
+  let text = String(input || "");
+  text = text.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "");
+  text = text.replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, "");
+  text = text.replace(/<\/?[^>]+>/g, "");
+  text = text.replace(/\s+/g, " ").trim();
+  if (text.length > MAX_USER_MESSAGE_LENGTH) {
+    text = text.slice(0, MAX_USER_MESSAGE_LENGTH);
+  }
+  return text;
+}
+
+// ---- Abuse protection (IP + Client + Session) ----
 // Goals:
-// 1) Minimum delay between messages per IP (anti "double click spam")
-// 2) Max requests per IP per short time window (anti flooding)
+// 1) Minimum delay between messages per key (anti spam)
+// 2) Max requests per key per short time window (anti flooding)
+// 3) Simple duplicate message spam detection
 
 const RL_WINDOW_MS = 10 * 1000; // 10 seconds
-const RL_MAX_REQUESTS_PER_WINDOW = 12; // 12 req / 10s per IP
-const RL_MIN_GAP_MS = 800; // at least 800ms between /chat calls per IP
 
+// IP limits (baseline)
+const RL_IP_MAX_REQUESTS_PER_WINDOW = 12;
+const RL_IP_MIN_GAP_MS = 800;
+
+// Client limits (protect multi-tenant)
+const RL_CLIENT_MAX_REQUESTS_PER_WINDOW = 40; // across all IPs/sessions for one client
+const RL_CLIENT_MIN_GAP_MS = 200; // small gap, mainly to reduce bursts
+
+// Session limits (protect chat sessions)
+const RL_SESSION_MAX_REQUESTS_PER_WINDOW = 10;
+const RL_SESSION_MIN_GAP_MS = 700;
+
+// Duplicate message spam limits (per session)
+const RL_DUPLICATE_WINDOW_MS = 20 * 1000; // 20 seconds window for duplicate checks
+const RL_DUPLICATE_MAX = 3; // allow 3 repeats, block the 4th within window
+
+// stores
 // ip -> { windowStart, count, lastAt }
-const rateLimitStore = new Map();
+const rateLimitStoreIp = new Map();
+// clientId -> { windowStart, count, lastAt }
+const rateLimitStoreClient = new Map();
+// sessionId -> { windowStart, count, lastAt, lastMsg, lastMsgAt, dupCount }
+const rateLimitStoreSession = new Map();
 
 function getClientIp(req) {
-  // with trust proxy enabled, req.ip should be correct
   return req.ip || "unknown";
+}
+
+function readClientIdFromReq(req) {
+  // query client is the canonical one for your API
+  return sanitizeClientId(req.query && req.query.client ? req.query.client : "Advantum");
+}
+
+function readSessionIdFromReq(req) {
+  // body may not exist in some cases; safe fallback
+  return sanitizeSessionId(req.body && req.body.sessionId ? req.body.sessionId : "");
+}
+
+function readMessageFromReq(req) {
+  // only used for duplicate spam detection
+  return sanitizeUserMessage(req.body && req.body.message ? req.body.message : "");
+}
+
+function rateLimitDecision(store, key, now, maxPerWindow, minGapMs) {
+  const entry = store.get(key) || { windowStart: now, count: 0, lastAt: 0 };
+  if (now - entry.windowStart > RL_WINDOW_MS) {
+    entry.windowStart = now;
+    entry.count = 0;
+  }
+  if (entry.lastAt && now - entry.lastAt < minGapMs) {
+    entry.lastAt = now;
+    store.set(key, entry);
+    return { blocked: true, reason: "min_gap", entry };
+  }
+  entry.count += 1;
+  entry.lastAt = now;
+  store.set(key, entry);
+  if (entry.count > maxPerWindow) {
+    return { blocked: true, reason: "window_count", entry };
+  }
+  return { blocked: false, reason: "", entry };
+}
+
+function shouldBlockDuplicateSessionMessage(sessionEntry, now, message) {
+  if (!message || !sessionEntry) return { blocked: false };
+
+  const lastMsg = sessionEntry.lastMsg || "";
+  const lastMsgAt = sessionEntry.lastMsgAt || 0;
+
+  // reset duplicate counter if time window passed or message differs
+  if (!lastMsgAt || now - lastMsgAt > RL_DUPLICATE_WINDOW_MS || lastMsg !== message) {
+    sessionEntry.lastMsg = message;
+    sessionEntry.lastMsgAt = now;
+    sessionEntry.dupCount = 0;
+    return { blocked: false };
+  }
+
+  // same message inside window
+  sessionEntry.dupCount = (sessionEntry.dupCount || 0) + 1;
+
+  if (sessionEntry.dupCount >= RL_DUPLICATE_MAX) {
+    return { blocked: true };
+  }
+
+  return { blocked: false };
 }
 
 function rateLimitChat(req, res, next) {
   // Only protect /chat
   if (req.path !== "/chat") return next();
 
-  const ip = getClientIp(req);
   const now = Date.now();
+  const ip = getClientIp(req);
+  const clientId = readClientIdFromReq(req);
+  const sessionId = readSessionIdFromReq(req);
+  const message = readMessageFromReq(req);
 
-  const entry = rateLimitStore.get(ip) || {
-    windowStart: now,
-    count: 0,
-    lastAt: 0,
-  };
-
-  // reset window if expired
-  if (now - entry.windowStart > RL_WINDOW_MS) {
-    entry.windowStart = now;
-    entry.count = 0;
-  }
-
-  // min-gap rule
-  if (entry.lastAt && now - entry.lastAt < RL_MIN_GAP_MS) {
-    entry.lastAt = now;
-    rateLimitStore.set(ip, entry);
-
+  // 1) IP limit
+  const ipCheck = rateLimitDecision(
+    rateLimitStoreIp,
+    ip,
+    now,
+    RL_IP_MAX_REQUESTS_PER_WINDOW,
+    RL_IP_MIN_GAP_MS
+  );
+  if (ipCheck.blocked) {
     safeLogJson({
       type: "rate_limit",
       requestId: req.requestId,
-      ip,
-      path: req.path,
-      rule: "min_gap",
+      keyType: "ip",
+      key: ip,
+      clientId,
+      sessionId: sessionId || null,
+      rule: ipCheck.reason,
+      count: ipCheck.entry.count,
+      windowMs: RL_WINDOW_MS,
       at: new Date().toISOString(),
     });
-
     return res.status(429).json({
       requestId: req.requestId,
       error: "Too many messages too quickly. Please wait a moment and try again.",
     });
   }
 
-  // window-count rule
-  entry.count += 1;
-  entry.lastAt = now;
-  rateLimitStore.set(ip, entry);
-
-  if (entry.count > RL_MAX_REQUESTS_PER_WINDOW) {
+  // 2) Client limit (protects multi-tenant)
+  const clientCheck = rateLimitDecision(
+    rateLimitStoreClient,
+    clientId,
+    now,
+    RL_CLIENT_MAX_REQUESTS_PER_WINDOW,
+    RL_CLIENT_MIN_GAP_MS
+  );
+  if (clientCheck.blocked) {
     safeLogJson({
       type: "rate_limit",
       requestId: req.requestId,
-      ip,
-      path: req.path,
-      rule: "window_count",
-      count: entry.count,
+      keyType: "client",
+      key: clientId,
+      clientId,
+      sessionId: sessionId || null,
+      rule: clientCheck.reason,
+      count: clientCheck.entry.count,
       windowMs: RL_WINDOW_MS,
       at: new Date().toISOString(),
     });
-
     return res.status(429).json({
       requestId: req.requestId,
-      error: "Too many requests. Please wait a few seconds and try again.",
+      error: "Too many requests right now for this store. Please wait a few seconds and try again.",
     });
+  }
+
+  // 3) Session limit (protect single chat sessions)
+  // If no sessionId is provided, we skip session limiting (frontend should always send one)
+  if (sessionId) {
+    const sessionCheck = rateLimitDecision(
+      rateLimitStoreSession,
+      sessionId,
+      now,
+      RL_SESSION_MAX_REQUESTS_PER_WINDOW,
+      RL_SESSION_MIN_GAP_MS
+    );
+
+    // duplicate spam detection (only meaningful for sessions)
+    const sessionEntry = rateLimitStoreSession.get(sessionId) || sessionCheck.entry;
+    const dupCheck = shouldBlockDuplicateSessionMessage(sessionEntry, now, message);
+    rateLimitStoreSession.set(sessionId, sessionEntry);
+
+    if (dupCheck.blocked) {
+      safeLogJson({
+        type: "rate_limit",
+        requestId: req.requestId,
+        keyType: "session",
+        key: sessionId,
+        clientId,
+        sessionId,
+        rule: "duplicate_message",
+        dupCount: sessionEntry.dupCount,
+        windowMs: RL_DUPLICATE_WINDOW_MS,
+        at: new Date().toISOString(),
+      });
+      return res.status(429).json({
+        requestId: req.requestId,
+        error: "It looks like the same message was sent repeatedly. Please wait a moment and try again.",
+      });
+    }
+
+    if (sessionCheck.blocked) {
+      safeLogJson({
+        type: "rate_limit",
+        requestId: req.requestId,
+        keyType: "session",
+        key: sessionId,
+        clientId,
+        sessionId,
+        rule: sessionCheck.reason,
+        count: sessionCheck.entry.count,
+        windowMs: RL_WINDOW_MS,
+        at: new Date().toISOString(),
+      });
+      return res.status(429).json({
+        requestId: req.requestId,
+        error: "Too many messages too quickly. Please wait a moment and try again.",
+      });
+    }
   }
 
   return next();
 }
 
-// cleanup store to avoid memory growth
+// cleanup stores to avoid memory growth
 setInterval(() => {
   const now = Date.now();
-  for (const [ip, entry] of rateLimitStore.entries()) {
-    if (!entry) {
-      rateLimitStore.delete(ip);
-      continue;
-    }
-    if (now - entry.windowStart > RL_WINDOW_MS * 6) {
-      rateLimitStore.delete(ip);
+
+  function clean(store) {
+    for (const [k, entry] of store.entries()) {
+      if (!entry) {
+        store.delete(k);
+        continue;
+      }
+      // delete idle keys after ~1 minute
+      if (now - (entry.lastAt || entry.windowStart || 0) > 60 * 1000) {
+        store.delete(k);
+      }
     }
   }
+
+  clean(rateLimitStoreIp);
+  clean(rateLimitStoreClient);
+  clean(rateLimitStoreSession);
 }, 60 * 1000);
 
 // apply limiter early (before routes)
@@ -174,21 +346,6 @@ if (SHOPIFY_STORE_DOMAIN && SHOPIFY_API_TOKEN) {
   );
 }
 
-// ---- Sanitizing ----
-const MAX_USER_MESSAGE_LENGTH = 1000;
-
-function sanitizeUserMessage(input) {
-  let text = String(input || "");
-  text = text.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "");
-  text = text.replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, "");
-  text = text.replace(/<\/?[^>]+>/g, "");
-  text = text.replace(/\s+/g, " ").trim();
-  if (text.length > MAX_USER_MESSAGE_LENGTH) {
-    text = text.slice(0, MAX_USER_MESSAGE_LENGTH);
-  }
-  return text;
-}
-
 function sanitizeOrderNumber(orderNumber) {
   if (!orderNumber) return "";
   // Allow letters, digits, #, dash, underscore, and spaces
@@ -196,20 +353,6 @@ function sanitizeOrderNumber(orderNumber) {
     .replace(/[^A-Za-z0-9#\-_ ]/g, "")
     .trim()
     .slice(0, 60);
-}
-
-function sanitizeClientId(id) {
-  const fallback = "Advantum";
-  const raw = String(id || "").trim();
-  if (!raw) return fallback;
-  if (!/^[A-Za-z0-9_-]+$/.test(raw)) return fallback;
-  return raw;
-}
-
-function sanitizeSessionId(id) {
-  const raw = String(id || "").trim();
-  if (!raw) return "";
-  return raw.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 80);
 }
 
 function looksLikeEmail(s) {
@@ -1138,7 +1281,6 @@ ${context || "No relevant knowledge matched."}
     });
     openaiMs = Date.now() - tAi0;
 
-    // usage is usually available here; if not, it stays null
     openaiUsage = response && response.usage ? response.usage : null;
 
     const reply = response.choices[0].message.content;
@@ -1208,5 +1350,4 @@ app.listen(port, () => {
     at: new Date().toISOString(),
   });
 });
-
 
