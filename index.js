@@ -42,7 +42,6 @@ function safeLogJson(obj) {
 // attach requestId to every request
 app.use((req, res, next) => {
   req.requestId = makeRequestId();
-  // helpful for debugging from browser/network tab too
   res.setHeader("X-Request-Id", req.requestId);
   next();
 });
@@ -77,53 +76,42 @@ function sanitizeUserMessage(input) {
 }
 
 // ---- Abuse protection (IP + Client + Session) ----
-// Goals:
-// 1) Minimum delay between messages per key (anti spam)
-// 2) Max requests per key per short time window (anti flooding)
-// 3) Simple duplicate message spam detection
-
 const RL_WINDOW_MS = 10 * 1000; // 10 seconds
 
-// IP limits (baseline)
+// IP limits
 const RL_IP_MAX_REQUESTS_PER_WINDOW = 12;
 const RL_IP_MIN_GAP_MS = 800;
 
-// Client limits (protect multi-tenant)
-const RL_CLIENT_MAX_REQUESTS_PER_WINDOW = 40; // across all IPs/sessions for one client
-const RL_CLIENT_MIN_GAP_MS = 200; // small gap, mainly to reduce bursts
+// Client limits
+const RL_CLIENT_MAX_REQUESTS_PER_WINDOW = 40;
+const RL_CLIENT_MIN_GAP_MS = 200;
 
-// Session limits (protect chat sessions)
+// Session limits
 const RL_SESSION_MAX_REQUESTS_PER_WINDOW = 10;
 const RL_SESSION_MIN_GAP_MS = 700;
 
 // Duplicate message spam limits (per session)
-const RL_DUPLICATE_WINDOW_MS = 20 * 1000; // 20 seconds window for duplicate checks
-const RL_DUPLICATE_MAX = 3; // allow 3 repeats, block the 4th within window
+const RL_DUPLICATE_WINDOW_MS = 20 * 1000;
+const RL_DUPLICATE_MAX = 3;
 
 // stores
-// ip -> { windowStart, count, lastAt }
-const rateLimitStoreIp = new Map();
-// clientId -> { windowStart, count, lastAt }
-const rateLimitStoreClient = new Map();
-// sessionId -> { windowStart, count, lastAt, lastMsg, lastMsgAt, dupCount }
-const rateLimitStoreSession = new Map();
+const rateLimitStoreIp = new Map(); // ip -> { windowStart, count, lastAt }
+const rateLimitStoreClient = new Map(); // clientId -> { windowStart, count, lastAt }
+const rateLimitStoreSession = new Map(); // sessionId -> { windowStart, count, lastAt, lastMsg, lastMsgAt, dupCount }
 
 function getClientIp(req) {
   return req.ip || "unknown";
 }
 
 function readClientIdFromReq(req) {
-  // query client is the canonical one for your API
   return sanitizeClientId(req.query && req.query.client ? req.query.client : "Advantum");
 }
 
 function readSessionIdFromReq(req) {
-  // body may not exist in some cases; safe fallback
   return sanitizeSessionId(req.body && req.body.sessionId ? req.body.sessionId : "");
 }
 
 function readMessageFromReq(req) {
-  // only used for duplicate spam detection
   return sanitizeUserMessage(req.body && req.body.message ? req.body.message : "");
 }
 
@@ -153,7 +141,6 @@ function shouldBlockDuplicateSessionMessage(sessionEntry, now, message) {
   const lastMsg = sessionEntry.lastMsg || "";
   const lastMsgAt = sessionEntry.lastMsgAt || 0;
 
-  // reset duplicate counter if time window passed or message differs
   if (!lastMsgAt || now - lastMsgAt > RL_DUPLICATE_WINDOW_MS || lastMsg !== message) {
     sessionEntry.lastMsg = message;
     sessionEntry.lastMsgAt = now;
@@ -161,18 +148,14 @@ function shouldBlockDuplicateSessionMessage(sessionEntry, now, message) {
     return { blocked: false };
   }
 
-  // same message inside window
   sessionEntry.dupCount = (sessionEntry.dupCount || 0) + 1;
-
   if (sessionEntry.dupCount >= RL_DUPLICATE_MAX) {
     return { blocked: true };
   }
-
   return { blocked: false };
 }
 
 function rateLimitChat(req, res, next) {
-  // Only protect /chat
   if (req.path !== "/chat") return next();
 
   const now = Date.now();
@@ -181,14 +164,7 @@ function rateLimitChat(req, res, next) {
   const sessionId = readSessionIdFromReq(req);
   const message = readMessageFromReq(req);
 
-  // 1) IP limit
-  const ipCheck = rateLimitDecision(
-    rateLimitStoreIp,
-    ip,
-    now,
-    RL_IP_MAX_REQUESTS_PER_WINDOW,
-    RL_IP_MIN_GAP_MS
-  );
+  const ipCheck = rateLimitDecision(rateLimitStoreIp, ip, now, RL_IP_MAX_REQUESTS_PER_WINDOW, RL_IP_MIN_GAP_MS);
   if (ipCheck.blocked) {
     safeLogJson({
       type: "rate_limit",
@@ -208,7 +184,6 @@ function rateLimitChat(req, res, next) {
     });
   }
 
-  // 2) Client limit (protects multi-tenant)
   const clientCheck = rateLimitDecision(
     rateLimitStoreClient,
     clientId,
@@ -235,8 +210,6 @@ function rateLimitChat(req, res, next) {
     });
   }
 
-  // 3) Session limit (protect single chat sessions)
-  // If no sessionId is provided, we skip session limiting (frontend should always send one)
   if (sessionId) {
     const sessionCheck = rateLimitDecision(
       rateLimitStoreSession,
@@ -246,7 +219,6 @@ function rateLimitChat(req, res, next) {
       RL_SESSION_MIN_GAP_MS
     );
 
-    // duplicate spam detection (only meaningful for sessions)
     const sessionEntry = rateLimitStoreSession.get(sessionId) || sessionCheck.entry;
     const dupCheck = shouldBlockDuplicateSessionMessage(sessionEntry, now, message);
     rateLimitStoreSession.set(sessionId, sessionEntry);
@@ -293,29 +265,25 @@ function rateLimitChat(req, res, next) {
   return next();
 }
 
-// cleanup stores to avoid memory growth
+// cleanup stores
 setInterval(() => {
   const now = Date.now();
-
   function clean(store) {
     for (const [k, entry] of store.entries()) {
       if (!entry) {
         store.delete(k);
         continue;
       }
-      // delete idle keys after ~1 minute
       if (now - (entry.lastAt || entry.windowStart || 0) > 60 * 1000) {
         store.delete(k);
       }
     }
   }
-
   clean(rateLimitStoreIp);
   clean(rateLimitStoreClient);
   clean(rateLimitStoreSession);
 }, 60 * 1000);
 
-// apply limiter early (before routes)
 app.use(rateLimitChat);
 
 // ---- OpenAI ----
@@ -324,9 +292,7 @@ if (!process.env.OPENAI_API_KEY) {
   process.exit(1);
 }
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ---- Shopify ----
 const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
@@ -341,18 +307,12 @@ if (SHOPIFY_STORE_DOMAIN && SHOPIFY_API_TOKEN) {
     timeout: 5000,
   });
 } else {
-  console.warn(
-    "Shopify env vars missing; order lookup will be disabled until they are set."
-  );
+  console.warn("Shopify env vars missing; order lookup will be disabled until they are set.");
 }
 
 function sanitizeOrderNumber(orderNumber) {
   if (!orderNumber) return "";
-  // Allow letters, digits, #, dash, underscore, and spaces
-  return String(orderNumber)
-    .replace(/[^A-Za-z0-9#\-_ ]/g, "")
-    .trim()
-    .slice(0, 60);
+  return String(orderNumber).replace(/[^A-Za-z0-9#\-_ ]/g, "").trim().slice(0, 60);
 }
 
 function looksLikeEmail(s) {
@@ -364,27 +324,21 @@ function looksLikeEmail(s) {
 function looksLikeShopifyOrderName(orderNumberRaw) {
   const t = sanitizeOrderNumber(orderNumberRaw).replace(/\s+/g, "");
   if (!t) return false;
-  // Shopify name lookups are reliable for numeric names like #1055 / 1055
   if (/^#\d{3,12}$/.test(t)) return true;
   if (/^\d{3,12}$/.test(t)) return true;
   return false;
 }
 
-// Better extraction:
-// - Captures numeric (#1055, 1055, 10-55, 10 55)
-// - Captures common custom formats (ADV-2024-001, AB-123-456, ORD_98231, etc.)
 function extractOrderNumberFromText(message) {
   const raw = String(message || "");
   if (!raw.trim()) return "";
 
   const candidates = [];
 
-  const customMatches =
-    raw.match(/\b[A-Za-z]{2,12}[-_]\d{2,8}(?:[-_]\d{1,8})+\b/g) || [];
+  const customMatches = raw.match(/\b[A-Za-z]{2,12}[-_]\d{2,8}(?:[-_]\d{1,8})+\b/g) || [];
   for (const m of customMatches) candidates.push(m);
 
-  const customShortMatches =
-    raw.match(/\b[A-Za-z]{2,12}[-_]\d{3,12}\b/g) || [];
+  const customShortMatches = raw.match(/\b[A-Za-z]{2,12}[-_]\d{3,12}\b/g) || [];
   for (const m of customShortMatches) candidates.push(m);
 
   const numericMatches = raw.match(/#\d{3,12}\b/g) || [];
@@ -399,11 +353,9 @@ function extractOrderNumberFromText(message) {
   if (!candidates.length) return "";
 
   const pickedRaw = candidates[candidates.length - 1];
-
   let cleaned = sanitizeOrderNumber(pickedRaw);
   cleaned = cleaned.replace(/\s+/g, " ").trim();
   if (!/\d/.test(cleaned)) return "";
-
   return cleaned;
 }
 
@@ -438,10 +390,8 @@ function appendToHistory(sessionId, role, content) {
   const existing = getSession(sessionId);
   const history = existing ? existing.messages.slice() : [];
   const meta = existing ? { ...(existing.meta || {}) } : {};
-
   history.push({ role, content });
   const trimmed = history.slice(-SESSION_HISTORY_LIMIT);
-
   upsertSession(sessionId, trimmed, meta);
 }
 
@@ -490,26 +440,16 @@ setInterval(() => {
 // ---- Intent detection ----
 function detectIntent(message) {
   const text = message.toLowerCase();
-  const shipping = [
-    "verzending",
-    "bezorg",
-    "track",
-    "order",
-    "shipping",
-    "delivery",
-  ];
+  const shipping = ["verzending", "bezorg", "track", "order", "shipping", "delivery"];
   const returns = ["retour", "refund", "terug", "herroep", "omruil"];
   const usage = ["gebruik", "how", "hoe", "tutorial", "uitleg"];
 
   const orderNumber = extractOrderNumberFromText(message);
 
   let mainIntent = "general";
-  if (shipping.some((w) => text.includes(w)) || orderNumber)
-    mainIntent = "shipping_or_order";
-  if (returns.some((w) => text.includes(w)))
-    mainIntent = "return_or_withdrawal";
-  if (usage.some((w) => text.includes(w)) && mainIntent === "general")
-    mainIntent = "product_usage";
+  if (shipping.some((w) => text.includes(w)) || orderNumber) mainIntent = "shipping_or_order";
+  if (returns.some((w) => text.includes(w))) mainIntent = "return_or_withdrawal";
+  if (usage.some((w) => text.includes(w)) && mainIntent === "general") mainIntent = "product_usage";
 
   return { mainIntent, orderNumber };
 }
@@ -533,19 +473,14 @@ async function lookupShopifyOrder(orderNumberRaw) {
     if (!orders.length) return null;
 
     const order = orders[0];
-    const fulfillment =
-      order.fulfillments && order.fulfillments[0]
-        ? order.fulfillments[0]
-        : null;
+    const fulfillment = order.fulfillments && order.fulfillments[0] ? order.fulfillments[0] : null;
 
     return {
       orderName: order.name || null,
       fulfillmentStatus: order.fulfillment_status || null,
       financialStatus: order.financial_status || null,
       tracking:
-        fulfillment &&
-        fulfillment.tracking_numbers &&
-        fulfillment.tracking_numbers[0]
+        fulfillment && fulfillment.tracking_numbers && fulfillment.tracking_numbers[0]
           ? fulfillment.tracking_numbers[0]
           : null,
       trackingUrl:
@@ -965,6 +900,45 @@ function buildEscalationReply(clientConfig, clientId) {
   return msg;
 }
 
+// NEW: structured handoff payload for the frontend
+function buildHandoffPayload({ clientConfig, clientId, sessionId, reason, lastUserMessage }) {
+  const lang = (clientConfig && clientConfig.language) || "nl";
+  const brandName = (clientConfig && clientConfig.brandName) || clientId;
+
+  const email =
+    (clientConfig && clientConfig.support && clientConfig.support.email) ||
+    (clientConfig && clientConfig.supportEmail) ||
+    null;
+
+  const contactFormUrl =
+    (clientConfig && clientConfig.support && clientConfig.support.contactFormUrl) ||
+    (clientConfig && clientConfig.contactFormUrl) ||
+    null;
+
+  const facts = getFacts(sessionId);
+
+  const parts = [];
+  parts.push(`${brandName} support handoff`);
+  parts.push(`Reason: ${reason || "unknown"}`);
+
+  if (facts.orderNumber) parts.push(`Order number: ${facts.orderNumber}`);
+  if (facts.email) parts.push(`Customer email: ${facts.email}`);
+  if (facts.productName) parts.push(`Product: ${facts.productName}`);
+  if (facts.problemDetails) parts.push(`Problem details: ${facts.problemDetails}`);
+
+  if (lastUserMessage) parts.push(`Last message: ${String(lastUserMessage).slice(0, 300)}`);
+
+  const summary = parts.join("\n");
+
+  return {
+    reason: reason || "unknown",
+    email,
+    contactFormUrl,
+    summary,
+    language: String(lang).toLowerCase().startsWith("en") ? "en" : "nl",
+  };
+}
+
 // ---- Deterministic reply for "order number not found" ----
 function buildOrderNotFoundReply(clientConfig, clientId, orderNumber) {
   const lang = (clientConfig && clientConfig.language) || "nl";
@@ -982,7 +956,6 @@ app.get("/", (req, res) => {
   return res.json({ ok: true, message: "AI support backend running.", requestId: req.requestId });
 });
 
-// Health endpoint for monitoring + debugging
 app.get("/health", (req, res) => {
   return res.json({
     ok: true,
@@ -1039,7 +1012,6 @@ app.post("/chat", async (req, res) => {
   let sessionId = "";
   let effectiveIntent = null;
 
-  // Observability fields
   let shopifyAttempted = false;
   let shopifyFound = false;
   let shopifyMs = 0;
@@ -1064,6 +1036,15 @@ app.post("/chat", async (req, res) => {
     const escalation = detectAngryOrUrgent(message);
     if (escalation.shouldEscalate) {
       const reply = buildEscalationReply(data.clientConfig || {}, data.clientId);
+
+      const handoff = buildHandoffPayload({
+        clientConfig: data.clientConfig || {},
+        clientId: data.clientId,
+        sessionId,
+        reason: escalation.hasUrgent ? "urgent" : "angry",
+        lastUserMessage: message,
+      });
+
       appendToHistory(sessionId, "assistant", reply);
 
       safeLogJson({
@@ -1075,6 +1056,7 @@ app.post("/chat", async (req, res) => {
         intent: { ...intentRaw, mainIntent: "support_escalation" },
         routed: true,
         escalated: true,
+        handoffReason: handoff.reason,
         shopifyAttempted: false,
         shopifyFound: false,
         openaiMs: 0,
@@ -1089,6 +1071,7 @@ app.post("/chat", async (req, res) => {
         shopify: null,
         routed: true,
         escalated: true,
+        handoff,
         facts: getFacts(sessionId),
       });
     }
@@ -1136,7 +1119,6 @@ app.post("/chat", async (req, res) => {
       orderNumber: intentRaw.orderNumber || facts.orderNumber || "",
     };
 
-    // Order number exists but not Shopify-style -> deterministic "not found" message
     if (
       effectiveIntent.mainIntent === "shipping_or_order" &&
       effectiveIntent.orderNumber &&
@@ -1172,13 +1154,8 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    // Shopify lookup (only numeric Shopify-like)
     let shopify = null;
-    if (
-      effectiveIntent.mainIntent === "shipping_or_order" &&
-      effectiveIntent.orderNumber &&
-      looksLikeShopifyOrderName(effectiveIntent.orderNumber)
-    ) {
+    if (effectiveIntent.mainIntent === "shipping_or_order" && effectiveIntent.orderNumber && looksLikeShopifyOrderName(effectiveIntent.orderNumber)) {
       shopifyAttempted = true;
       const tShop0 = Date.now();
       shopify = await lookupShopifyOrder(effectiveIntent.orderNumber);
@@ -1218,8 +1195,7 @@ app.post("/chat", async (req, res) => {
       }
     }
 
-    const retrievalQuery =
-      (message.length < 30 && facts.productName) ? `${message} ${facts.productName}` : message;
+    const retrievalQuery = message.length < 30 && facts.productName ? `${message} ${facts.productName}` : message;
 
     const topChunks = selectTopChunks(data.chunks, retrievalQuery, 8, 4500);
     const context = topChunks
@@ -1280,7 +1256,6 @@ ${context || "No relevant knowledge matched."}
       ],
     });
     openaiMs = Date.now() - tAi0;
-
     openaiUsage = response && response.usage ? response.usage : null;
 
     const reply = response.choices[0].message.content;
