@@ -9,7 +9,6 @@ const app = express();
 const port = process.env.PORT || 3001;
 
 // Optional: set this in Render env vars to know exactly what version is deployed
-// Example: BUILD_VERSION=2025-12-16-a
 const BUILD_VERSION = process.env.BUILD_VERSION || "dev";
 
 // IMPORTANT on Render/Proxies: this makes req.ip work properly
@@ -39,7 +38,6 @@ function safeLogJson(obj) {
   }
 }
 
-// attach requestId to every request
 app.use((req, res, next) => {
   req.requestId = makeRequestId();
   res.setHeader("X-Request-Id", req.requestId);
@@ -78,26 +76,21 @@ function sanitizeUserMessage(input) {
 // ---- Abuse protection (IP + Client + Session) ----
 const RL_WINDOW_MS = 10 * 1000; // 10 seconds
 
-// IP limits
 const RL_IP_MAX_REQUESTS_PER_WINDOW = 12;
 const RL_IP_MIN_GAP_MS = 800;
 
-// Client limits
 const RL_CLIENT_MAX_REQUESTS_PER_WINDOW = 40;
 const RL_CLIENT_MIN_GAP_MS = 200;
 
-// Session limits
 const RL_SESSION_MAX_REQUESTS_PER_WINDOW = 10;
 const RL_SESSION_MIN_GAP_MS = 700;
 
-// Duplicate message spam limits (per session)
 const RL_DUPLICATE_WINDOW_MS = 20 * 1000;
 const RL_DUPLICATE_MAX = 3;
 
-// stores
-const rateLimitStoreIp = new Map(); // ip -> { windowStart, count, lastAt }
-const rateLimitStoreClient = new Map(); // clientId -> { windowStart, count, lastAt }
-const rateLimitStoreSession = new Map(); // sessionId -> { windowStart, count, lastAt, lastMsg, lastMsgAt, dupCount }
+const rateLimitStoreIp = new Map();
+const rateLimitStoreClient = new Map();
+const rateLimitStoreSession = new Map();
 
 function getClientIp(req) {
   return req.ip || "unknown";
@@ -184,13 +177,7 @@ function rateLimitChat(req, res, next) {
     });
   }
 
-  const clientCheck = rateLimitDecision(
-    rateLimitStoreClient,
-    clientId,
-    now,
-    RL_CLIENT_MAX_REQUESTS_PER_WINDOW,
-    RL_CLIENT_MIN_GAP_MS
-  );
+  const clientCheck = rateLimitDecision(rateLimitStoreClient, clientId, now, RL_CLIENT_MAX_REQUESTS_PER_WINDOW, RL_CLIENT_MIN_GAP_MS);
   if (clientCheck.blocked) {
     safeLogJson({
       type: "rate_limit",
@@ -211,13 +198,7 @@ function rateLimitChat(req, res, next) {
   }
 
   if (sessionId) {
-    const sessionCheck = rateLimitDecision(
-      rateLimitStoreSession,
-      sessionId,
-      now,
-      RL_SESSION_MAX_REQUESTS_PER_WINDOW,
-      RL_SESSION_MIN_GAP_MS
-    );
+    const sessionCheck = rateLimitDecision(rateLimitStoreSession, sessionId, now, RL_SESSION_MAX_REQUESTS_PER_WINDOW, RL_SESSION_MIN_GAP_MS);
 
     const sessionEntry = rateLimitStoreSession.get(sessionId) || sessionCheck.entry;
     const dupCheck = shouldBlockDuplicateSessionMessage(sessionEntry, now, message);
@@ -265,7 +246,6 @@ function rateLimitChat(req, res, next) {
   return next();
 }
 
-// cleanup stores
 setInterval(() => {
   const now = Date.now();
   function clean(store) {
@@ -703,6 +683,30 @@ function selectTopChunks(chunks, message, limit = 8, maxTotalChars = 4500) {
   return selected;
 }
 
+// ---- Canonical support settings (single source of truth) ----
+function getSupportSettings(clientConfig) {
+  const email =
+    (clientConfig && clientConfig.supportEmail) ||
+    (clientConfig && clientConfig.support && clientConfig.support.email) ||
+    null;
+
+  const contactFormUrl =
+    (clientConfig && clientConfig.contactFormUrl) ||
+    (clientConfig && clientConfig.support && clientConfig.support.contactFormUrl) ||
+    null;
+
+  const escalationMessage =
+    (clientConfig && clientConfig.support && clientConfig.support.escalationMessage) ||
+    (clientConfig && clientConfig.escalationMessage) ||
+    "";
+
+  return {
+    email: email ? String(email).trim() : null,
+    contactFormUrl: contactFormUrl ? String(contactFormUrl).trim() : null,
+    escalationMessage: escalationMessage ? String(escalationMessage).trim() : "",
+  };
+}
+
 // ---- Widget config endpoint ----
 function buildWidgetConfig(clientConfig, clientId) {
   const brandName = clientConfig.brandName || clientId;
@@ -740,6 +744,8 @@ function buildWidgetConfig(clientConfig, clientId) {
         botBubble: "#ffffff",
       };
 
+  const support = getSupportSettings(clientConfig);
+
   return {
     brandName,
     assistantName: clientConfig.assistantName || widgetTitle,
@@ -749,8 +755,8 @@ function buildWidgetConfig(clientConfig, clientId) {
     widget: { title: widgetTitle, greeting: widgetGreeting },
     colors,
     support: {
-      email: clientConfig.supportEmail || null,
-      contactFormUrl: clientConfig.contactFormUrl || null,
+      email: support.email,
+      contactFormUrl: support.contactFormUrl,
     },
     version: clientConfig.version || null,
   };
@@ -876,9 +882,10 @@ function buildEscalationReply(clientConfig, clientId) {
   const lang = clientConfig.language || "nl";
   const brandName = clientConfig.brandName || clientId;
 
-  const email = (clientConfig.support && clientConfig.support.email) || clientConfig.supportEmail || "";
-  const contactUrl = (clientConfig.support && clientConfig.support.contactFormUrl) || clientConfig.contactFormUrl || "";
-  const custom = (clientConfig.support && clientConfig.support.escalationMessage) || "";
+  const support = getSupportSettings(clientConfig);
+  const email = support.email || "";
+  const contactUrl = support.contactFormUrl || "";
+  const custom = support.escalationMessage || "";
 
   if (custom && String(custom).trim()) {
     let msg = String(custom).trim();
@@ -905,15 +912,7 @@ function buildHandoffPayload({ clientConfig, clientId, sessionId, reason, lastUs
   const lang = (clientConfig && clientConfig.language) || "nl";
   const brandName = (clientConfig && clientConfig.brandName) || clientId;
 
-  const email =
-    (clientConfig && clientConfig.support && clientConfig.support.email) ||
-    (clientConfig && clientConfig.supportEmail) ||
-    null;
-
-  const contactFormUrl =
-    (clientConfig && clientConfig.support && clientConfig.support.contactFormUrl) ||
-    (clientConfig && clientConfig.contactFormUrl) ||
-    null;
+  const support = getSupportSettings(clientConfig);
 
   const facts = getFacts(sessionId);
 
@@ -925,15 +924,14 @@ function buildHandoffPayload({ clientConfig, clientId, sessionId, reason, lastUs
   if (facts.email) parts.push(`Customer email: ${facts.email}`);
   if (facts.productName) parts.push(`Product: ${facts.productName}`);
   if (facts.problemDetails) parts.push(`Problem details: ${facts.problemDetails}`);
-
   if (lastUserMessage) parts.push(`Last message: ${String(lastUserMessage).slice(0, 300)}`);
 
   const summary = parts.join("\n");
 
   return {
     reason: reason || "unknown",
-    email,
-    contactFormUrl,
+    email: support.email,
+    contactFormUrl: support.contactFormUrl,
     summary,
     language: String(lang).toLowerCase().startsWith("en") ? "en" : "nl",
   };
@@ -1119,11 +1117,7 @@ app.post("/chat", async (req, res) => {
       orderNumber: intentRaw.orderNumber || facts.orderNumber || "",
     };
 
-    if (
-      effectiveIntent.mainIntent === "shipping_or_order" &&
-      effectiveIntent.orderNumber &&
-      !looksLikeShopifyOrderName(effectiveIntent.orderNumber)
-    ) {
+    if (effectiveIntent.mainIntent === "shipping_or_order" && effectiveIntent.orderNumber && !looksLikeShopifyOrderName(effectiveIntent.orderNumber)) {
       const reply = buildOrderNotFoundReply(data.clientConfig || {}, data.clientId, effectiveIntent.orderNumber);
       appendToHistory(sessionId, "assistant", reply);
 
@@ -1217,6 +1211,16 @@ FACTS WE ALREADY KNOW (persisted from earlier messages):
 - problemDetails: ${facts.problemDetails || "unknown"}
 `.trim();
 
+    // IMPORTANT: Force correct support contact details so the model does not invent support@...
+    const support = getSupportSettings(data.clientConfig || {});
+    const supportBlock = `
+OFFICIAL SUPPORT CONTACT DETAILS (must be used exactly; never invent others):
+- Support email: ${support.email || "unknown"}
+- Contact form URL: ${support.contactFormUrl || "unknown"}
+If an email address is needed, ONLY use the Support email above.
+If a contact form exists (URL is not "unknown"), do NOT say "no contact form".
+`.trim();
+
     const systemPrompt = `
 You are the AI support bot for ${data.clientConfig.brandName || data.clientId}.
 Use the same language as the user. No emojis.
@@ -1232,6 +1236,8 @@ Conversation handling rules:
 ${flowHint}
 
 ${factsBlock}
+
+${supportBlock}
 
 BRAND VOICE:
 ${data.brandVoice || ""}
@@ -1325,4 +1331,5 @@ app.listen(port, () => {
     at: new Date().toISOString(),
   });
 });
+
 
