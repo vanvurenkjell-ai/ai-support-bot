@@ -1387,6 +1387,15 @@ TRACKING LINK RULES (CRITICAL):
   - Do NOT output HTML. Use plain text with the full URL visible.
   - If trackingUrl is null or missing, say: "Track & trace is nog niet beschikbaar." (Dutch) or "Track & trace is not yet available." (English).
 
+SOCIAL MEDIA LINK RULES (CRITICAL):
+- When mentioning Instagram links or other social media links:
+  - ALWAYS format them as Markdown links using the syntax: [text](url)
+  - For Instagram links in Dutch, use natural phrasing like: "voor haar Instagram, [klik hier](https://www.instagram.com/username/)" or "Je kunt haar volgen op Instagram: [klik hier](https://www.instagram.com/username/)"
+  - For Instagram links in English, use: "for her Instagram, [click here](https://www.instagram.com/username/)" or "You can follow her on Instagram: [click here](https://www.instagram.com/username/)"
+  - Do NOT output raw URLs like "https://www.instagram.com/username/"
+  - The label text in the Markdown link should be natural (e.g., "klik hier", "click here", "hier", "here")
+  - This applies to all Instagram, Facebook, Twitter, or other social media platform links mentioned in the knowledge base.
+
 RELEVANT KNOWLEDGE (selected excerpts):
 ${context || "No relevant knowledge matched."}
 `;
