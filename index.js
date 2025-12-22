@@ -434,6 +434,54 @@ function detectIntent(message) {
   return { mainIntent, orderNumber };
 }
 
+// ---- Tracking URL normalization ----
+function normalizeTrackingLink(trackingUrl, carrier, trackingNumber) {
+  // If trackingUrl exists, normalize it
+  if (trackingUrl) {
+    const trimmed = String(trackingUrl).trim();
+    if (!trimmed) {
+      // Empty string, fall through to carrier logic
+    } else if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+      return trimmed;
+    } else if (trimmed.startsWith("www.")) {
+      return "https://" + trimmed;
+    } else if (trimmed.includes(".") && !trimmed.includes(" ")) {
+      // Looks like a domain/path (contains a dot and no spaces)
+      return "https://" + trimmed;
+    }
+    // If trackingUrl exists but doesn't match patterns, fall through to carrier logic
+  }
+  
+  // If carrier + trackingNumber exist, build carrier-specific URL
+  if (carrier && trackingNumber) {
+    const carrierLower = String(carrier).toLowerCase();
+    const tracking = String(trackingNumber).trim();
+    if (!tracking) return null;
+    
+    // Carrier matching (case-insensitive, tolerant)
+    if (carrierLower.includes("postnl")) {
+      return `https://www.postnl.nl/tracktrace/?B=${encodeURIComponent(tracking)}`;
+    }
+    if (carrierLower.includes("dhl")) {
+      return `https://www.dhl.com/nl-nl/home/tracking.html?tracking-id=${encodeURIComponent(tracking)}`;
+    }
+    if (carrierLower.includes("dpd")) {
+      return `https://www.dpd.com/nl/nl/ontvangen/track-en-trace/?shipmentNumber=${encodeURIComponent(tracking)}`;
+    }
+    if (carrierLower.includes("ups")) {
+      return `https://wwwapps.ups.com/WebTracking/track?track=yes&trackNums=${encodeURIComponent(tracking)}`;
+    }
+    if (carrierLower.includes("gls")) {
+      return `https://gls-group.com/NL/nl/pakket-volgen/?match=${encodeURIComponent(tracking)}`;
+    }
+    
+    // Unknown carrier: fall back to neutral tracking page
+    return `https://www.17track.net/en#nums=${encodeURIComponent(tracking)}`;
+  }
+  
+  return null;
+}
+
 // ---- Shopify lookup ----
 async function lookupShopifyOrder(orderNumberRaw) {
   if (!shopifyClient) return null;
@@ -455,18 +503,28 @@ async function lookupShopifyOrder(orderNumberRaw) {
     const order = orders[0];
     const fulfillment = order.fulfillments && order.fulfillments[0] ? order.fulfillments[0] : null;
 
+    const trackingNumber =
+      fulfillment && fulfillment.tracking_numbers && fulfillment.tracking_numbers[0]
+        ? fulfillment.tracking_numbers[0]
+        : null;
+    const trackingUrlRaw =
+      fulfillment && fulfillment.tracking_urls && fulfillment.tracking_urls[0]
+        ? fulfillment.tracking_urls[0]
+        : null;
+    const carrier =
+      fulfillment && fulfillment.tracking_company
+        ? fulfillment.tracking_company
+        : null;
+
+    const trackingUrlNormalized = normalizeTrackingLink(trackingUrlRaw, carrier, trackingNumber);
+
     return {
       orderName: order.name || null,
       fulfillmentStatus: order.fulfillment_status || null,
       financialStatus: order.financial_status || null,
-      tracking:
-        fulfillment && fulfillment.tracking_numbers && fulfillment.tracking_numbers[0]
-          ? fulfillment.tracking_numbers[0]
-          : null,
-      trackingUrl:
-        fulfillment && fulfillment.tracking_urls && fulfillment.tracking_urls[0]
-          ? fulfillment.tracking_urls[0]
-          : null,
+      tracking: trackingNumber,
+      trackingUrl: trackingUrlNormalized,
+      carrier: carrier,
       createdAt: order.created_at || null,
     };
   } catch (e) {
@@ -1320,6 +1378,14 @@ ${data.supportRules || ""}
 
 SHOPIFY ORDER DATA:
 ${shopify ? JSON.stringify(shopify, null, 2) : "none"}
+
+TRACKING LINK RULES (CRITICAL):
+- When mentioning track & trace / tracking information:
+  - If the trackingUrl field in SHOPIFY ORDER DATA is a URL (starts with https://), ALWAYS output it as a clickable link.
+  - Format: "Track & trace: https://..." (put the full URL on the same line, starting with https://).
+  - Do NOT output only a tracking code. Always prefer the clickable URL from trackingUrl field.
+  - Do NOT output HTML. Use plain text with the full URL visible.
+  - If trackingUrl is null or missing, say: "Track & trace is nog niet beschikbaar." (Dutch) or "Track & trace is not yet available." (English).
 
 RELEVANT KNOWLEDGE (selected excerpts):
 ${context || "No relevant knowledge matched."}
