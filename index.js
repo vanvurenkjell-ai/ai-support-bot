@@ -804,6 +804,8 @@ function buildWidgetConfig(clientConfig, clientId) {
 
   const support = getSupportSettings(clientConfig);
 
+  const entryScreen = clientConfig.entryScreen || null;
+
   return {
     brandName,
     assistantName: clientConfig.assistantName || widgetTitle,
@@ -812,6 +814,7 @@ function buildWidgetConfig(clientConfig, clientId) {
     logoUrl,
     widget: { title: widgetTitle, greeting: widgetGreeting },
     colors,
+    entryScreen,
     support: {
       email: support.email,
       contactFormUrl: support.contactFormUrl,

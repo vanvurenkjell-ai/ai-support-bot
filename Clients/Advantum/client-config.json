@@ -13,15 +13,26 @@
   "contactFormUrl": "https://advantum.nl/pages/contact",
 
   "widget": {
-    "title": "Advantum klantenservice assistent",
+    "title": "Advantum AI-assistent",
     "greeting": "Hallo! Ik ben de Advantum klantenservice assistent. Fijn dat je er bent. Waar kan ik je mee helpen?"
   },
 
+  "entryScreen": {
+    "enabled": true,
+    "title": "Interesse in Advantum?",
+    "disclaimer": "Onze AI-assistent is 24 uur per dag beschikbaar om vragen te beantwoorden. Let op: de assistent weet nog niet alles, maar leert elke dag bij.",
+    "primaryButton": { "label": "Start chat", "action": "openChat" },
+    "secondaryButtons": [
+      { "label": "Maak een afspraak", "action": "link", "url": "https://advantum.nl/pages/contact" },
+      { "label": "FAQ / Help", "action": "link", "url": "https://advantum.nl" }
+    ]
+  },
+
   "colors": {
-    "primary": "#000000",
+    "primary": "#225ADF",
     "accent": "#2563eb",
     "background": "#ffffff",
-    "userBubble": "#000000",
+    "userBubble": "#225ADF",
     "botBubble": "#ffffff"
   },
 
