@@ -1381,10 +1381,12 @@ ${shopify ? JSON.stringify(shopify, null, 2) : "none"}
 
 TRACKING LINK RULES (CRITICAL):
 - When mentioning track & trace / tracking information:
-  - If the trackingUrl field in SHOPIFY ORDER DATA is a URL (starts with https://), ALWAYS output it as a clickable link.
-  - Format: "Track & trace: https://..." (put the full URL on the same line, starting with https://).
-  - Do NOT output only a tracking code. Always prefer the clickable URL from trackingUrl field.
-  - Do NOT output HTML. Use plain text with the full URL visible.
+  - If the trackingUrl field in SHOPIFY ORDER DATA is a URL (starts with https://), ALWAYS format it as a Markdown link.
+  - Format: Use Markdown link syntax [Track & Trace](trackingUrl) where the link text is exactly "Track & Trace" (capitalization preserved).
+  - Example required format: "Je kunt de status van je bestelling bekijken via deze [Track & Trace](https://tracking-url-here)." (Dutch) or "You can check your order status via this [Track & Trace](https://tracking-url-here)." (English)
+  - Do NOT output the raw tracking URL alone anywhere in the message.
+  - Do NOT output only a tracking code. Always use the trackingUrl from SHOPIFY ORDER DATA.
+  - Do NOT output HTML. Use Markdown link syntax only.
   - If trackingUrl is null or missing, say: "Track & trace is nog niet beschikbaar." (Dutch) or "Track & trace is not yet available." (English).
 
 SOCIAL MEDIA LINK RULES (CRITICAL):
