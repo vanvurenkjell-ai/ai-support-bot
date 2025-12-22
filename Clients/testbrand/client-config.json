@@ -1,5 +1,6 @@
 {
   "brandName": "testbrand",
+  "language": "en",
   "supportEmail": "support@testbrand.com",
   "contactFormUrl": "https://testbrand.com/contact",
   "widgetTitle": "testbrand Support",

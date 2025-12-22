@@ -823,7 +823,7 @@ function captureFactsFromExpectedSlot(sessionId, expectedSlot, userMessage) {
   }
 }
 
-function maybeHandleWithRouter({ sessionId, message, intent, clientConfig }) {
+function maybeHandleWithRouter({ sessionId, message, intent, clientConfig, clientId }) {
   const lang = clientConfig.language || "nl";
   const meta = getMeta(sessionId);
   const facts = getFacts(sessionId);
@@ -833,6 +833,12 @@ function maybeHandleWithRouter({ sessionId, message, intent, clientConfig }) {
     captureFactsFromExpectedSlot(sessionId, expected, message);
     clearExpectedSlot(sessionId);
     return { handled: false };
+  }
+
+  // Check for catastrophic physical damage/defect before other routing
+  if (isCatastrophicIssue(message)) {
+    const reply = buildCatastrophicIssueReply(clientConfig, clientId);
+    return { handled: true, reply };
   }
 
   if (intent.orderNumber) setFacts(sessionId, { orderNumber: intent.orderNumber });
@@ -876,6 +882,67 @@ function detectAngryOrUrgent(message) {
   const hasUrgent = urgent.some((k) => t.includes(k));
   const hasAngry = angry.some((k) => t.includes(k));
   return { hasUrgent, hasAngry, shouldEscalate: hasUrgent || hasAngry };
+}
+
+// ---- Catastrophic physical damage detection ----
+function isCatastrophicIssue(message) {
+  const t = normalizeText(message);
+  
+  // Dutch catastrophic keywords/phrases (specific damage indicators, not vague "kapot" alone)
+  const dutchCatastrophic = [
+    "afgebroken",
+    "gebroken",
+    "gescheurd",
+    "gekraakt",
+    "gebarsten",
+    "lekkage",
+    "onderdeel ontbreekt",
+    "valt uit elkaar",
+    "ring is afgebroken",
+    "is gebarsten",
+    "is gescheurd",
+    "is kapot gegaan",
+    "stuk",
+  ];
+  
+  // English catastrophic keywords/phrases
+  const englishCatastrophic = [
+    "snapped",
+    "cracked",
+    "torn",
+    "leaking",
+    "missing part",
+    "fell apart",
+    "defective out of the box",
+    "broken part",
+  ];
+  
+  // Check for catastrophic keywords - require explicit physical damage language
+  const hasDutchCatastrophic = dutchCatastrophic.some((k) => t.includes(k));
+  const hasEnglishCatastrophic = englishCatastrophic.some((k) => t.includes(k));
+  
+  // Conservative: only escalate if explicit physical damage indicators are present
+  // Note: "kapot" alone is excluded as it can mean "not working" (troubleshootable)
+  return hasDutchCatastrophic || hasEnglishCatastrophic;
+}
+
+function buildCatastrophicIssueReply(clientConfig, clientId) {
+  const lang = clientConfig.language || "nl";
+  const support = getSupportSettings(clientConfig);
+  const email = support.email || "";
+  const contactUrl = support.contactFormUrl || "";
+  
+  if (String(lang).toLowerCase().startsWith("en")) {
+    let msg = "That sounds like physical damage or a defect. Unfortunately, I can't resolve this directly via chat. Please contact our support team, and they'll help you further.";
+    if (email) msg += `\n\nEmail: ${email}`;
+    if (contactUrl) msg += `\nContact form: ${contactUrl}`;
+    return msg;
+  }
+  
+  let msg = "Dat klinkt als fysieke schade/defect. Dit kan ik helaas niet direct voor je oplossen via de chat. Neem contact op met onze support, dan helpen zij je verder.";
+  if (email) msg += `\n\nE-mail: ${email}`;
+  if (contactUrl) msg += `\nContactformulier: ${contactUrl}`;
+  return msg;
 }
 
 function buildEscalationReply(clientConfig, clientId) {
@@ -1079,6 +1146,7 @@ app.post("/chat", async (req, res) => {
       message,
       intent: intentRaw,
       clientConfig: data.clientConfig || {},
+      clientId: data.clientId,
     });
 
     if (router.handled) {
@@ -1221,9 +1289,14 @@ If an email address is needed, ONLY use the Support email above.
 If a contact form exists (URL is not "unknown"), do NOT say "no contact form".
 `.trim();
 
+    const brandLanguage = (data.clientConfig && data.clientConfig.language) || "nl";
+
     const systemPrompt = `
 You are the AI support bot for ${data.clientConfig.brandName || data.clientId}.
-Use the same language as the user. No emojis.
+The brand's default support language is "${brandLanguage}".
+At the start of the conversation, or whenever the user's language is unclear or ambiguous, respond in this default language.
+If the user clearly writes in another language or explicitly asks for a different language, you may switch to that language for your replies.
+No emojis.
 Never guess policies, prices, or shipping rules.
 Only answer using the provided context.
 
