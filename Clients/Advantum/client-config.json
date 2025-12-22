@@ -23,8 +23,8 @@
     "disclaimer": "Onze AI-assistent is 24 uur per dag beschikbaar om vragen te beantwoorden. Let op: de assistent weet nog niet alles, maar leert elke dag bij.",
     "primaryButton": { "label": "Start chat", "action": "openChat" },
     "secondaryButtons": [
-      { "label": "Maak een afspraak", "action": "link", "url": "https://advantum.nl/pages/contact" },
-      { "label": "FAQ / Help", "action": "link", "url": "https://advantum.nl" }
+      { "label": "Instagram", "action": "link", "url": "https://www.instagram.com/advantum_/" },
+      { "label": "Producten", "action": "link", "url": "https://advantum.nl/collections/all" }
     ]
   },
 
