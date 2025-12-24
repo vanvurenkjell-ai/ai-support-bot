@@ -2,6 +2,8 @@ const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 const crypto = require("crypto");
+const https = require("https");
+const { URL } = require("url");
 require("dotenv").config();
 const OpenAI = require("openai");
 const axios = require("axios");
@@ -11,6 +13,12 @@ const port = process.env.PORT || 3001;
 
 // Optional: set this in Render env vars to know exactly what version is deployed
 const BUILD_VERSION = process.env.BUILD_VERSION || "dev";
+
+// ---- Axiom log ingestion config ----
+const AXIOM_TOKEN = process.env.AXIOM_TOKEN;
+const AXIOM_DATASET = process.env.AXIOM_DATASET;
+const AXIOM_URL = process.env.AXIOM_URL || "https://api.axiom.co";
+const AXIOM_ENABLED = Boolean(AXIOM_TOKEN && AXIOM_DATASET);
 
 // IMPORTANT on Render/Proxies: this makes req.ip work properly
 app.set("trust proxy", 1);
@@ -32,6 +40,48 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function sendEventToAxiom(eventObj) {
+  if (!AXIOM_ENABLED) return;
+
+  try {
+    const ingestUrl = `${AXIOM_URL}/v1/datasets/${encodeURIComponent(AXIOM_DATASET)}/ingest`;
+    const urlObj = new URL(ingestUrl);
+    const payload = JSON.stringify([eventObj]);
+
+    const options = {
+      hostname: urlObj.hostname,
+      port: urlObj.port || 443,
+      path: urlObj.pathname + urlObj.search,
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${AXIOM_TOKEN}`,
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(payload),
+      },
+      timeout: 1500,
+    };
+
+    const req = https.request(options, (res) => {
+      // Consume response to prevent memory leaks, but ignore result
+      res.on("data", () => {});
+      res.on("end", () => {});
+    });
+
+    req.on("error", () => {
+      // Silently ignore errors - don't log sensitive data
+    });
+
+    req.on("timeout", () => {
+      req.destroy();
+    });
+
+    req.write(payload);
+    req.end();
+  } catch (e) {
+    // Silently ignore all errors
+  }
+}
+
 function logJson(level, event, fields) {
   try {
     const logObj = {
@@ -41,6 +91,11 @@ function logJson(level, event, fields) {
       ...(fields || {}),
     };
     console.log(JSON.stringify(logObj));
+
+    // Send to Axiom for request_end and error events only
+    if (event === "request_end" || level === "error") {
+      sendEventToAxiom(logObj);
+    }
   } catch {
     console.log(String(fields));
   }
