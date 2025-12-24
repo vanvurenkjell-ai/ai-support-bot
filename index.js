@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
+const crypto = require("crypto");
 require("dotenv").config();
 const OpenAI = require("openai");
 const axios = require("axios");
@@ -17,18 +18,47 @@ app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json());
 
-// ---- Process-level safety (log crashes) ----
-process.on("unhandledRejection", (reason) => {
-  console.error("UNHANDLED_REJECTION:", reason);
-});
-process.on("uncaughtException", (err) => {
-  console.error("UNCAUGHT_EXCEPTION:", err);
-});
-
-// ---- RequestId + structured logging ----
+// ---- RequestId + structured logging helpers ----
 function makeRequestId() {
+  try {
+    if (typeof crypto !== "undefined" && crypto.randomUUID) {
+      return crypto.randomUUID();
+    }
+  } catch (e) {}
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function logJson(level, event, fields) {
+  try {
+    const logObj = {
+      timestamp: nowIso(),
+      level: level || "info",
+      event: event || "log",
+      ...(fields || {}),
+    };
+    console.log(JSON.stringify(logObj));
+  } catch {
+    console.log(String(fields));
+  }
+}
+
+// ---- Process-level safety (log crashes) ----
+process.on("unhandledRejection", (reason) => {
+  logJson("error", "unhandled_rejection", {
+    error: reason && typeof reason === "object" && reason.message ? reason.message : String(reason),
+    errorStack: reason && typeof reason === "object" && reason.stack ? String(reason.stack).slice(0, 500) : null,
+  });
+});
+process.on("uncaughtException", (err) => {
+  logJson("error", "uncaught_exception", {
+    error: err && err.message ? err.message : String(err),
+    errorStack: err && err.stack ? String(err.stack).slice(0, 500) : null,
+  });
+});
 
 function safeLogJson(obj) {
   try {
@@ -40,7 +70,67 @@ function safeLogJson(obj) {
 
 app.use((req, res, next) => {
   req.requestId = makeRequestId();
+  req.requestStartTime = Date.now();
   res.setHeader("X-Request-Id", req.requestId);
+
+  const clientId = sanitizeClientId(req.query && req.query.client ? req.query.client : (req.body && req.body.client ? req.body.client : null));
+  const sessionId = req.body && req.body.sessionId ? sanitizeSessionId(req.body.sessionId) : null;
+
+  logJson("info", "request_start", {
+    requestId: req.requestId,
+    route: req.path,
+    method: req.method,
+    clientId: clientId || null,
+    sessionId: sessionId || null,
+    messageLength: req.body && req.body.message ? String(req.body.message).length : null,
+  });
+
+  let responseLogged = false;
+  const originalJson = res.json.bind(res);
+  res.json = function (data) {
+    if (!responseLogged) {
+      responseLogged = true;
+      const latencyMs = Date.now() - req.requestStartTime;
+      const logData = {
+        requestId: req.requestId,
+        route: req.path,
+        method: req.method,
+        statusCode: res.statusCode || 200,
+        latencyMs: latencyMs,
+        clientId: clientId || null,
+        sessionId: sessionId || null,
+      };
+
+      if (req.path === "/chat" && res.locals.chatMetrics) {
+        Object.assign(logData, res.locals.chatMetrics);
+      }
+
+      logJson("info", "request_end", logData);
+    }
+    return originalJson(data);
+  };
+
+  res.on("finish", function () {
+    if (!responseLogged) {
+      const latencyMs = Date.now() - req.requestStartTime;
+      const logData = {
+        requestId: req.requestId,
+        route: req.path,
+        method: req.method,
+        statusCode: res.statusCode || 200,
+        latencyMs: latencyMs,
+        clientId: clientId || null,
+        sessionId: sessionId || null,
+      };
+
+      if (req.path === "/chat" && res.locals.chatMetrics) {
+        Object.assign(logData, res.locals.chatMetrics);
+      }
+
+      logJson("info", "request_end", logData);
+    }
+  });
+
   next();
 });
 
@@ -1079,51 +1169,37 @@ function buildOrderNotFoundReply(clientConfig, clientId, orderNumber) {
 
 // ---- Routes ----
 app.get("/", (req, res) => {
-  return res.json({ ok: true, message: "AI support backend running.", requestId: req.requestId });
+  return res.json({ ok: true, message: "AI support backend running.", requestId: req.requestId, status: "ok" });
 });
 
 app.get("/health", (req, res) => {
+  const version = process.env.VERSION || process.env.RENDER_GIT_COMMIT || BUILD_VERSION || "unknown";
   return res.json({
-    ok: true,
+    status: "ok",
     requestId: req.requestId,
-    version: BUILD_VERSION,
     uptimeSec: Math.round(process.uptime()),
-    node: process.version,
-    shopifyEnabled: Boolean(shopifyClient),
-    time: new Date().toISOString(),
+    version: version,
+    timestamp: nowIso(),
   });
 });
 
 app.get("/widget-config", (req, res) => {
   const clientId = sanitizeClientId(req.query.client || "Advantum");
-  const t0 = Date.now();
 
   try {
     const data = loadClient(clientId);
     const widgetConfig = buildWidgetConfig(data.clientConfig || {}, data.clientId);
     res.setHeader("Cache-Control", "public, max-age=300");
 
-    safeLogJson({
-      type: "widget_config",
-      requestId: req.requestId,
-      clientId: data.clientId,
-      ip: getClientIp(req),
-      ms: Date.now() - t0,
-      at: new Date().toISOString(),
-    });
-
     return res.json({ requestId: req.requestId, ...widgetConfig });
   } catch (e) {
-    console.error("widget-config error:", e.message);
-
-    safeLogJson({
-      type: "widget_config_error",
+    logJson("error", "widget_config_error", {
       requestId: req.requestId,
-      clientId,
-      ip: getClientIp(req),
+      route: "/widget-config",
+      method: "GET",
+      clientId: clientId,
       error: e && e.message ? e.message : String(e),
-      ms: Date.now() - t0,
-      at: new Date().toISOString(),
+      errorStack: e && e.stack ? String(e.stack).slice(0, 500) : null,
     });
 
     return res.status(500).json({ requestId: req.requestId, error: "Server error" });
@@ -1131,28 +1207,49 @@ app.get("/widget-config", (req, res) => {
 });
 
 app.post("/chat", async (req, res) => {
-  const tAll0 = Date.now();
   const ip = getClientIp(req);
 
   let clientId = "Advantum";
   let sessionId = "";
   let effectiveIntent = null;
 
-  let shopifyAttempted = false;
-  let shopifyFound = false;
+  let shopifyLookupAttempted = false;
+  let shopifyFound = null;
+  let shopifyError = null;
   let shopifyMs = 0;
-  let openaiMs = 0;
-  let openaiUsage = null;
+  let llmLatencyMs = 0;
+  let tokenUsage = null;
+  let llmModel = null;
+  let routedTo = "bot";
+  let escalateReason = null;
+
+  // Initialize metrics object
+  res.locals.chatMetrics = {
+    intent: null,
+    routedTo: "bot",
+    escalateReason: null,
+    shopifyLookupAttempted: false,
+    shopifyFound: null,
+    shopifyError: null,
+    llmProvider: "openai",
+    llmModel: null,
+    llmLatencyMs: 0,
+    tokenUsage: null,
+  };
 
   try {
     const message = sanitizeUserMessage(req.body.message);
-    if (!message) return res.status(400).json({ requestId: req.requestId, error: "Invalid message" });
+    if (!message) {
+      res.status(400);
+      return res.json({ requestId: req.requestId, error: "Invalid message" });
+    }
 
     clientId = sanitizeClientId(req.query.client || "Advantum");
     sessionId = sanitizeSessionId(req.body.sessionId);
 
     const data = loadClient(clientId);
     const intentRaw = detectIntent(message);
+    effectiveIntent = intentRaw;
 
     if (intentRaw.orderNumber) setFacts(sessionId, { orderNumber: intentRaw.orderNumber });
     setMeta(sessionId, { lastIntent: intentRaw.mainIntent });
@@ -1173,22 +1270,20 @@ app.post("/chat", async (req, res) => {
 
       appendToHistory(sessionId, "assistant", reply);
 
-      safeLogJson({
-        type: "chat_done",
-        requestId: req.requestId,
-        clientId: data.clientId,
-        sessionId: sessionId || null,
-        ip,
+      routedTo = "human";
+      escalateReason = escalation.hasUrgent ? "urgent" : "angry";
+      res.locals.chatMetrics = {
         intent: { ...intentRaw, mainIntent: "support_escalation" },
-        routed: true,
-        escalated: true,
-        handoffReason: handoff.reason,
-        shopifyAttempted: false,
-        shopifyFound: false,
-        openaiMs: 0,
-        totalMs: Date.now() - tAll0,
-        at: new Date().toISOString(),
-      });
+        routedTo: "human",
+        escalateReason: escalateReason,
+        shopifyLookupAttempted: false,
+        shopifyFound: null,
+        shopifyError: null,
+        llmProvider: "openai",
+        llmModel: null,
+        llmLatencyMs: 0,
+        tokenUsage: null,
+      };
 
       return res.json({
         requestId: req.requestId,
@@ -1213,21 +1308,24 @@ app.post("/chat", async (req, res) => {
     if (router.handled) {
       appendToHistory(sessionId, "assistant", router.reply);
 
-      safeLogJson({
-        type: "chat_done",
-        requestId: req.requestId,
-        clientId: data.clientId,
-        sessionId: sessionId || null,
-        ip,
+      // Check if catastrophic issue (router may have handled it)
+      if (isCatastrophicIssue(message)) {
+        routedTo = "human";
+        escalateReason = "catastrophic";
+      }
+
+      res.locals.chatMetrics = {
         intent: intentRaw,
-        routed: true,
-        escalated: false,
-        shopifyAttempted: false,
-        shopifyFound: false,
-        openaiMs: 0,
-        totalMs: Date.now() - tAll0,
-        at: new Date().toISOString(),
-      });
+        routedTo: routedTo,
+        escalateReason: escalateReason,
+        shopifyLookupAttempted: false,
+        shopifyFound: null,
+        shopifyError: null,
+        llmProvider: "openai",
+        llmModel: null,
+        llmLatencyMs: 0,
+        tokenUsage: null,
+      };
 
       return res.json({
         requestId: req.requestId,
@@ -1235,7 +1333,7 @@ app.post("/chat", async (req, res) => {
         intent: intentRaw,
         shopify: null,
         routed: true,
-        escalated: false,
+        escalated: escalateReason !== null,
         facts: getFacts(sessionId),
       });
     }
@@ -1250,21 +1348,18 @@ app.post("/chat", async (req, res) => {
       const reply = buildOrderNotFoundReply(data.clientConfig || {}, data.clientId, effectiveIntent.orderNumber);
       appendToHistory(sessionId, "assistant", reply);
 
-      safeLogJson({
-        type: "chat_done",
-        requestId: req.requestId,
-        clientId: data.clientId,
-        sessionId: sessionId || null,
-        ip,
+      res.locals.chatMetrics = {
         intent: effectiveIntent,
-        routed: true,
-        escalated: false,
-        shopifyAttempted: false,
-        shopifyFound: false,
-        openaiMs: 0,
-        totalMs: Date.now() - tAll0,
-        at: new Date().toISOString(),
-      });
+        routedTo: "bot",
+        escalateReason: null,
+        shopifyLookupAttempted: false,
+        shopifyFound: null,
+        shopifyError: null,
+        llmProvider: "openai",
+        llmModel: null,
+        llmLatencyMs: 0,
+        tokenUsage: null,
+      };
 
       return res.json({
         requestId: req.requestId,
@@ -1279,32 +1374,34 @@ app.post("/chat", async (req, res) => {
 
     let shopify = null;
     if (effectiveIntent.mainIntent === "shipping_or_order" && effectiveIntent.orderNumber && looksLikeShopifyOrderName(effectiveIntent.orderNumber)) {
-      shopifyAttempted = true;
+      shopifyLookupAttempted = true;
       const tShop0 = Date.now();
-      shopify = await lookupShopifyOrder(effectiveIntent.orderNumber);
-      shopifyMs = Date.now() - tShop0;
-      shopifyFound = Boolean(shopify);
+      try {
+        shopify = await lookupShopifyOrder(effectiveIntent.orderNumber);
+        shopifyMs = Date.now() - tShop0;
+        shopifyFound = shopify !== null;
+      } catch (e) {
+        shopifyMs = Date.now() - tShop0;
+        shopifyFound = null;
+        shopifyError = e && e.message ? e.message : String(e);
+      }
 
       if (!shopify) {
         const reply = buildOrderNotFoundReply(data.clientConfig || {}, data.clientId, effectiveIntent.orderNumber);
         appendToHistory(sessionId, "assistant", reply);
 
-        safeLogJson({
-          type: "chat_done",
-          requestId: req.requestId,
-          clientId: data.clientId,
-          sessionId: sessionId || null,
-          ip,
+        res.locals.chatMetrics = {
           intent: effectiveIntent,
-          routed: true,
-          escalated: false,
-          shopifyAttempted: true,
+          routedTo: "bot",
+          escalateReason: null,
+          shopifyLookupAttempted: true,
           shopifyFound: false,
-          shopifyMs,
-          openaiMs: 0,
-          totalMs: Date.now() - tAll0,
-          at: new Date().toISOString(),
-        });
+          shopifyError: shopifyError,
+          llmProvider: "openai",
+          llmModel: null,
+          llmLatencyMs: 0,
+          tokenUsage: null,
+        };
 
         return res.json({
           requestId: req.requestId,
@@ -1436,29 +1533,29 @@ ${context || "No relevant knowledge matched."}
         { role: "user", content: message },
       ],
     });
-    openaiMs = Date.now() - tAi0;
-    openaiUsage = response && response.usage ? response.usage : null;
+    llmLatencyMs = Date.now() - tAi0;
+    llmModel = "gpt-4.1-mini";
+    tokenUsage = response && response.usage ? {
+      promptTokens: response.usage.prompt_tokens || null,
+      completionTokens: response.usage.completion_tokens || null,
+      totalTokens: response.usage.total_tokens || null,
+    } : null;
 
     const reply = response.choices[0].message.content;
     appendToHistory(sessionId, "assistant", reply);
 
-    safeLogJson({
-      type: "chat_done",
-      requestId: req.requestId,
-      clientId: data.clientId,
-      sessionId: sessionId || null,
-      ip,
+    res.locals.chatMetrics = {
       intent: effectiveIntent,
-      routed: false,
-      escalated: false,
-      shopifyAttempted,
-      shopifyFound,
-      shopifyMs,
-      openaiMs,
-      openaiUsage,
-      totalMs: Date.now() - tAll0,
-      at: new Date().toISOString(),
-    });
+      routedTo: "bot",
+      escalateReason: null,
+      shopifyLookupAttempted: shopifyLookupAttempted,
+      shopifyFound: shopifyFound,
+      shopifyError: shopifyError,
+      llmProvider: "openai",
+      llmModel: llmModel,
+      llmLatencyMs: llmLatencyMs,
+      tokenUsage: tokenUsage,
+    };
 
     return res.json({
       requestId: req.requestId,
@@ -1470,25 +1567,26 @@ ${context || "No relevant knowledge matched."}
       facts: getFacts(sessionId),
     });
   } catch (e) {
-    console.error("CHAT_ROUTE_ERROR:", e);
-
-    safeLogJson({
-      type: "chat_error",
+    logJson("error", "chat_error", {
       requestId: req.requestId,
-      clientId,
+      route: "/chat",
+      method: "POST",
+      clientId: clientId || null,
       sessionId: sessionId || null,
-      ip,
-      intent: effectiveIntent,
-      shopifyAttempted,
-      shopifyFound,
-      shopifyMs,
-      openaiMs,
-      totalMs: Date.now() - tAll0,
+      intent: effectiveIntent || null,
+      shopifyLookupAttempted: shopifyLookupAttempted,
+      shopifyFound: shopifyFound,
+      shopifyError: shopifyError,
+      llmProvider: "openai",
+      llmModel: llmModel,
+      llmLatencyMs: llmLatencyMs,
+      tokenUsage: tokenUsage,
       error: e && e.message ? e.message : String(e),
-      at: new Date().toISOString(),
+      errorStack: e && e.stack ? String(e.stack).slice(0, 500) : null,
     });
 
-    return res.status(500).json({ requestId: req.requestId, error: "Server error" });
+    res.status(500);
+    return res.json({ requestId: req.requestId, error: "Server error" });
   }
 });
 
@@ -1497,13 +1595,11 @@ app.use((req, res) => {
 });
 
 app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
-  safeLogJson({
-    type: "boot",
-    version: BUILD_VERSION,
-    port,
+  const version = process.env.VERSION || process.env.RENDER_GIT_COMMIT || BUILD_VERSION || "unknown";
+  logJson("info", "boot", {
+    version: version,
+    port: port,
     shopifyEnabled: Boolean(shopifyClient),
-    at: new Date().toISOString(),
   });
 });
 
