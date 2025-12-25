@@ -1031,6 +1031,22 @@ function normalizeClientConfig(rawCfg, clientId) {
     normalized.entryScreen = { enabled: false };
   }
 
+  // Support config with defaults
+  if (rawCfg.support && typeof rawCfg.support === "object") {
+    normalized.support = {
+      email: rawCfg.support.email ? String(rawCfg.support.email).trim() : (normalized.supportEmail || null),
+      contactUrl: rawCfg.support.contactUrl ? String(rawCfg.support.contactUrl).trim() : (normalized.contactFormUrl || null),
+      contactUrlMessageParam: rawCfg.support.contactUrlMessageParam ? String(rawCfg.support.contactUrlMessageParam).trim() : "message",
+    };
+  } else {
+    // Fallback to top-level supportEmail/contactFormUrl for backward compatibility
+    normalized.support = {
+      email: normalized.supportEmail || null,
+      contactUrl: normalized.contactFormUrl || null,
+      contactUrlMessageParam: "message",
+    };
+  }
+
   return normalized;
 }
 
@@ -1249,14 +1265,19 @@ function selectTopChunks(chunks, message, limit = 8, maxTotalChars = 4500) {
 // ---- Canonical support settings (single source of truth) ----
 function getSupportSettings(clientConfig) {
   const email =
-    (clientConfig && clientConfig.supportEmail) ||
     (clientConfig && clientConfig.support && clientConfig.support.email) ||
+    (clientConfig && clientConfig.supportEmail) ||
     null;
 
   const contactFormUrl =
-    (clientConfig && clientConfig.contactFormUrl) ||
+    (clientConfig && clientConfig.support && clientConfig.support.contactUrl) ||
     (clientConfig && clientConfig.support && clientConfig.support.contactFormUrl) ||
+    (clientConfig && clientConfig.contactFormUrl) ||
     null;
+
+  const contactUrlMessageParam =
+    (clientConfig && clientConfig.support && clientConfig.support.contactUrlMessageParam) ||
+    "message";
 
   const escalationMessage =
     (clientConfig && clientConfig.support && clientConfig.support.escalationMessage) ||
@@ -1266,6 +1287,7 @@ function getSupportSettings(clientConfig) {
   return {
     email: email ? String(email).trim() : null,
     contactFormUrl: contactFormUrl ? String(contactFormUrl).trim() : null,
+    contactUrlMessageParam: contactUrlMessageParam ? String(contactUrlMessageParam).trim() : "message",
     escalationMessage: escalationMessage ? String(escalationMessage).trim() : "",
   };
 }
@@ -1322,7 +1344,8 @@ function buildWidgetConfig(clientConfig, clientId) {
     entryScreen,
     support: {
       email: support.email,
-      contactFormUrl: support.contactFormUrl,
+      contactUrl: support.contactFormUrl,
+      contactUrlMessageParam: support.contactUrlMessageParam,
     },
     version: clientConfig.version || null,
   };
@@ -1780,33 +1803,57 @@ function buildEscalationReply(clientConfig, clientId) {
   return msg;
 }
 
-// NEW: structured handoff payload for the frontend
-function buildHandoffPayload({ clientConfig, clientId, sessionId, reason, lastUserMessage }) {
+// Build safe handoff summary (Dutch, no PII)
+function buildHandoffSummary({ topic, topicSource, intentMain, orderNumberPresent, escalateReason, missingInfoType, knowledgeGapTopic, clientConfig }) {
   const lang = (clientConfig && clientConfig.language) || "nl";
-  const brandName = (clientConfig && clientConfig.brandName) || clientId;
+  const isEn = String(lang).toLowerCase().startsWith("en");
+  
+  if (isEn) {
+    const parts = ["Summary:"];
+    parts.push(`- Topic: ${topic || "general"}`);
+    parts.push(`- Reason: ${escalateReason || "unknown"}`);
+    parts.push(`- Order number present: ${orderNumberPresent ? "yes" : "no"}`);
+    if (missingInfoType) parts.push(`- Missing information: ${missingInfoType}`);
+    if (knowledgeGapTopic && escalateReason === "knowledge_gap") parts.push(`- Knowledge base: insufficient information for topic "${knowledgeGapTopic}"`);
+    return parts.join("\n");
+  } else {
+    const parts = ["Samenvatting:"];
+    parts.push(`- Onderwerp: ${topic || "algemeen"}`);
+    parts.push(`- Reden: ${escalateReason || "onbekend"}`);
+    parts.push(`- Bestelnummer aanwezig: ${orderNumberPresent ? "ja" : "nee"}`);
+    if (missingInfoType) {
+      const missingInfoLabels = {
+        orderNumber: "bestelnummer",
+        emailOrOrder: "e-mailadres of bestelnummer",
+        productName: "productnaam",
+        problemDetails: "probleemdetails",
+      };
+      parts.push(`- Ontbrekende info: ${missingInfoLabels[missingInfoType] || missingInfoType}`);
+    }
+    if (knowledgeGapTopic && escalateReason === "knowledge_gap") parts.push(`- Kennisbank: onvoldoende informatie voor onderwerp "${knowledgeGapTopic}"`);
+    return parts.join("\n");
+  }
+}
 
-  const support = getSupportSettings(clientConfig);
-
-  const facts = getFacts(sessionId);
-
-  const parts = [];
-  parts.push(`${brandName} support handoff`);
-  parts.push(`Reason: ${reason || "unknown"}`);
-
-  if (facts.orderNumber) parts.push(`Order number: ${facts.orderNumber}`);
-  if (facts.email) parts.push(`Customer email: ${facts.email}`);
-  if (facts.productName) parts.push(`Product: ${facts.productName}`);
-  if (facts.problemDetails) parts.push(`Problem details: ${facts.problemDetails}`);
-  if (lastUserMessage) parts.push(`Last message: ${String(lastUserMessage).slice(0, 300)}`);
-
-  const summary = parts.join("\n");
-
+// Build handoff payload (safe, no PII)
+function buildHandoffPayload({ topic, topicSource, intentMain, orderNumberPresent, escalateReason, missingInfoType, knowledgeGapTopic, clientConfig, clientId, conversationId, requestId }) {
+  const handoffSummary = buildHandoffSummary({ topic, topicSource, intentMain, orderNumberPresent, escalateReason, missingInfoType, knowledgeGapTopic, clientConfig });
+  
+  const payload = {
+    topic: topic || "general",
+    topicSource: topicSource || "fallback",
+    intentMain: intentMain || null,
+    orderNumberPresent: Boolean(orderNumberPresent),
+    escalateReason: escalateReason || null,
+    timestamp: nowIso(),
+  };
+  
+  if (missingInfoType) payload.missingInfoType = missingInfoType;
+  if (knowledgeGapTopic) payload.knowledgeGapTopic = knowledgeGapTopic;
+  
   return {
-    reason: reason || "unknown",
-    email: support.email,
-    contactFormUrl: support.contactFormUrl,
-    summary,
-    language: String(lang).toLowerCase().startsWith("en") ? "en" : "nl",
+    summary: handoffSummary,
+    payload: payload,
   };
 }
 
@@ -1922,6 +1969,7 @@ app.post("/chat", async (req, res) => {
     llmModel: null,
     llmLatencyMs: 0,
     tokenUsage: null,
+    handoffPayload: null,
   };
 
   try {
@@ -1991,16 +2039,6 @@ app.post("/chat", async (req, res) => {
     if (escalation.shouldEscalate) {
       const reply = buildEscalationReply(data.clientConfig || {}, data.clientId);
 
-      const handoff = buildHandoffPayload({
-        clientConfig: data.clientConfig || {},
-        clientId: data.clientId,
-        sessionId,
-        reason: escalation.hasUrgent ? "urgent" : "angry",
-        lastUserMessage: message,
-      });
-
-      appendToHistory(sessionId, "assistant", reply);
-
       routedTo = "human";
       escalateReason = escalation.hasUrgent ? "urgent" : "angry";
       // Store escalateReason in meta for conversation_end log
@@ -2009,6 +2047,21 @@ app.post("/chat", async (req, res) => {
       endConversation(sessionId, "escalated_to_human");
       
       const topicInfo = normalizeTopic({ intent: intentRaw, orderNumber: intentRaw.orderNumber, escalateReason: escalateReason, knowledgeGapTopic: null, facts: getFacts(sessionId) });
+      const facts = getFacts(sessionId);
+      const handoff = buildHandoffPayload({
+        topic: topicInfo.topic,
+        topicSource: topicInfo.topicSource,
+        intentMain: intentRaw.mainIntent,
+        orderNumberPresent: Boolean(facts.orderNumber || intentRaw.orderNumber),
+        escalateReason: escalateReason,
+        missingInfoType: null,
+        knowledgeGapTopic: null,
+        clientConfig: data.clientConfig || {},
+        clientId: data.clientId,
+        conversationId: conversationId,
+        requestId: req.requestId,
+      });
+      
       res.locals.chatMetrics = {
         intent: { ...intentRaw, mainIntent: "support_escalation" },
         routedTo: "human",
@@ -2030,6 +2083,7 @@ app.post("/chat", async (req, res) => {
         llmModel: null,
         llmLatencyMs: 0,
         tokenUsage: null,
+        handoffPayload: handoff.payload,
       };
 
       return res.json({
@@ -2039,8 +2093,11 @@ app.post("/chat", async (req, res) => {
         shopify: null,
         routed: true,
         escalated: true,
-        handoff,
-        facts: getFacts(sessionId),
+        escalateToHuman: true,
+        escalateReason: escalateReason,
+        handoffSummary: handoff.summary,
+        handoffPayload: handoff.payload,
+        facts: facts,
       });
     }
 
@@ -2075,11 +2132,32 @@ app.post("/chat", async (req, res) => {
         endConversation(sessionId, "escalated_to_human");
       }
 
-      const routerTopicInfo = normalizeTopic({ intent: intentRaw, orderNumber: intentRaw.orderNumber, escalateReason: router.escalateReason || escalateReason, knowledgeGapTopic: null, facts: getFacts(sessionId) });
+      const routerEscalateReason = router.escalateReason || escalateReason;
+      const routerRoutedTo = routerEscalateReason ? "human" : routedTo;
+      const routerTopicInfo = normalizeTopic({ intent: intentRaw, orderNumber: intentRaw.orderNumber, escalateReason: routerEscalateReason, knowledgeGapTopic: null, facts: getFacts(sessionId) });
+      const routerFacts = getFacts(sessionId);
+      
+      let handoffData = null;
+      if (routerRoutedTo === "human") {
+        handoffData = buildHandoffPayload({
+          topic: routerTopicInfo.topic,
+          topicSource: routerTopicInfo.topicSource,
+          intentMain: intentRaw.mainIntent,
+          orderNumberPresent: Boolean(routerFacts.orderNumber || intentRaw.orderNumber),
+          escalateReason: routerEscalateReason,
+          missingInfoType: router.clarificationType || null,
+          knowledgeGapTopic: null,
+          clientConfig: data.clientConfig || {},
+          clientId: data.clientId,
+          conversationId: conversationId,
+          requestId: req.requestId,
+        });
+      }
+      
       res.locals.chatMetrics = {
         intent: intentRaw,
-        routedTo: router.escalateReason ? "human" : routedTo,
-        escalateReason: router.escalateReason || escalateReason,
+        routedTo: routerRoutedTo,
+        escalateReason: routerEscalateReason,
         conversationId: conversationId,
         topic: routerTopicInfo.topic,
         topicSource: routerTopicInfo.topicSource,
@@ -2097,17 +2175,27 @@ app.post("/chat", async (req, res) => {
         llmModel: null,
         llmLatencyMs: 0,
         tokenUsage: null,
+        handoffPayload: handoffData ? handoffData.payload : null,
       };
 
-      return res.json({
+      const responseJson = {
         requestId: req.requestId,
         reply: router.reply,
         intent: intentRaw,
         shopify: null,
         routed: true,
-        escalated: (router.escalateReason || escalateReason) !== null,
-        facts: getFacts(sessionId),
-      });
+        escalated: routerEscalateReason !== null,
+        facts: routerFacts,
+      };
+      
+      if (handoffData) {
+        responseJson.escalateToHuman = true;
+        responseJson.escalateReason = routerEscalateReason;
+        responseJson.handoffSummary = handoffData.summary;
+        responseJson.handoffPayload = handoffData.payload;
+      }
+
+      return res.json(responseJson);
     }
 
     const facts = getFacts(sessionId);
@@ -2121,28 +2209,29 @@ app.post("/chat", async (req, res) => {
       appendToHistory(sessionId, "assistant", reply);
 
       const orderNotFoundTopicInfo = normalizeTopic({ intent: effectiveIntent, orderNumber: effectiveIntent.orderNumber, escalateReason: null, knowledgeGapTopic: null, facts: getFacts(sessionId) });
-      res.locals.chatMetrics = {
-        intent: effectiveIntent,
-        routedTo: "bot",
-        escalateReason: null,
-        conversationId: conversationId,
-        topic: orderNotFoundTopicInfo.topic,
-        topicSource: orderNotFoundTopicInfo.topicSource,
-        clarificationRequired: false,
-        clarificationType: null,
-        clarificationAttemptCount: null,
-        knowledgeGapDetected: false,
-        knowledgeGapTopic: null,
-        knowledgeGapClarificationAsked: false,
-        knowledgeGapClarificationCount: 0,
-        shopifyLookupAttempted: false,
-        shopifyFound: null,
-        shopifyError: null,
-        llmProvider: "openai",
-        llmModel: null,
-        llmLatencyMs: 0,
-        tokenUsage: null,
-      };
+        res.locals.chatMetrics = {
+          intent: effectiveIntent,
+          routedTo: "bot",
+          escalateReason: null,
+          conversationId: conversationId,
+          topic: orderNotFoundTopicInfo.topic,
+          topicSource: orderNotFoundTopicInfo.topicSource,
+          clarificationRequired: false,
+          clarificationType: null,
+          clarificationAttemptCount: null,
+          knowledgeGapDetected: false,
+          knowledgeGapTopic: null,
+          knowledgeGapClarificationAsked: false,
+          knowledgeGapClarificationCount: 0,
+          shopifyLookupAttempted: false,
+          shopifyFound: null,
+          shopifyError: null,
+          llmProvider: "openai",
+          llmModel: null,
+          llmLatencyMs: 0,
+          tokenUsage: null,
+          handoffPayload: null,
+        };
 
       return res.json({
         requestId: req.requestId,
@@ -2195,6 +2284,7 @@ app.post("/chat", async (req, res) => {
           llmModel: null,
           llmLatencyMs: 0,
           tokenUsage: null,
+          handoffPayload: null,
         };
 
         return res.json({
@@ -2271,6 +2361,7 @@ app.post("/chat", async (req, res) => {
           llmModel: null,
           llmLatencyMs: 0,
           tokenUsage: null,
+          handoffPayload: null,
         };
         
         return res.json({
@@ -2294,6 +2385,21 @@ app.post("/chat", async (req, res) => {
         endConversation(sessionId, "escalated_to_human");
         
         const knowledgeGapEscalationTopicInfo = normalizeTopic({ intent: effectiveIntent, orderNumber: effectiveIntent.orderNumber, escalateReason: "knowledge_gap", knowledgeGapTopic: knowledgeGapTopic, facts: getFacts(sessionId) });
+        const knowledgeGapFacts = getFacts(sessionId);
+        const knowledgeGapHandoff = buildHandoffPayload({
+          topic: knowledgeGapEscalationTopicInfo.topic,
+          topicSource: knowledgeGapEscalationTopicInfo.topicSource,
+          intentMain: effectiveIntent.mainIntent,
+          orderNumberPresent: Boolean(knowledgeGapFacts.orderNumber || effectiveIntent.orderNumber),
+          escalateReason: "knowledge_gap",
+          missingInfoType: null,
+          knowledgeGapTopic: knowledgeGapTopic,
+          clientConfig: data.clientConfig || {},
+          clientId: data.clientId,
+          conversationId: conversationId,
+          requestId: req.requestId,
+        });
+        
         res.locals.chatMetrics = {
           intent: effectiveIntent,
           routedTo: "human",
@@ -2315,6 +2421,7 @@ app.post("/chat", async (req, res) => {
           llmModel: null,
           llmLatencyMs: 0,
           tokenUsage: null,
+          handoffPayload: knowledgeGapHandoff.payload,
         };
         
         return res.json({
@@ -2324,7 +2431,11 @@ app.post("/chat", async (req, res) => {
           shopify,
           routed: true,
           escalated: true,
-          facts: getFacts(sessionId),
+          escalateToHuman: true,
+          escalateReason: "knowledge_gap",
+          handoffSummary: knowledgeGapHandoff.summary,
+          handoffPayload: knowledgeGapHandoff.payload,
+          facts: knowledgeGapFacts,
         });
       }
     }
@@ -2501,6 +2612,7 @@ ${context || "No relevant knowledge matched."}
       llmModel: llmModel,
       llmLatencyMs: llmLatencyMs,
       tokenUsage: tokenUsage,
+      handoffPayload: null,
     };
 
     return res.json({

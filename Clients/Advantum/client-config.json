@@ -11,6 +11,12 @@
 
   "supportEmail": "info@advantum.nl",
   "contactFormUrl": "https://advantum.nl/pages/contact",
+  
+  "support": {
+    "email": "support@advantum.nl",
+    "contactUrl": "https://advantum.nl/pages/contact",
+    "contactUrlMessageParam": "message"
+  },
 
   "widget": {
     "title": "Advantum AI-assistent",
