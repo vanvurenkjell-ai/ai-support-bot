@@ -790,6 +790,205 @@ const SOURCE_WEIGHT = {
   "Legal.md": 1,
 };
 
+// ---- Client Registry & Validation ----
+const clientRegistry = new Map();
+
+const REQUIRED_CLIENT_FILES = [
+  "Brand voice.md",
+  "Customer support rules.md",
+  "client-config.json",
+];
+
+const OPTIONAL_CLIENT_FILES = [
+  "FAQ.md",
+  "Policies.md",
+  "Products.md",
+  "Company overview.md",
+  "Legal.md",
+  "Product tutorials.md",
+  "Promotions & discounts.md",
+  "Shipping matrix.md",
+  "Troubleshooting.md",
+];
+
+function normalizeClientConfig(rawCfg, clientId) {
+  const normalized = {
+    brandName: String(rawCfg.brandName || clientId || "Support").trim(),
+    assistantName: String(rawCfg.assistantName || rawCfg.brandName || clientId || "Support").trim(),
+    logoUrl: rawCfg.logoUrl ? String(rawCfg.logoUrl).trim() : null,
+    language: String(rawCfg.language || "nl").trim(),
+    noEmojis: rawCfg.noEmojis !== false,
+    version: rawCfg.version ? String(rawCfg.version).trim() : null,
+    supportEmail: rawCfg.supportEmail ? String(rawCfg.supportEmail).trim() : null,
+    contactFormUrl: rawCfg.contactFormUrl ? String(rawCfg.contactFormUrl).trim() : null,
+    features: rawCfg.features && typeof rawCfg.features === "object" ? rawCfg.features : {},
+  };
+
+  // Widget config with defaults
+  const widgetTitle = rawCfg.widget && rawCfg.widget.title
+    ? String(rawCfg.widget.title).trim()
+    : (rawCfg.widgetTitle ? String(rawCfg.widgetTitle).trim() : normalized.brandName);
+  const widgetGreeting = rawCfg.widget && rawCfg.widget.greeting
+    ? String(rawCfg.widget.greeting).trim()
+    : (rawCfg.widgetGreeting ? String(rawCfg.widgetGreeting).trim() : `Hallo! Waar kan ik je mee helpen?`);
+
+  normalized.widget = {
+    title: widgetTitle,
+    greeting: widgetGreeting,
+  };
+
+  // Colors with defaults
+  normalized.colors = {
+    primary: String(rawCfg.colors && rawCfg.colors.primary ? rawCfg.colors.primary : (rawCfg.primaryColor || "#000000")).trim(),
+    accent: String(rawCfg.colors && rawCfg.colors.accent ? rawCfg.colors.accent : (rawCfg.accentColor || "#2563eb")).trim(),
+    background: String(rawCfg.colors && rawCfg.colors.background ? rawCfg.colors.background : "#ffffff").trim(),
+    userBubble: String(rawCfg.colors && rawCfg.colors.userBubble ? rawCfg.colors.userBubble : (rawCfg.colors && rawCfg.colors.primary ? rawCfg.colors.primary : (rawCfg.primaryColor || "#000000"))).trim(),
+    botBubble: String(rawCfg.colors && rawCfg.colors.botBubble ? rawCfg.colors.botBubble : "#ffffff").trim(),
+  };
+
+  // Entry screen with defaults
+  if (rawCfg.entryScreen && typeof rawCfg.entryScreen === "object") {
+    normalized.entryScreen = {
+      enabled: rawCfg.entryScreen.enabled === true,
+      title: rawCfg.entryScreen.title ? String(rawCfg.entryScreen.title).trim() : null,
+      disclaimer: rawCfg.entryScreen.disclaimer ? String(rawCfg.entryScreen.disclaimer).trim() : null,
+      primaryButton: rawCfg.entryScreen.primaryButton && typeof rawCfg.entryScreen.primaryButton === "object"
+        ? {
+            label: rawCfg.entryScreen.primaryButton.label ? String(rawCfg.entryScreen.primaryButton.label).trim() : "Start chat",
+            action: rawCfg.entryScreen.primaryButton.action ? String(rawCfg.entryScreen.primaryButton.action).trim() : "openChat",
+          }
+        : null,
+      secondaryButtons: Array.isArray(rawCfg.entryScreen.secondaryButtons)
+        ? rawCfg.entryScreen.secondaryButtons.slice(0, 2).map(btn => ({
+            label: btn.label ? String(btn.label).trim() : "",
+            action: btn.action ? String(btn.action).trim() : "",
+            url: btn.url ? String(btn.url).trim() : "",
+          })).filter(btn => btn.label && btn.action)
+        : [],
+    };
+  } else {
+    normalized.entryScreen = { enabled: false };
+  }
+
+  return normalized;
+}
+
+function validateClientFolder(clientId) {
+  const base = `./Clients/${clientId}`;
+  const missingFiles = [];
+  const errors = [];
+
+  if (!fs.existsSync(base)) {
+    return { valid: false, missingFiles: ["folder"], errors: [`Client folder not found: ${clientId}`] };
+  }
+
+  if (!fs.statSync(base).isDirectory()) {
+    return { valid: false, missingFiles: [], errors: [`Path exists but is not a directory: ${clientId}`] };
+  }
+
+  for (const file of REQUIRED_CLIENT_FILES) {
+    const filePath = `${base}/${file}`;
+    if (!fs.existsSync(filePath)) {
+      missingFiles.push(file);
+    }
+  }
+
+  if (missingFiles.length > 0) {
+    errors.push(`Missing required files: ${missingFiles.join(", ")}`);
+  }
+
+  const clientConfigPath = `${base}/client-config.json`;
+  if (fs.existsSync(clientConfigPath)) {
+    try {
+      const configRaw = readFile(clientConfigPath);
+      const config = safeJsonParse(configRaw, null);
+      if (!config || typeof config !== "object") {
+        errors.push("client-config.json is not valid JSON");
+      }
+    } catch (e) {
+      errors.push(`client-config.json parse error: ${e && e.message ? e.message : String(e)}`);
+    }
+  }
+
+  return {
+    valid: missingFiles.length === 0 && errors.length === 0,
+    missingFiles,
+    errors,
+  };
+}
+
+function initializeClientRegistry() {
+  const clientsDir = "./Clients";
+  if (!fs.existsSync(clientsDir)) {
+    logJson("warn", "client_registry_init", { error: "Clients directory not found" });
+    return;
+  }
+
+  try {
+    const entries = fs.readdirSync(clientsDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name.startsWith(".")) continue;
+
+      const clientId = entry.name;
+      const validation = validateClientFolder(clientId);
+
+      if (!validation.valid) {
+        logJson("warn", "client_validation_failed", {
+          clientId: clientId,
+          missingFiles: validation.missingFiles,
+          errors: validation.errors,
+        });
+        clientRegistry.set(clientId, {
+          status: "invalid",
+          missingFiles: validation.missingFiles,
+          validationErrors: validation.errors,
+        });
+        continue;
+      }
+
+      try {
+        const base = `./Clients/${clientId}`;
+        const configRaw = readFile(`${base}/client-config.json`);
+        const config = safeJsonParse(configRaw, {});
+        const normalizedConfig = normalizeClientConfig(config, clientId);
+
+        clientRegistry.set(clientId, {
+          status: "ok",
+          config: normalizedConfig,
+        });
+      } catch (e) {
+        logJson("warn", "client_config_normalize_failed", {
+          clientId: clientId,
+          error: e && e.message ? e.message : String(e),
+        });
+        clientRegistry.set(clientId, {
+          status: "invalid",
+          validationErrors: [e && e.message ? e.message : "Config normalization failed"],
+        });
+      }
+    }
+
+    const validCount = Array.from(clientRegistry.values()).filter(c => c.status === "ok").length;
+    logJson("info", "client_registry_initialized", {
+      totalClients: clientRegistry.size,
+      validClients: validCount,
+    });
+  } catch (e) {
+    logJson("error", "client_registry_init_error", {
+      error: e && e.message ? e.message : String(e),
+    });
+  }
+}
+
+function getClientOrNull(clientIdRaw) {
+  const clientId = sanitizeClientId(clientIdRaw);
+  const entry = clientRegistry.get(clientId);
+  if (!entry) return null;
+  if (entry.status !== "ok") return null;
+  return { clientId, config: entry.config };
+}
+
 function loadClient(clientIdRaw) {
   const clientId = sanitizeClientId(clientIdRaw);
   const base = `./Clients/${clientId}`;
@@ -1239,11 +1438,31 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/widget-config", (req, res) => {
-  const clientId = sanitizeClientId(req.query.client || "Advantum");
+  const clientIdRaw = req.query.client;
+  
+  if (!clientIdRaw || !String(clientIdRaw).trim()) {
+    res.status(400);
+    return res.json({
+      requestId: req.requestId,
+      error: "missing_client",
+      message: "Client parameter is required",
+    });
+  }
+
+  const clientId = sanitizeClientId(clientIdRaw);
+  const clientEntry = getClientOrNull(clientId);
+
+  if (!clientEntry) {
+    res.status(404);
+    return res.json({
+      requestId: req.requestId,
+      error: "invalid_client",
+      message: "Deze chat is niet juist geconfigureerd. Neem contact op met support.",
+    });
+  }
 
   try {
-    const data = loadClient(clientId);
-    const widgetConfig = buildWidgetConfig(data.clientConfig || {}, data.clientId);
+    const widgetConfig = buildWidgetConfig(clientEntry.config, clientEntry.clientId);
     res.setHeader("Cache-Control", "public, max-age=300");
 
     return res.json({ requestId: req.requestId, ...widgetConfig });
@@ -1257,7 +1476,8 @@ app.get("/widget-config", (req, res) => {
       errorStack: e && e.stack ? String(e.stack).slice(0, 500) : null,
     });
 
-    return res.status(500).json({ requestId: req.requestId, error: "Server error" });
+    res.status(500);
+    return res.json({ requestId: req.requestId, error: "Server error" });
   }
 });
 
@@ -1299,10 +1519,49 @@ app.post("/chat", async (req, res) => {
       return res.json({ requestId: req.requestId, error: "Invalid message" });
     }
 
-    clientId = sanitizeClientId(req.query.client || "Advantum");
+    const clientIdRaw = req.query.client;
+    if (!clientIdRaw || !String(clientIdRaw).trim()) {
+      res.status(400);
+      return res.json({
+        requestId: req.requestId,
+        reply: "Deze chat is niet juist geconfigureerd. Neem contact op met support.",
+        error: "missing_client",
+      });
+    }
+
+    clientId = sanitizeClientId(clientIdRaw);
     sessionId = sanitizeSessionId(req.body.sessionId);
 
-    const data = loadClient(clientId);
+    const clientEntry = getClientOrNull(clientId);
+    if (!clientEntry) {
+      res.status(404);
+      return res.json({
+        requestId: req.requestId,
+        reply: "Deze chat is niet juist geconfigureerd. Neem contact op met support.",
+        error: "invalid_client",
+      });
+    }
+
+    let data;
+    try {
+      data = loadClient(clientId);
+    } catch (e) {
+      logJson("error", "load_client_failed", {
+        requestId: req.requestId,
+        clientId: clientId,
+        error: e && e.message ? e.message : String(e),
+      });
+      res.status(404);
+      return res.json({
+        requestId: req.requestId,
+        reply: "Deze chat is niet juist geconfigureerd. Neem contact op met support.",
+        error: "invalid_client",
+      });
+    }
+
+    // Use normalized config from registry
+    data.clientConfig = clientEntry.config;
+
     const intentRaw = detectIntent(message);
     effectiveIntent = intentRaw;
 
@@ -1648,6 +1907,9 @@ ${context || "No relevant knowledge matched."}
 app.use((req, res) => {
   res.status(404).send("Not Found");
 });
+
+// Initialize client registry on startup
+initializeClientRegistry();
 
 app.listen(port, () => {
   const version = process.env.VERSION || process.env.RENDER_GIT_COMMIT || BUILD_VERSION || "unknown";
