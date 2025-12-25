@@ -1453,20 +1453,21 @@ function buildFollowUpQuestion(language, intent, slot, attemptNumber) {
 function buildMissingInfoEscalationReply(clientConfig, clientId) {
   const lang = clientConfig.language || "nl";
   const support = getSupportSettings(clientConfig);
-  const email = support.email || "";
-  const contactUrl = support.contactFormUrl || "";
+  const hasSupportConfig = !!(support.email || support.contactFormUrl);
   
   if (String(lang).toLowerCase().startsWith("en")) {
-    let msg = "I'd like to help you, but I'm missing important information to resolve this properly. I'm transferring you to our support team so you can get help quickly.";
-    if (email) msg += `\n\nEmail: ${email}`;
-    if (contactUrl) msg += `\nContact form: ${contactUrl}`;
-    return msg;
+    if (hasSupportConfig) {
+      return "I'd like to help you, but I'm missing important information to resolve this properly.\n\nVia the buttons below, you can contact our support directly.\n\nImportant: I automatically add a short summary of your question and the situation to your email or contact form, so you don't have to explain everything again.";
+    } else {
+      return "I'd like to help you, but I'm missing important information to resolve this properly. Please contact our support team for assistance.";
+    }
   }
   
-  let msg = "Ik wil je graag helpen, maar ik mis belangrijke informatie om dit goed op te lossen. Ik zet je door naar onze support zodat je snel geholpen wordt.";
-  if (email) msg += `\n\nE-mail: ${email}`;
-  if (contactUrl) msg += `\nContactformulier: ${contactUrl}`;
-  return msg;
+  if (hasSupportConfig) {
+    return "Ik wil je graag helpen, maar ik mis belangrijke informatie om dit goed op te lossen.\n\nVia de knoppen hieronder kun je direct contact opnemen met onze support.\n\nBelangrijk: ik voeg automatisch een korte samenvatting van je vraag en de situatie toe aan je e-mail of contactformulier, zodat je dit niet opnieuw hoeft uit te leggen.";
+  } else {
+    return "Ik wil je graag helpen, maar ik mis belangrijke informatie om dit goed op te lossen. Neem contact op met onze support voor hulp.";
+  }
 }
 
 function isKnowledgeInsufficient(contextString, topChunks) {
@@ -1495,20 +1496,21 @@ function buildKnowledgeGapClarificationReply(language) {
 function buildKnowledgeGapEscalationReply(clientConfig, clientId) {
   const lang = clientConfig.language || "nl";
   const support = getSupportSettings(clientConfig);
-  const email = support.email || "";
-  const contactUrl = support.contactFormUrl || "";
+  const hasSupportConfig = !!(support.email || support.contactFormUrl);
   
   if (String(lang).toLowerCase().startsWith("en")) {
-    let msg = "I'd like to help you properly, but I don't have the right information in my knowledge base to resolve this reliably. I'm transferring you to our support so you can get the right help directly.";
-    if (email) msg += `\n\nEmail: ${email}`;
-    if (contactUrl) msg += `\nContact form: ${contactUrl}`;
-    return msg;
+    if (hasSupportConfig) {
+      return "I'd like to help you properly, but I don't have the right information in my knowledge base to resolve this reliably.\n\nVia the buttons below, you can contact our support directly.\n\nImportant: I automatically add a short summary of your question and the situation to your email or contact form, so you don't have to explain everything again.";
+    } else {
+      return "I'd like to help you properly, but I don't have the right information in my knowledge base to resolve this reliably. Please contact our support team for assistance.";
+    }
   }
   
-  let msg = "Ik wil je graag goed helpen, maar ik heb niet de juiste informatie in mijn kennisbank om dit betrouwbaar op te lossen. Ik zet je door naar onze support zodat je direct de juiste hulp krijgt.";
-  if (email) msg += `\n\nE-mail: ${email}`;
-  if (contactUrl) msg += `\nContactformulier: ${contactUrl}`;
-  return msg;
+  if (hasSupportConfig) {
+    return "Ik wil je graag goed helpen, maar ik heb niet de juiste informatie in mijn kennisbank om dit betrouwbaar op te lossen.\n\nVia de knoppen hieronder kun je direct contact opnemen met onze support.\n\nBelangrijk: ik voeg automatisch een korte samenvatting van je vraag en de situatie toe aan je e-mail of contactformulier, zodat je dit niet opnieuw hoeft uit te leggen.";
+  } else {
+    return "Ik wil je graag goed helpen, maar ik heb niet de juiste informatie in mijn kennisbank om dit betrouwbaar op te lossen. Neem contact op met onze support voor hulp.";
+  }
 }
 
 function captureFactsFromExpectedSlot(sessionId, expectedSlot, userMessage) {
@@ -1758,49 +1760,42 @@ function isCatastrophicIssue(message) {
 function buildCatastrophicIssueReply(clientConfig, clientId) {
   const lang = clientConfig.language || "nl";
   const support = getSupportSettings(clientConfig);
-  const email = support.email || "";
-  const contactUrl = support.contactFormUrl || "";
+  const hasSupportConfig = !!(support.email || support.contactFormUrl);
   
   if (String(lang).toLowerCase().startsWith("en")) {
-    let msg = "That sounds like physical damage or a defect. Unfortunately, I can't resolve this directly via chat. Please contact our support team, and they'll help you further.";
-    if (email) msg += `\n\nEmail: ${email}`;
-    if (contactUrl) msg += `\nContact form: ${contactUrl}`;
-    return msg;
+    if (hasSupportConfig) {
+      return "That sounds like physical damage or a defect. Unfortunately, I can't resolve this directly via chat.\n\nVia the buttons below, you can contact our support directly.\n\nImportant: I automatically add a short summary of your question and the situation to your email or contact form, so you don't have to explain everything again.";
+    } else {
+      return "That sounds like physical damage or a defect. Unfortunately, I can't resolve this directly via chat. Please contact our support team for assistance.";
+    }
   }
   
-  let msg = "Dat klinkt als fysieke schade/defect. Dit kan ik helaas niet direct voor je oplossen via de chat. Neem contact op met onze support, dan helpen zij je verder.";
-  if (email) msg += `\n\nE-mail: ${email}`;
-  if (contactUrl) msg += `\nContactformulier: ${contactUrl}`;
-  return msg;
+  if (hasSupportConfig) {
+    return "Dat klinkt als fysieke schade/defect. Dit kan ik helaas niet direct voor je oplossen via de chat.\n\nVia de knoppen hieronder kun je direct contact opnemen met onze support.\n\nBelangrijk: ik voeg automatisch een korte samenvatting van je vraag en de situatie toe aan je e-mail of contactformulier, zodat je dit niet opnieuw hoeft uit te leggen.";
+  } else {
+    return "Dat klinkt als fysieke schade/defect. Dit kan ik helaas niet direct voor je oplossen via de chat. Neem contact op met onze support voor hulp.";
+  }
 }
 
 function buildEscalationReply(clientConfig, clientId) {
   const lang = clientConfig.language || "nl";
-  const brandName = clientConfig.brandName || clientId;
 
   const support = getSupportSettings(clientConfig);
-  const email = support.email || "";
-  const contactUrl = support.contactFormUrl || "";
-  const custom = support.escalationMessage || "";
-
-  if (custom && String(custom).trim()) {
-    let msg = String(custom).trim();
-    if (email && !msg.includes(email)) msg += `\n\nE-mail: ${email}`;
-    if (contactUrl && !msg.includes(contactUrl)) msg += `\nContact: ${contactUrl}`;
-    return msg;
-  }
+  const hasSupportConfig = !!(support.email || support.contactFormUrl);
 
   if (String(lang).toLowerCase().startsWith("en")) {
-    let msg = `I’m sorry this has been frustrating. For urgent help, please contact ${brandName} support.`;
-    if (email) msg += `\n\nEmail: ${email}`;
-    if (contactUrl) msg += `\nContact form: ${contactUrl}`;
-    return msg;
+    if (hasSupportConfig) {
+      return "I'm sorry this has been frustrating. I can't help you well enough here.\n\nVia the buttons below, you can contact our support directly.\n\nImportant: I automatically add a short summary of your question and the situation to your email or contact form, so you don't have to explain everything again.";
+    } else {
+      return "I'm sorry this has been frustrating. I can't help you well enough here. Please contact our support team for assistance.";
+    } `I’m sorry this has been frustrating. For urgent help, please contact ${brandName} support.`;
   }
 
-  let msg = `Het spijt me dat dit frustrerend is. Voor snelle hulp kun je direct contact opnemen met ${brandName} support.`;
-  if (email) msg += `\n\nE-mail: ${email}`;
-  if (contactUrl) msg += `\nContactformulier: ${contactUrl}`;
-  return msg;
+  if (hasSupportConfig) {
+    return "Het spijt me dat dit frustrerend is. Ik kan je hier niet goed genoeg mee helpen.\n\nVia de knoppen hieronder kun je direct contact opnemen met onze support.\n\nBelangrijk: ik voeg automatisch een korte samenvatting van je vraag en de situatie toe aan je e-mail of contactformulier, zodat je dit niet opnieuw hoeft uit te leggen.";
+  } else {
+    return "Het spijt me dat dit frustrerend is. Ik kan je hier niet goed genoeg mee helpen. Neem contact op met onze support voor hulp.";
+  }
 }
 
 // Build safe handoff summary (Dutch, no PII)
