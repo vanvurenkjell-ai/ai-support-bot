@@ -92,8 +92,8 @@ function logJson(level, event, fields) {
     };
     console.log(JSON.stringify(logObj));
 
-    // Send to Axiom for request_end, conversation_end, and error events
-    if (event === "request_end" || event === "conversation_end" || level === "error") {
+    // Send to Axiom for request_end, conversation_end, knowledge_gap, and error events
+    if (event === "request_end" || event === "conversation_end" || event === "knowledge_gap" || level === "error") {
       sendEventToAxiom(logObj);
     }
   } catch {
@@ -1357,6 +1357,48 @@ function buildMissingInfoEscalationReply(clientConfig, clientId) {
   return msg;
 }
 
+function isKnowledgeInsufficient(contextString, topChunks) {
+  // Check if context is empty or indicates no knowledge
+  if (!contextString || !contextString.trim()) return true;
+  if (contextString.trim() === "No relevant knowledge matched.") return true;
+  
+  // Check if very short (below minimal threshold for meaningful content)
+  // Threshold: less than 100 characters likely indicates insufficient knowledge
+  if (contextString.trim().length < 100) return true;
+  
+  // Check if topChunks is empty or very few chunks with low scores
+  if (!topChunks || topChunks.length === 0) return true;
+  
+  return false;
+}
+
+function buildKnowledgeGapClarificationReply(language) {
+  const isEn = String(language || "nl").toLowerCase().startsWith("en");
+  if (isEn) {
+    return "I want to help you well, but I'm missing some context. What product/topic is your question about exactly?";
+  }
+  return "Ik wil je goed helpen, maar ik mis nog wat context. Over welk product/onderwerp gaat je vraag precies?";
+}
+
+function buildKnowledgeGapEscalationReply(clientConfig, clientId) {
+  const lang = clientConfig.language || "nl";
+  const support = getSupportSettings(clientConfig);
+  const email = support.email || "";
+  const contactUrl = support.contactFormUrl || "";
+  
+  if (String(lang).toLowerCase().startsWith("en")) {
+    let msg = "I'd like to help you properly, but I don't have the right information in my knowledge base to resolve this reliably. I'm transferring you to our support so you can get the right help directly.";
+    if (email) msg += `\n\nEmail: ${email}`;
+    if (contactUrl) msg += `\nContact form: ${contactUrl}`;
+    return msg;
+  }
+  
+  let msg = "Ik wil je graag goed helpen, maar ik heb niet de juiste informatie in mijn kennisbank om dit betrouwbaar op te lossen. Ik zet je door naar onze support zodat je direct de juiste hulp krijgt.";
+  if (email) msg += `\n\nE-mail: ${email}`;
+  if (contactUrl) msg += `\nContactformulier: ${contactUrl}`;
+  return msg;
+}
+
 function captureFactsFromExpectedSlot(sessionId, expectedSlot, userMessage) {
   const msg = String(userMessage || "").trim();
   if (!expectedSlot) return;
@@ -1777,6 +1819,10 @@ app.post("/chat", async (req, res) => {
     clarificationRequired: false,
     clarificationType: null,
     clarificationAttemptCount: null,
+    knowledgeGapDetected: false,
+    knowledgeGapTopic: null,
+    knowledgeGapClarificationAsked: false,
+    knowledgeGapClarificationCount: 0,
     shopifyLookupAttempted: false,
     shopifyFound: null,
     shopifyError: null,
@@ -1878,6 +1924,10 @@ app.post("/chat", async (req, res) => {
         clarificationRequired: false,
         clarificationType: null,
         clarificationAttemptCount: null,
+        knowledgeGapDetected: false,
+        knowledgeGapTopic: null,
+        knowledgeGapClarificationAsked: false,
+        knowledgeGapClarificationCount: 0,
         shopifyLookupAttempted: false,
         shopifyFound: null,
         shopifyError: null,
@@ -1938,6 +1988,10 @@ app.post("/chat", async (req, res) => {
         clarificationRequired: router.clarificationRequired || false,
         clarificationType: router.clarificationType || null,
         clarificationAttemptCount: router.clarificationAttemptCount || null,
+        knowledgeGapDetected: false,
+        knowledgeGapTopic: null,
+        knowledgeGapClarificationAsked: false,
+        knowledgeGapClarificationCount: 0,
         shopifyLookupAttempted: false,
         shopifyFound: null,
         shopifyError: null,
@@ -1976,6 +2030,10 @@ app.post("/chat", async (req, res) => {
         clarificationRequired: false,
         clarificationType: null,
         clarificationAttemptCount: null,
+        knowledgeGapDetected: false,
+        knowledgeGapTopic: null,
+        knowledgeGapClarificationAsked: false,
+        knowledgeGapClarificationCount: 0,
         shopifyLookupAttempted: false,
         shopifyFound: null,
         shopifyError: null,
@@ -2022,6 +2080,10 @@ app.post("/chat", async (req, res) => {
           clarificationRequired: false,
           clarificationType: null,
           clarificationAttemptCount: null,
+          knowledgeGapDetected: false,
+          knowledgeGapTopic: null,
+          knowledgeGapClarificationAsked: false,
+          knowledgeGapClarificationCount: 0,
           shopifyLookupAttempted: true,
           shopifyFound: false,
           shopifyError: shopifyError,
@@ -2051,10 +2113,120 @@ app.post("/chat", async (req, res) => {
       .join("\n\n");
 
     const historyMessages = buildHistoryMessages(sessionId);
-    const meta = getMeta(sessionId);
+    const currentMeta = getMeta(sessionId);
+    
+    // Knowledge gap detection (only if not already handling missing info clarification)
+    const knowledgeGapClarificationAsked = currentMeta.knowledgeGapClarificationAsked || false;
+    const knowledgeInsufficient = isKnowledgeInsufficient(context, topChunks);
+    
+    if (knowledgeInsufficient && !currentMeta.expectedSlot) {
+      // Only check knowledge gap if we're not already asking for missing info clarification
+      if (!knowledgeGapClarificationAsked) {
+        // First time detecting knowledge gap: ask one clarification
+        const knowledgeGapTopic = effectiveIntent.mainIntent || "unknown";
+        setMeta(sessionId, {
+          knowledgeGapClarificationAsked: true,
+          knowledgeGapTopic: knowledgeGapTopic,
+          knowledgeGapDetectedCount: (currentMeta.knowledgeGapDetectedCount || 0) + 1,
+          lastKnowledgeGapAt: Date.now(),
+        });
+        
+        const reply = buildKnowledgeGapClarificationReply(data.clientConfig.language || "nl");
+        appendToHistory(sessionId, "assistant", reply);
+        
+        logJson("info", "knowledge_gap", {
+          requestId: req.requestId,
+          conversationId: conversationId,
+          clientId: clientId,
+          sessionId: sessionId,
+          knowledgeGapTopic: knowledgeGapTopic,
+        });
+        
+        res.locals.chatMetrics = {
+          intent: effectiveIntent,
+          routedTo: "bot",
+          escalateReason: null,
+          conversationId: conversationId,
+          clarificationRequired: false,
+          clarificationType: null,
+          clarificationAttemptCount: null,
+          knowledgeGapDetected: true,
+          knowledgeGapTopic: knowledgeGapTopic,
+          knowledgeGapClarificationAsked: true,
+          knowledgeGapClarificationCount: 1,
+          shopifyLookupAttempted: shopifyLookupAttempted,
+          shopifyFound: shopifyFound,
+          shopifyError: shopifyError,
+          llmProvider: "openai",
+          llmModel: null,
+          llmLatencyMs: 0,
+          tokenUsage: null,
+        };
+        
+        return res.json({
+          requestId: req.requestId,
+          reply,
+          intent: effectiveIntent,
+          shopify,
+          routed: true,
+          escalated: false,
+          facts: getFacts(sessionId),
+        });
+      } else {
+        // Already asked clarification once, now escalate
+        const knowledgeGapTopic = currentMeta.knowledgeGapTopic || effectiveIntent.mainIntent || "unknown";
+        const reply = buildKnowledgeGapEscalationReply(data.clientConfig || {}, data.clientId);
+        appendToHistory(sessionId, "assistant", reply);
+        
+        // Store escalateReason in meta for conversation_end log
+        setMeta(sessionId, { escalateReason: "knowledge_gap" });
+        // End conversation with escalation outcome
+        endConversation(sessionId, "escalated_to_human");
+        
+        res.locals.chatMetrics = {
+          intent: effectiveIntent,
+          routedTo: "human",
+          escalateReason: "knowledge_gap",
+          conversationId: conversationId,
+          clarificationRequired: false,
+          clarificationType: null,
+          clarificationAttemptCount: null,
+          knowledgeGapDetected: true,
+          knowledgeGapTopic: knowledgeGapTopic,
+          knowledgeGapClarificationAsked: true,
+          knowledgeGapClarificationCount: 1,
+          shopifyLookupAttempted: shopifyLookupAttempted,
+          shopifyFound: shopifyFound,
+          shopifyError: shopifyError,
+          llmProvider: "openai",
+          llmModel: null,
+          llmLatencyMs: 0,
+          tokenUsage: null,
+        };
+        
+        return res.json({
+          requestId: req.requestId,
+          reply,
+          intent: effectiveIntent,
+          shopify,
+          routed: true,
+          escalated: true,
+          facts: getFacts(sessionId),
+        });
+      }
+    }
+    
+    // Reset knowledge gap state if knowledge is now sufficient
+    if (!knowledgeInsufficient && knowledgeGapClarificationAsked) {
+      setMeta(sessionId, {
+        knowledgeGapClarificationAsked: false,
+        knowledgeGapTopic: null,
+      });
+    }
 
-    const flowHint = meta.expectedSlot
-      ? `EXPECTED_USER_INPUT: The user is answering the bot's question. Slot expected: ${meta.expectedSlot}.`
+    const flowMeta = getMeta(sessionId);
+    const flowHint = flowMeta.expectedSlot
+      ? `EXPECTED_USER_INPUT: The user is answering the bot's question. Slot expected: ${flowMeta.expectedSlot}.`
       : "EXPECTED_USER_INPUT: none";
 
     const factsBlock = `
@@ -2189,6 +2361,11 @@ ${context || "No relevant knowledge matched."}
       }
     }
 
+    const finalMetaForMetrics = getMeta(sessionId);
+    const knowledgeGapDetected = isKnowledgeInsufficient(context, topChunks);
+    const knowledgeGapTopic = finalMetaForMetrics.knowledgeGapTopic || null;
+    const knowledgeGapClarificationAskedForMetrics = finalMetaForMetrics.knowledgeGapClarificationAsked || false;
+    
     res.locals.chatMetrics = {
       intent: effectiveIntent,
       routedTo: "bot",
@@ -2197,6 +2374,10 @@ ${context || "No relevant knowledge matched."}
       clarificationRequired: false,
       clarificationType: null,
       clarificationAttemptCount: null,
+      knowledgeGapDetected: knowledgeGapDetected,
+      knowledgeGapTopic: knowledgeGapTopic,
+      knowledgeGapClarificationAsked: knowledgeGapClarificationAskedForMetrics,
+      knowledgeGapClarificationCount: knowledgeGapClarificationAskedForMetrics ? 1 : 0,
       shopifyLookupAttempted: shopifyLookupAttempted,
       shopifyFound: shopifyFound,
       shopifyError: shopifyError,
