@@ -602,6 +602,19 @@ function endConversation(sessionId, outcome) {
   const session = getSession(sessionId);
   const meta = session && session.meta ? session.meta : {};
   const escalateReason = meta.escalateReason || null;
+  const knowledgeGapTopic = meta.knowledgeGapTopic || null;
+  const lastIntent = meta.lastIntent || null;
+  
+  // Normalize topic for conversation_end log
+  // Try to get orderNumber from facts if available
+  const conversationOrderNumber = (meta.facts && meta.facts.orderNumber) || null;
+  const topicInfo = normalizeTopic({
+    intent: lastIntent ? { mainIntent: lastIntent } : null,
+    orderNumber: conversationOrderNumber,
+    escalateReason: escalateReason,
+    knowledgeGapTopic: knowledgeGapTopic,
+    facts: meta.facts || null,
+  });
   
   // logJson will send to Axiom for conversation_end events
   logJson("info", "conversation_end", {
@@ -610,6 +623,8 @@ function endConversation(sessionId, outcome) {
     sessionId: state.sessionId,
     conversationOutcome: outcome,
     escalateReason: escalateReason,
+    topic: topicInfo.topic,
+    topicSource: topicInfo.topicSource,
     durationMs: durationMs,
     messageCount: state.messageCount || 0,
   });
@@ -649,6 +664,80 @@ function detectIntent(message) {
   if (usage.some((w) => text.includes(w)) && mainIntent === "general") mainIntent = "product_usage";
 
   return { mainIntent, orderNumber };
+}
+
+// ---- Topic normalization for analytics ----
+const CANONICAL_TOPICS = [
+  "order_tracking",
+  "shipping",
+  "returns",
+  "refunds",
+  "discounts",
+  "product_issue",
+  "policy",
+  "account",
+  "general",
+];
+
+const INTENT_TO_TOPIC_MAP = {
+  "shipping_or_order": "shipping",
+  "return_or_withdrawal": "returns",
+  "product_usage": "product_issue",
+  "support_escalation": "general",
+  "product_troubleshooting": "product_issue",
+  "general": "general",
+};
+
+// Canonical topic list for validation (ensure topics are always canonical)
+const CANONICAL_TOPICS_SET = new Set(CANONICAL_TOPICS);
+
+function normalizeTopic({ intent, orderNumber, escalateReason, knowledgeGapTopic, facts }) {
+  // Extract orderNumber from facts if not provided directly
+  const effectiveOrderNumber = orderNumber || (facts && facts.orderNumber) || null;
+  
+  // Priority 1: If explicit intent.mainIntent exists, map it to canonical topic
+  if (intent && intent.mainIntent) {
+    const mappedTopic = INTENT_TO_TOPIC_MAP[intent.mainIntent];
+    if (mappedTopic) {
+      // Special case: if order number is present, use "order_tracking" instead of "shipping"
+      if (mappedTopic === "shipping" && effectiveOrderNumber) {
+        return { topic: "order_tracking", topicSource: "intent_classifier" };
+      }
+      return { topic: mappedTopic, topicSource: "intent_classifier" };
+    }
+  }
+  
+  // Priority 2: If orderNumber is present (even without intent), use order_tracking
+  if (effectiveOrderNumber) {
+    return { topic: "order_tracking", topicSource: "rule_based" };
+  }
+  
+  // Priority 3: If escalation reason exists, map to topic when appropriate
+  if (escalateReason) {
+    if (escalateReason === "knowledge_gap" && knowledgeGapTopic) {
+      // Try to normalize knowledgeGapTopic
+      const mappedKnowledgeTopic = INTENT_TO_TOPIC_MAP[knowledgeGapTopic] || null;
+      if (mappedKnowledgeTopic) {
+        return { topic: mappedKnowledgeTopic, topicSource: "rule_based" };
+      }
+    }
+    // For other escalation reasons (missing_required_info, urgent, angry, catastrophic),
+    // try to preserve context from intent if available, otherwise fall back to general
+    if (intent && intent.mainIntent) {
+      const mappedTopic = INTENT_TO_TOPIC_MAP[intent.mainIntent];
+      if (mappedTopic) {
+        return { topic: mappedTopic, topicSource: "rule_based" };
+      }
+    }
+  }
+  
+  // Priority 4: Fallback to general (always canonical, never null)
+  const finalTopic = "general";
+  // Ensure topic is always canonical (safety check)
+  if (!CANONICAL_TOPICS_SET.has(finalTopic)) {
+    return { topic: "general", topicSource: "fallback" };
+  }
+  return { topic: finalTopic, topicSource: "fallback" };
 }
 
 // ---- Tracking URL normalization ----
@@ -1811,11 +1900,14 @@ app.post("/chat", async (req, res) => {
   let escalateReason = null;
 
   // Initialize metrics object
+  const defaultTopic = normalizeTopic({ intent: null, orderNumber: null, escalateReason: null, knowledgeGapTopic: null, facts: null });
   res.locals.chatMetrics = {
     intent: null,
     routedTo: "bot",
     escalateReason: null,
     conversationId: null,
+    topic: defaultTopic.topic,
+    topicSource: defaultTopic.topicSource,
     clarificationRequired: false,
     clarificationType: null,
     clarificationAttemptCount: null,
@@ -1916,11 +2008,14 @@ app.post("/chat", async (req, res) => {
       // End conversation with escalation outcome
       endConversation(sessionId, "escalated_to_human");
       
+      const topicInfo = normalizeTopic({ intent: intentRaw, orderNumber: intentRaw.orderNumber, escalateReason: escalateReason, knowledgeGapTopic: null, facts: getFacts(sessionId) });
       res.locals.chatMetrics = {
         intent: { ...intentRaw, mainIntent: "support_escalation" },
         routedTo: "human",
         escalateReason: escalateReason,
         conversationId: conversationId,
+        topic: topicInfo.topic,
+        topicSource: topicInfo.topicSource,
         clarificationRequired: false,
         clarificationType: null,
         clarificationAttemptCount: null,
@@ -1980,11 +2075,14 @@ app.post("/chat", async (req, res) => {
         endConversation(sessionId, "escalated_to_human");
       }
 
+      const routerTopicInfo = normalizeTopic({ intent: intentRaw, orderNumber: intentRaw.orderNumber, escalateReason: router.escalateReason || escalateReason, knowledgeGapTopic: null, facts: getFacts(sessionId) });
       res.locals.chatMetrics = {
         intent: intentRaw,
         routedTo: router.escalateReason ? "human" : routedTo,
         escalateReason: router.escalateReason || escalateReason,
         conversationId: conversationId,
+        topic: routerTopicInfo.topic,
+        topicSource: routerTopicInfo.topicSource,
         clarificationRequired: router.clarificationRequired || false,
         clarificationType: router.clarificationType || null,
         clarificationAttemptCount: router.clarificationAttemptCount || null,
@@ -2022,11 +2120,14 @@ app.post("/chat", async (req, res) => {
       const reply = buildOrderNotFoundReply(data.clientConfig || {}, data.clientId, effectiveIntent.orderNumber);
       appendToHistory(sessionId, "assistant", reply);
 
+      const orderNotFoundTopicInfo = normalizeTopic({ intent: effectiveIntent, orderNumber: effectiveIntent.orderNumber, escalateReason: null, knowledgeGapTopic: null, facts: getFacts(sessionId) });
       res.locals.chatMetrics = {
         intent: effectiveIntent,
         routedTo: "bot",
         escalateReason: null,
         conversationId: conversationId,
+        topic: orderNotFoundTopicInfo.topic,
+        topicSource: orderNotFoundTopicInfo.topicSource,
         clarificationRequired: false,
         clarificationType: null,
         clarificationAttemptCount: null,
@@ -2072,11 +2173,14 @@ app.post("/chat", async (req, res) => {
         const reply = buildOrderNotFoundReply(data.clientConfig || {}, data.clientId, effectiveIntent.orderNumber);
         appendToHistory(sessionId, "assistant", reply);
 
+        const shopifyNotFoundTopicInfo = normalizeTopic({ intent: effectiveIntent, orderNumber: effectiveIntent.orderNumber, escalateReason: null, knowledgeGapTopic: null, facts: getFacts(sessionId) });
         res.locals.chatMetrics = {
           intent: effectiveIntent,
           routedTo: "bot",
           escalateReason: null,
           conversationId: conversationId,
+          topic: shopifyNotFoundTopicInfo.topic,
+          topicSource: shopifyNotFoundTopicInfo.topicSource,
           clarificationRequired: false,
           clarificationType: null,
           clarificationAttemptCount: null,
@@ -2134,12 +2238,16 @@ app.post("/chat", async (req, res) => {
         const reply = buildKnowledgeGapClarificationReply(data.clientConfig.language || "nl");
         appendToHistory(sessionId, "assistant", reply);
         
+        const knowledgeGapClarificationTopicInfo = normalizeTopic({ intent: effectiveIntent, orderNumber: effectiveIntent.orderNumber, escalateReason: null, knowledgeGapTopic: knowledgeGapTopic, facts: getFacts(sessionId) });
+        
         logJson("info", "knowledge_gap", {
           requestId: req.requestId,
           conversationId: conversationId,
           clientId: clientId,
           sessionId: sessionId,
           knowledgeGapTopic: knowledgeGapTopic,
+          topic: knowledgeGapClarificationTopicInfo.topic,
+          topicSource: knowledgeGapClarificationTopicInfo.topicSource,
         });
         
         res.locals.chatMetrics = {
@@ -2147,6 +2255,8 @@ app.post("/chat", async (req, res) => {
           routedTo: "bot",
           escalateReason: null,
           conversationId: conversationId,
+          topic: knowledgeGapClarificationTopicInfo.topic,
+          topicSource: knowledgeGapClarificationTopicInfo.topicSource,
           clarificationRequired: false,
           clarificationType: null,
           clarificationAttemptCount: null,
@@ -2183,11 +2293,14 @@ app.post("/chat", async (req, res) => {
         // End conversation with escalation outcome
         endConversation(sessionId, "escalated_to_human");
         
+        const knowledgeGapEscalationTopicInfo = normalizeTopic({ intent: effectiveIntent, orderNumber: effectiveIntent.orderNumber, escalateReason: "knowledge_gap", knowledgeGapTopic: knowledgeGapTopic, facts: getFacts(sessionId) });
         res.locals.chatMetrics = {
           intent: effectiveIntent,
           routedTo: "human",
           escalateReason: "knowledge_gap",
           conversationId: conversationId,
+          topic: knowledgeGapEscalationTopicInfo.topic,
+          topicSource: knowledgeGapEscalationTopicInfo.topicSource,
           clarificationRequired: false,
           clarificationType: null,
           clarificationAttemptCount: null,
@@ -2366,11 +2479,14 @@ ${context || "No relevant knowledge matched."}
     const knowledgeGapTopic = finalMetaForMetrics.knowledgeGapTopic || null;
     const knowledgeGapClarificationAskedForMetrics = finalMetaForMetrics.knowledgeGapClarificationAsked || false;
     
+    const normalTopicInfo = normalizeTopic({ intent: effectiveIntent, orderNumber: effectiveIntent.orderNumber, escalateReason: null, knowledgeGapTopic: knowledgeGapTopic, facts: getFacts(sessionId) });
     res.locals.chatMetrics = {
       intent: effectiveIntent,
       routedTo: "bot",
       escalateReason: null,
       conversationId: conversationId,
+      topic: normalTopicInfo.topic,
+      topicSource: normalTopicInfo.topicSource,
       clarificationRequired: false,
       clarificationType: null,
       clarificationAttemptCount: null,
