@@ -547,7 +547,7 @@ function setFacts(sessionId, patch) {
 }
 
 function clearExpectedSlot(sessionId) {
-  setMeta(sessionId, { expectedSlot: "" });
+  setMeta(sessionId, { expectedSlot: "", clarificationType: null, clarificationAttemptCount: 0 });
 }
 
 function buildHistoryMessages(sessionId) {
@@ -598,12 +598,18 @@ function endConversation(sessionId, outcome) {
   state.outcome = outcome;
   const durationMs = Date.now() - state.startedAt;
   
+  // Get escalateReason from session meta if available
+  const session = getSession(sessionId);
+  const meta = session && session.meta ? session.meta : {};
+  const escalateReason = meta.escalateReason || null;
+  
   // logJson will send to Axiom for conversation_end events
   logJson("info", "conversation_end", {
     conversationId: state.conversationId,
     clientId: state.clientId,
     sessionId: state.sessionId,
     conversationOutcome: outcome,
+    escalateReason: escalateReason,
     durationMs: durationMs,
     messageCount: state.messageCount || 0,
   });
@@ -1254,11 +1260,101 @@ function buildFollowUpQuestion(language, intent, slot) {
     problemDetails: "What exactly is going wrong, and what have you tried already?",
   };
 
-  const dict = String(language || "nl").toLowerCase().startsWith("en") ? en : nl;
+  const isEn = String(language || "nl").toLowerCase().startsWith("en");
+  const attempt = attemptNumber || 1;
+  
+  if (attempt >= 2) {
+    // Second attempt: shorter and more explicit
+    const nl2 = {
+      orderNumber: "Ik heb je bestelnummer echt nodig om je te helpen. Wat is je bestelnummer?",
+      emailOrOrder: "Ik heb je bestelnummer of e-mailadres nodig om je te helpen. Wat is je bestelnummer of e-mailadres?",
+      productName: "Ik heb echt nodig te weten welk product je bedoelt. Welk product is het?",
+      problemDetails: "Ik heb meer details nodig om je te helpen. Wat gaat er precies mis?",
+    };
+    const en2 = {
+      orderNumber: "I really need your order number to help you. What is your order number?",
+      emailOrOrder: "I need your order number or email address to help you. What is your order number or email address?",
+      productName: "I really need to know which product you mean. Which product is it?",
+      problemDetails: "I need more details to help you. What exactly is going wrong?",
+    };
+    const dict2 = isEn ? en2 : nl2;
+    if (slot && dict2[slot]) return dict2[slot];
+    if (intent === "shipping_or_order") return dict2.orderNumber;
+    if (intent === "return_or_withdrawal") return dict2.emailOrOrder;
+    return dict2.problemDetails;
+  }
+  
+  // First attempt: normal clarification question
+  const dict = isEn ? en : nl;
   if (slot && dict[slot]) return dict[slot];
   if (intent === "shipping_or_order") return dict.orderNumber;
   if (intent === "return_or_withdrawal") return dict.emailOrOrder;
   return dict.problemDetails;
+}
+
+function buildFollowUpQuestion(language, intent, slot, attemptNumber) {
+  const isEn = String(language || "nl").toLowerCase().startsWith("en");
+  const attempt = attemptNumber || 1;
+  
+  const nl = {
+    orderNumber: "Wat is je bestelnummer? Bijvoorbeeld #1055.",
+    emailOrOrder: "Wat is je bestelnummer? Als je die niet hebt: met welk e-mailadres heb je besteld?",
+    productName: "Welk product bedoel je precies?",
+    problemDetails: "Wat gaat er precies mis, en wat heb je al geprobeerd?",
+  };
+  const en = {
+    orderNumber: "What is your order number? For example #1055.",
+    emailOrOrder: "What is your order number? If you don't have it: what email address did you order with?",
+    productName: "Which product is it exactly?",
+    problemDetails: "What exactly is going wrong, and what have you tried already?",
+  };
+  
+  if (attempt >= 2) {
+    // Second attempt: shorter and more explicit
+    const nl2 = {
+      orderNumber: "Ik heb je bestelnummer echt nodig om je te helpen. Wat is je bestelnummer?",
+      emailOrOrder: "Ik heb je bestelnummer of e-mailadres nodig om je te helpen. Wat is je bestelnummer of e-mailadres?",
+      productName: "Ik heb echt nodig te weten welk product je bedoelt. Welk product is het?",
+      problemDetails: "Ik heb meer details nodig om je te helpen. Wat gaat er precies mis?",
+    };
+    const en2 = {
+      orderNumber: "I really need your order number to help you. What is your order number?",
+      emailOrOrder: "I need your order number or email address to help you. What is your order number or email address?",
+      productName: "I really need to know which product you mean. Which product is it?",
+      problemDetails: "I need more details to help you. What exactly is going wrong?",
+    };
+    const dict2 = isEn ? en2 : nl2;
+    if (slot && dict2[slot]) return dict2[slot];
+    if (intent === "shipping_or_order") return dict2.orderNumber;
+    if (intent === "return_or_withdrawal") return dict2.emailOrOrder;
+    return dict2.problemDetails;
+  }
+  
+  // First attempt: normal clarification question
+  const dict = isEn ? en : nl;
+  if (slot && dict[slot]) return dict[slot];
+  if (intent === "shipping_or_order") return dict.orderNumber;
+  if (intent === "return_or_withdrawal") return dict.emailOrOrder;
+  return dict.problemDetails;
+}
+
+function buildMissingInfoEscalationReply(clientConfig, clientId) {
+  const lang = clientConfig.language || "nl";
+  const support = getSupportSettings(clientConfig);
+  const email = support.email || "";
+  const contactUrl = support.contactFormUrl || "";
+  
+  if (String(lang).toLowerCase().startsWith("en")) {
+    let msg = "I'd like to help you, but I'm missing important information to resolve this properly. I'm transferring you to our support team so you can get help quickly.";
+    if (email) msg += `\n\nEmail: ${email}`;
+    if (contactUrl) msg += `\nContact form: ${contactUrl}`;
+    return msg;
+  }
+  
+  let msg = "Ik wil je graag helpen, maar ik mis belangrijke informatie om dit goed op te lossen. Ik zet je door naar onze support zodat je snel geholpen wordt.";
+  if (email) msg += `\n\nE-mail: ${email}`;
+  if (contactUrl) msg += `\nContactformulier: ${contactUrl}`;
+  return msg;
 }
 
 function captureFactsFromExpectedSlot(sessionId, expectedSlot, userMessage) {
@@ -1299,11 +1395,66 @@ function maybeHandleWithRouter({ sessionId, message, intent, clientConfig, clien
   const meta = getMeta(sessionId);
   const facts = getFacts(sessionId);
   const expected = meta.expectedSlot || "";
+  const clarificationType = meta.clarificationType || null;
+  const clarificationAttemptCount = meta.clarificationAttemptCount || 0;
 
+  // If we're awaiting clarification, try to capture the info
   if (expected) {
+    const beforeCapture = {
+      orderNumber: facts.orderNumber || null,
+      email: facts.email || null,
+      productName: facts.productName || null,
+      problemDetails: facts.problemDetails || null,
+    };
+    
     captureFactsFromExpectedSlot(sessionId, expected, message);
-    clearExpectedSlot(sessionId);
-    return { handled: false };
+    
+    // Check if we successfully captured the info
+    const afterCapture = {
+      orderNumber: getFacts(sessionId).orderNumber || null,
+      email: getFacts(sessionId).email || null,
+      productName: getFacts(sessionId).productName || null,
+      problemDetails: getFacts(sessionId).problemDetails || null,
+    };
+    
+    const infoCaptured = (
+      (expected === "orderNumber" && afterCapture.orderNumber && !beforeCapture.orderNumber) ||
+      (expected === "emailOrOrder" && ((afterCapture.orderNumber && !beforeCapture.orderNumber) || (afterCapture.email && !beforeCapture.email))) ||
+      (expected === "productName" && afterCapture.productName && !beforeCapture.productName) ||
+      (expected === "problemDetails" && afterCapture.problemDetails && !beforeCapture.problemDetails)
+    );
+    
+    if (infoCaptured) {
+      // Successfully captured the info, reset clarification state
+      clearExpectedSlot(sessionId);
+      setMeta(sessionId, { clarificationType: null, clarificationAttemptCount: 0 });
+      return { handled: false, clarificationResolved: true };
+    } else {
+      // Info still missing, increment attempt count
+      const newAttemptCount = clarificationAttemptCount + 1;
+      setMeta(sessionId, { clarificationAttemptCount: newAttemptCount });
+      
+      // Check if we've exceeded max attempts
+      if (newAttemptCount >= 2) {
+        // Escalate to human support
+        clearExpectedSlot(sessionId);
+        setMeta(sessionId, { clarificationType: null, clarificationAttemptCount: 0 });
+        return {
+          handled: true,
+          reply: buildMissingInfoEscalationReply(clientConfig, clientId),
+          escalateReason: "missing_required_info",
+        };
+      }
+      
+      // Ask clarification again (second attempt with shorter message)
+      return {
+        handled: true,
+        reply: buildFollowUpQuestion(lang, meta.lastIntent || intent.mainIntent, expected, newAttemptCount),
+        clarificationRequired: true,
+        clarificationType: expected,
+        clarificationAttemptCount: newAttemptCount,
+      };
+    }
   }
 
   // Check for catastrophic physical damage/defect before other routing
@@ -1317,8 +1468,20 @@ function maybeHandleWithRouter({ sessionId, message, intent, clientConfig, clien
   if (intent.mainIntent === "shipping_or_order") {
     const orderKnown = intent.orderNumber || facts.orderNumber;
     if (!orderKnown) {
-      setMeta(sessionId, { expectedSlot: "orderNumber", lastIntent: intent.mainIntent });
-      return { handled: true, reply: buildFollowUpQuestion(lang, intent.mainIntent, "orderNumber") };
+      const newAttemptCount = (clarificationType === "orderNumber" ? clarificationAttemptCount : 0) + 1;
+      setMeta(sessionId, {
+        expectedSlot: "orderNumber",
+        lastIntent: intent.mainIntent,
+        clarificationType: "orderNumber",
+        clarificationAttemptCount: newAttemptCount,
+      });
+      return {
+        handled: true,
+        reply: buildFollowUpQuestion(lang, intent.mainIntent, "orderNumber", newAttemptCount),
+        clarificationRequired: true,
+        clarificationType: "orderNumber",
+        clarificationAttemptCount: newAttemptCount,
+      };
     }
   }
 
@@ -1326,20 +1489,61 @@ function maybeHandleWithRouter({ sessionId, message, intent, clientConfig, clien
     const orderKnown = intent.orderNumber || facts.orderNumber;
     const emailKnown = facts.email;
     if (!orderKnown && !emailKnown) {
-      setMeta(sessionId, { expectedSlot: "emailOrOrder", lastIntent: intent.mainIntent });
-      return { handled: true, reply: buildFollowUpQuestion(lang, intent.mainIntent, "emailOrOrder") };
+      const newAttemptCount = (clarificationType === "emailOrOrder" ? clarificationAttemptCount : 0) + 1;
+      setMeta(sessionId, {
+        expectedSlot: "emailOrOrder",
+        lastIntent: intent.mainIntent,
+        clarificationType: "emailOrOrder",
+        clarificationAttemptCount: newAttemptCount,
+      });
+      return {
+        handled: true,
+        reply: buildFollowUpQuestion(lang, intent.mainIntent, "emailOrOrder", newAttemptCount),
+        clarificationRequired: true,
+        clarificationType: "emailOrOrder",
+        clarificationAttemptCount: newAttemptCount,
+      };
     }
   }
 
   if ((intent.mainIntent === "product_usage" || intent.mainIntent === "general") && isTroubleshootingLike(message)) {
     if (!facts.productName) {
-      setMeta(sessionId, { expectedSlot: "productName", lastIntent: "product_troubleshooting" });
-      return { handled: true, reply: buildFollowUpQuestion(lang, "product_usage", "productName") };
+      const newAttemptCount = (clarificationType === "productName" ? clarificationAttemptCount : 0) + 1;
+      setMeta(sessionId, {
+        expectedSlot: "productName",
+        lastIntent: "product_troubleshooting",
+        clarificationType: "productName",
+        clarificationAttemptCount: newAttemptCount,
+      });
+      return {
+        handled: true,
+        reply: buildFollowUpQuestion(lang, "product_usage", "productName", newAttemptCount),
+        clarificationRequired: true,
+        clarificationType: "productName",
+        clarificationAttemptCount: newAttemptCount,
+      };
     }
     if (!facts.problemDetails) {
-      setMeta(sessionId, { expectedSlot: "problemDetails", lastIntent: "product_troubleshooting" });
-      return { handled: true, reply: buildFollowUpQuestion(lang, "product_usage", "problemDetails") };
+      const newAttemptCount = (clarificationType === "problemDetails" ? clarificationAttemptCount : 0) + 1;
+      setMeta(sessionId, {
+        expectedSlot: "problemDetails",
+        lastIntent: "product_troubleshooting",
+        clarificationType: "problemDetails",
+        clarificationAttemptCount: newAttemptCount,
+      });
+      return {
+        handled: true,
+        reply: buildFollowUpQuestion(lang, "product_usage", "problemDetails", newAttemptCount),
+        clarificationRequired: true,
+        clarificationType: "problemDetails",
+        clarificationAttemptCount: newAttemptCount,
+      };
     }
+  }
+
+  // Reset clarification state if we're not asking for clarification
+  if (clarificationType || clarificationAttemptCount > 0) {
+    setMeta(sessionId, { clarificationType: null, clarificationAttemptCount: 0 });
   }
 
   return { handled: false };
@@ -1570,6 +1774,9 @@ app.post("/chat", async (req, res) => {
     routedTo: "bot",
     escalateReason: null,
     conversationId: null,
+    clarificationRequired: false,
+    clarificationType: null,
+    clarificationAttemptCount: null,
     shopifyLookupAttempted: false,
     shopifyFound: null,
     shopifyError: null,
@@ -1658,7 +1865,8 @@ app.post("/chat", async (req, res) => {
 
       routedTo = "human";
       escalateReason = escalation.hasUrgent ? "urgent" : "angry";
-      
+      // Store escalateReason in meta for conversation_end log
+      setMeta(sessionId, { escalateReason: escalateReason });
       // End conversation with escalation outcome
       endConversation(sessionId, "escalated_to_human");
       
@@ -1667,6 +1875,9 @@ app.post("/chat", async (req, res) => {
         routedTo: "human",
         escalateReason: escalateReason,
         conversationId: conversationId,
+        clarificationRequired: false,
+        clarificationType: null,
+        clarificationAttemptCount: null,
         shopifyLookupAttempted: false,
         shopifyFound: null,
         shopifyError: null,
@@ -1703,15 +1914,30 @@ app.post("/chat", async (req, res) => {
       if (isCatastrophicIssue(message)) {
         routedTo = "human";
         escalateReason = "catastrophic";
+        // Store escalateReason in meta for conversation_end log
+        setMeta(sessionId, { escalateReason: "catastrophic" });
+        // End conversation with escalation outcome
+        endConversation(sessionId, "escalated_to_human");
+      }
+      
+      // Check if escalation due to missing required info
+      if (router.escalateReason === "missing_required_info") {
+        routedTo = "human";
+        escalateReason = "missing_required_info";
+        // Store escalateReason in meta for conversation_end log
+        setMeta(sessionId, { escalateReason: "missing_required_info" });
         // End conversation with escalation outcome
         endConversation(sessionId, "escalated_to_human");
       }
 
       res.locals.chatMetrics = {
         intent: intentRaw,
-        routedTo: routedTo,
-        escalateReason: escalateReason,
+        routedTo: router.escalateReason ? "human" : routedTo,
+        escalateReason: router.escalateReason || escalateReason,
         conversationId: conversationId,
+        clarificationRequired: router.clarificationRequired || false,
+        clarificationType: router.clarificationType || null,
+        clarificationAttemptCount: router.clarificationAttemptCount || null,
         shopifyLookupAttempted: false,
         shopifyFound: null,
         shopifyError: null,
@@ -1727,7 +1953,7 @@ app.post("/chat", async (req, res) => {
         intent: intentRaw,
         shopify: null,
         routed: true,
-        escalated: escalateReason !== null,
+        escalated: (router.escalateReason || escalateReason) !== null,
         facts: getFacts(sessionId),
       });
     }
@@ -1747,6 +1973,9 @@ app.post("/chat", async (req, res) => {
         routedTo: "bot",
         escalateReason: null,
         conversationId: conversationId,
+        clarificationRequired: false,
+        clarificationType: null,
+        clarificationAttemptCount: null,
         shopifyLookupAttempted: false,
         shopifyFound: null,
         shopifyError: null,
@@ -1790,6 +2019,9 @@ app.post("/chat", async (req, res) => {
           routedTo: "bot",
           escalateReason: null,
           conversationId: conversationId,
+          clarificationRequired: false,
+          clarificationType: null,
+          clarificationAttemptCount: null,
           shopifyLookupAttempted: true,
           shopifyFound: false,
           shopifyError: shopifyError,
@@ -1962,6 +2194,9 @@ ${context || "No relevant knowledge matched."}
       routedTo: "bot",
       escalateReason: null,
       conversationId: conversationId,
+      clarificationRequired: false,
+      clarificationType: null,
+      clarificationAttemptCount: null,
       shopifyLookupAttempted: shopifyLookupAttempted,
       shopifyFound: shopifyFound,
       shopifyError: shopifyError,
