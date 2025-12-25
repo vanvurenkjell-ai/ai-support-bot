@@ -92,8 +92,8 @@ function logJson(level, event, fields) {
     };
     console.log(JSON.stringify(logObj));
 
-    // Send to Axiom for request_end and error events only
-    if (event === "request_end" || level === "error") {
+    // Send to Axiom for request_end, conversation_end, and error events
+    if (event === "request_end" || event === "conversation_end" || level === "error") {
       sendEventToAxiom(logObj);
     }
   } catch {
@@ -555,12 +555,78 @@ function buildHistoryMessages(sessionId) {
   return existing ? existing.messages.slice() : [];
 }
 
+// ---- Conversation state tracking ----
+const conversationStateMap = new Map();
+const ABANDON_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
+
+function getOrCreateConversation(sessionId, clientId) {
+  if (!sessionId) return null;
+  
+  let state = conversationStateMap.get(sessionId);
+  if (!state) {
+    state = {
+      conversationId: sessionId, // Use sessionId as conversationId
+      clientId: clientId,
+      sessionId: sessionId,
+      startedAt: Date.now(),
+      lastActivityAt: Date.now(),
+      ended: false,
+      outcome: null,
+      messageCount: 0,
+    };
+    conversationStateMap.set(sessionId, state);
+  }
+  
+  return state;
+}
+
+function updateConversationActivity(sessionId) {
+  if (!sessionId) return;
+  const state = conversationStateMap.get(sessionId);
+  if (state && !state.ended) {
+    state.lastActivityAt = Date.now();
+    state.messageCount = (state.messageCount || 0) + 1;
+  }
+}
+
+function endConversation(sessionId, outcome) {
+  if (!sessionId) return false;
+  const state = conversationStateMap.get(sessionId);
+  if (!state || state.ended) return false;
+  
+  state.ended = true;
+  state.outcome = outcome;
+  const durationMs = Date.now() - state.startedAt;
+  
+  // logJson will send to Axiom for conversation_end events
+  logJson("info", "conversation_end", {
+    conversationId: state.conversationId,
+    clientId: state.clientId,
+    sessionId: state.sessionId,
+    conversationOutcome: outcome,
+    durationMs: durationMs,
+    messageCount: state.messageCount || 0,
+  });
+  
+  return true;
+}
+
 setInterval(() => {
   const now = Date.now();
   for (const [key, val] of sessionStore.entries()) {
     if (!val || now - val.updatedAt > SESSION_TTL_MS) sessionStore.delete(key);
   }
 }, 1000 * 60 * 15);
+
+// Background timer for abandonment detection
+setInterval(() => {
+  const now = Date.now();
+  for (const [sessionId, state] of conversationStateMap.entries()) {
+    if (!state.ended && (now - state.lastActivityAt) > ABANDON_TIMEOUT_MS) {
+      endConversation(sessionId, "abandoned");
+    }
+  }
+}, 60 * 1000); // Check every 60 seconds
 
 // ---- Intent detection ----
 function detectIntent(message) {
@@ -1503,6 +1569,7 @@ app.post("/chat", async (req, res) => {
     intent: null,
     routedTo: "bot",
     escalateReason: null,
+    conversationId: null,
     shopifyLookupAttempted: false,
     shopifyFound: null,
     shopifyError: null,
@@ -1531,6 +1598,11 @@ app.post("/chat", async (req, res) => {
 
     clientId = sanitizeClientId(clientIdRaw);
     sessionId = sanitizeSessionId(req.body.sessionId);
+
+    // Get or create conversation state
+    const convState = getOrCreateConversation(sessionId, clientId);
+    const conversationId = convState ? convState.conversationId : sessionId;
+    updateConversationActivity(sessionId);
 
     const clientEntry = getClientOrNull(clientId);
     if (!clientEntry) {
@@ -1586,10 +1658,15 @@ app.post("/chat", async (req, res) => {
 
       routedTo = "human";
       escalateReason = escalation.hasUrgent ? "urgent" : "angry";
+      
+      // End conversation with escalation outcome
+      endConversation(sessionId, "escalated_to_human");
+      
       res.locals.chatMetrics = {
         intent: { ...intentRaw, mainIntent: "support_escalation" },
         routedTo: "human",
         escalateReason: escalateReason,
+        conversationId: conversationId,
         shopifyLookupAttempted: false,
         shopifyFound: null,
         shopifyError: null,
@@ -1626,12 +1703,15 @@ app.post("/chat", async (req, res) => {
       if (isCatastrophicIssue(message)) {
         routedTo = "human";
         escalateReason = "catastrophic";
+        // End conversation with escalation outcome
+        endConversation(sessionId, "escalated_to_human");
       }
 
       res.locals.chatMetrics = {
         intent: intentRaw,
         routedTo: routedTo,
         escalateReason: escalateReason,
+        conversationId: conversationId,
         shopifyLookupAttempted: false,
         shopifyFound: null,
         shopifyError: null,
@@ -1666,6 +1746,7 @@ app.post("/chat", async (req, res) => {
         intent: effectiveIntent,
         routedTo: "bot",
         escalateReason: null,
+        conversationId: conversationId,
         shopifyLookupAttempted: false,
         shopifyFound: null,
         shopifyError: null,
@@ -1708,6 +1789,7 @@ app.post("/chat", async (req, res) => {
           intent: effectiveIntent,
           routedTo: "bot",
           escalateReason: null,
+          conversationId: conversationId,
           shopifyLookupAttempted: true,
           shopifyFound: false,
           shopifyError: shopifyError,
@@ -1858,10 +1940,28 @@ ${context || "No relevant knowledge matched."}
     const reply = response.choices[0].message.content;
     appendToHistory(sessionId, "assistant", reply);
 
+    // Simple resolution detection: if bot gives a helpful answer without asking follow-up
+    // and conversation has had sufficient exchanges, mark as resolved
+    const currentConvState = conversationStateMap.get(sessionId);
+    if (currentConvState && !currentConvState.ended && currentConvState.messageCount >= 4) {
+      // Check if reply doesn't ask for follow-up (no question marks, no "stuur", "geef", "vertel")
+      const replyLower = reply.toLowerCase();
+      const hasQuestionMark = reply.includes("?");
+      const asksForInput = /\b(stuur|geef|vertel|send|provide|tell|welke|which|wat|what)\b/.test(replyLower);
+      const meta = getMeta(sessionId);
+      const hasExpectedSlot = meta.expectedSlot && meta.expectedSlot.trim();
+      
+      if (!hasQuestionMark && !asksForInput && !hasExpectedSlot) {
+        // Bot appears to have given a final answer
+        endConversation(sessionId, "resolved_by_bot");
+      }
+    }
+
     res.locals.chatMetrics = {
       intent: effectiveIntent,
       routedTo: "bot",
       escalateReason: null,
+      conversationId: conversationId,
       shopifyLookupAttempted: shopifyLookupAttempted,
       shopifyFound: shopifyFound,
       shopifyError: shopifyError,
