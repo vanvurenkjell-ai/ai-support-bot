@@ -1348,20 +1348,237 @@ if (!process.env.OPENAI_API_KEY) {
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ---- Shopify ----
-const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
+// ============================================================================
+// SHOPIFY DOMAIN VALIDATION (SSRF PROTECTION)
+// ============================================================================
+// Strict validation to prevent SSRF attacks via misconfigured domains
+// ============================================================================
+
+// Parse optional allowlist from environment
+function parseAllowedDomains(envValue) {
+  if (!envValue || typeof envValue !== "string") return [];
+  return envValue
+    .split(",")
+    .map(d => d.trim().toLowerCase())
+    .filter(d => d.length > 0);
+}
+
+const SHOPIFY_ALLOWED_DOMAINS = parseAllowedDomains(process.env.SHOPIFY_ALLOWED_DOMAINS);
+
+// Validate Shopify domain (strict, no DNS lookups)
+function validateShopifyDomain(domainString) {
+  if (!domainString || typeof domainString !== "string") {
+    return { valid: false, reason: "domain_missing_or_invalid_type" };
+  }
+
+  // Normalize: trim and lowercase
+  let domain = String(domainString).trim().toLowerCase();
+  if (!domain) {
+    return { valid: false, reason: "domain_empty" };
+  }
+
+  // Reject if contains scheme/protocol
+  if (domain.includes("://") || domain.startsWith("http://") || domain.startsWith("https://")) {
+    return { valid: false, reason: "domain_contains_scheme" };
+  }
+
+  // Reject if contains path, query, or port
+  if (domain.includes("/") || domain.includes("?") || domain.includes("#") || domain.includes(":")) {
+    return { valid: false, reason: "domain_contains_path_query_port" };
+  }
+
+  // Reject if contains illegal characters (only allow alphanumeric, dots, hyphens)
+  if (!/^[a-z0-9.-]+$/.test(domain)) {
+    return { valid: false, reason: "domain_contains_illegal_characters" };
+  }
+
+  // Reject localhost and loopback variants
+  if (domain === "localhost" || domain === "127.0.0.1" || domain === "::1" || domain.startsWith("127.")) {
+    return { valid: false, reason: "domain_is_localhost_or_loopback" };
+  }
+
+  // Reject single-label hosts (no dot, not a valid domain)
+  if (!domain.includes(".")) {
+    return { valid: false, reason: "domain_is_single_label" };
+  }
+
+  // Reject if it's an IP address (IPv4 or IPv6)
+  // IPv4 pattern
+  const ipv4Pattern = /^(\d{1,3}\.){3}\d{1,3}$/;
+  if (ipv4Pattern.test(domain)) {
+    // Check if it's a private IP range
+    const parts = domain.split(".").map(Number);
+    if (
+      parts[0] === 10 || // 10.0.0.0/8
+      (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) || // 172.16.0.0/12
+      (parts[0] === 192 && parts[1] === 168) || // 192.168.0.0/16
+      (parts[0] === 169 && parts[1] === 254) || // 169.254.0.0/16 (link-local)
+      (parts[0] === 127) // 127.0.0.0/8 (loopback)
+    ) {
+      return { valid: false, reason: "domain_is_private_or_link_local_ip" };
+    }
+    // Reject all IP addresses, even public ones (we only want domain names)
+    return { valid: false, reason: "domain_is_ip_address" };
+  }
+
+  // IPv6 pattern (simplified check)
+  if (domain.includes(":") || domain.startsWith("[") || domain === "::1") {
+    return { valid: false, reason: "domain_is_ipv6_or_invalid" };
+  }
+
+  // Check if domain matches *.myshopify.com pattern
+  const isMyshopifyDomain = domain.endsWith(".myshopify.com") || domain === "myshopify.com";
+  
+  // Check if domain is in explicit allowlist
+  const isInAllowlist = SHOPIFY_ALLOWED_DOMAINS.includes(domain);
+
+  // Allow only if it's a myshopify.com subdomain OR in allowlist
+  if (!isMyshopifyDomain && !isInAllowlist) {
+    return { valid: false, reason: "domain_not_myshopify_or_allowlisted" };
+  }
+
+  // Additional safety: ensure myshopify.com domains have at least one subdomain
+  if (isMyshopifyDomain && domain === "myshopify.com") {
+    return { valid: false, reason: "domain_must_be_subdomain_of_myshopify" };
+  }
+
+  return { valid: true, domain: domain };
+}
+
+// Validate and construct safe Shopify base URL
+function buildShopifyBaseUrl(validatedDomain, apiVersion) {
+  // Double-check validation before constructing URL
+  const recheck = validateShopifyDomain(validatedDomain);
+  if (!recheck.valid) {
+    throw new Error(`Shopify domain validation failed: ${recheck.reason}`);
+  }
+
+  // Use URL constructor for safe construction
+  try {
+    const url = new URL(`https://${validatedDomain}/admin/api/${apiVersion}`);
+    // Ensure it's https
+    if (url.protocol !== "https:") {
+      throw new Error("Shopify URL must use HTTPS");
+    }
+    // Ensure hostname matches validated domain
+    if (url.hostname !== validatedDomain) {
+      throw new Error("Shopify URL hostname mismatch");
+    }
+    return url.toString();
+  } catch (e) {
+    throw new Error(`Failed to construct Shopify URL: ${e.message}`);
+  }
+}
+
+// Self-test function (runs in development or on startup)
+function selfTestShopifyDomainValidation() {
+  const testCases = [
+    // Must reject
+    { domain: "http://evil.com", shouldReject: true, reason: "contains scheme" },
+    { domain: "evil.com/path", shouldReject: true, reason: "contains path" },
+    { domain: "localhost", shouldReject: true, reason: "localhost" },
+    { domain: "127.0.0.1", shouldReject: true, reason: "loopback IP" },
+    { domain: "169.254.169.254", shouldReject: true, reason: "link-local IP (AWS metadata)" },
+    { domain: "10.0.0.5", shouldReject: true, reason: "private IP" },
+    { domain: "::1", shouldReject: true, reason: "IPv6 loopback" },
+    { domain: "evilmyshopify.com", shouldReject: true, reason: "not subdomain of myshopify.com" },
+    { domain: "evil.com", shouldReject: true, reason: "not allowlisted" },
+    { domain: "myshopify.com", shouldReject: true, reason: "must be subdomain" },
+    // Must allow
+    { domain: "my-store.myshopify.com", shouldReject: false, reason: "valid myshopify subdomain" },
+  ];
+
+  const results = [];
+  for (const test of testCases) {
+    const result = validateShopifyDomain(test.domain);
+    const passed = test.shouldReject ? !result.valid : result.valid;
+    results.push({
+      domain: test.domain,
+      expected: test.shouldReject ? "reject" : "allow",
+      actual: result.valid ? "allow" : "reject",
+      passed: passed,
+      reason: test.reason,
+      validationReason: result.reason || "valid",
+    });
+  }
+
+  const failures = results.filter(r => !r.passed);
+  if (failures.length > 0) {
+    logJson("error", "shopify_domain_validation_self_test_failed", {
+      failures: failures,
+      timestamp: nowIso(),
+    });
+    return false;
+  }
+
+  logJson("info", "shopify_domain_validation_self_test_passed", {
+    testCount: results.length,
+    timestamp: nowIso(),
+  });
+  return true;
+}
+
+// ---- Shopify Configuration ----
+const SHOPIFY_STORE_DOMAIN_RAW = process.env.SHOPIFY_STORE_DOMAIN;
 const SHOPIFY_API_TOKEN = process.env.SHOPIFY_API_TOKEN;
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-01";
 
 let shopifyClient = null;
-if (SHOPIFY_STORE_DOMAIN && SHOPIFY_API_TOKEN) {
-  shopifyClient = axios.create({
-    baseURL: `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}`,
-    headers: { "X-Shopify-Access-Token": SHOPIFY_API_TOKEN },
-    timeout: 5000,
-  });
+let shopifyDomainValidated = null;
+let shopifyEnabled = false;
+
+// Validate Shopify domain at startup (fail-closed)
+if (SHOPIFY_STORE_DOMAIN_RAW && SHOPIFY_API_TOKEN) {
+  const validation = validateShopifyDomain(SHOPIFY_STORE_DOMAIN_RAW);
+  
+  if (!validation.valid) {
+    // SECURITY: Fail closed - disable Shopify if domain is invalid
+    logJson("error", "shopify_domain_validation_failed", {
+      reason: validation.reason,
+      domain: SHOPIFY_STORE_DOMAIN_RAW ? "[REDACTED]" : null,
+      message: "Shopify order lookup disabled due to invalid domain configuration",
+      timestamp: nowIso(),
+    });
+    shopifyEnabled = false;
+    shopifyClient = null;
+  } else {
+    try {
+      // Build safe base URL
+      const baseURL = buildShopifyBaseUrl(validation.domain, SHOPIFY_API_VERSION);
+      shopifyDomainValidated = validation.domain;
+      shopifyClient = axios.create({
+        baseURL: baseURL,
+        headers: { "X-Shopify-Access-Token": SHOPIFY_API_TOKEN },
+        timeout: 5000,
+      });
+      shopifyEnabled = true;
+      
+      logJson("info", "shopify_client_initialized", {
+        domain: validation.domain,
+        apiVersion: SHOPIFY_API_VERSION,
+        allowlistedDomains: SHOPIFY_ALLOWED_DOMAINS.length > 0 ? SHOPIFY_ALLOWED_DOMAINS.length : 0,
+        timestamp: nowIso(),
+      });
+    } catch (e) {
+      logJson("error", "shopify_client_initialization_failed", {
+        error: e && e.message ? e.message : String(e),
+        timestamp: nowIso(),
+      });
+      shopifyEnabled = false;
+      shopifyClient = null;
+    }
+  }
 } else {
-  console.warn("Shopify env vars missing; order lookup will be disabled until they are set.");
+  logJson("info", "shopify_disabled_missing_env", {
+    hasDomain: Boolean(SHOPIFY_STORE_DOMAIN_RAW),
+    hasToken: Boolean(SHOPIFY_API_TOKEN),
+    timestamp: nowIso(),
+  });
+}
+
+// Run self-tests in development or on startup
+if (process.env.NODE_ENV !== "production" || process.env.RUN_VALIDATION_TESTS === "true") {
+  selfTestShopifyDomainValidation();
 }
 
 function sanitizeOrderNumber(orderNumber) {
@@ -1719,7 +1936,30 @@ function normalizeTrackingLink(trackingUrl, carrier, trackingNumber) {
 
 // ---- Shopify lookup ----
 async function lookupShopifyOrder(orderNumberRaw) {
-  if (!shopifyClient) return null;
+  if (!shopifyClient || !shopifyEnabled) return null;
+
+  // Defense-in-depth: Re-validate domain before request
+  if (!shopifyDomainValidated) {
+    logJson("warn", "shopify_lookup_blocked_no_validated_domain", {
+      timestamp: nowIso(),
+    });
+    return null;
+  }
+
+  // Additional safety check: ensure validated domain hasn't changed
+  const currentDomain = process.env.SHOPIFY_STORE_DOMAIN;
+  if (currentDomain) {
+    const revalidation = validateShopifyDomain(currentDomain);
+    if (!revalidation.valid || revalidation.domain !== shopifyDomainValidated) {
+      logJson("error", "shopify_domain_validation_changed", {
+        previousDomain: shopifyDomainValidated,
+        currentDomain: revalidation.valid ? revalidation.domain : "[INVALID]",
+        reason: revalidation.reason || "domain_changed",
+        timestamp: nowIso(),
+      });
+      return null;
+    }
+  }
 
   const orderNumber = sanitizeOrderNumber(orderNumberRaw);
   if (!orderNumber) return null;
@@ -2999,11 +3239,172 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Internal metrics endpoint (for operators only, not exposed publicly)
-// SECURITY: In production, this should be protected by authentication/IP allowlist
-app.get("/internal/metrics", (req, res) => {
-  // Note: In production, add authentication here
-  // For now, metrics are available but should be protected
+// ============================================================================
+// INTERNAL METRICS AUTHENTICATION MIDDLEWARE
+// ============================================================================
+// Protects /internal/metrics endpoint with API key and optional IP allowlist
+// ============================================================================
+
+// Parse IP allowlist from environment
+function parseIpAllowlist(envValue) {
+  if (!envValue || typeof envValue !== "string") return [];
+  return envValue
+    .split(",")
+    .map(ip => ip.trim())
+    .filter(ip => ip.length > 0);
+}
+
+const INTERNAL_METRICS_API_KEY = process.env.INTERNAL_METRICS_API_KEY;
+const INTERNAL_METRICS_IP_ALLOWLIST = parseIpAllowlist(process.env.INTERNAL_METRICS_IP_ALLOWLIST);
+
+// Check if IP is in allowlist (if allowlist is configured)
+function isIpAllowed(ip) {
+  // If no allowlist configured, skip IP check (API key alone is sufficient)
+  if (INTERNAL_METRICS_IP_ALLOWLIST.length === 0) {
+    return true;
+  }
+  
+  if (!ip || ip === "unknown") {
+    return false;
+  }
+  
+  // Normalize IP (handle IPv6 brackets, etc.)
+  const normalizedIp = String(ip).trim();
+  
+  // Check exact match
+  if (INTERNAL_METRICS_IP_ALLOWLIST.includes(normalizedIp)) {
+    return true;
+  }
+  
+  // Check without brackets for IPv6
+  const withoutBrackets = normalizedIp.replace(/^\[|\]$/g, "");
+  if (INTERNAL_METRICS_IP_ALLOWLIST.includes(withoutBrackets)) {
+    return true;
+  }
+  
+  return false;
+}
+
+// Extract API key from Authorization header
+function extractApiKey(req) {
+  const authHeader = req.headers.authorization || req.headers.Authorization;
+  if (!authHeader || typeof authHeader !== "string") {
+    return null;
+  }
+  
+  // Support "Bearer <key>" format
+  const parts = authHeader.trim().split(/\s+/);
+  if (parts.length === 2 && parts[0].toLowerCase() === "bearer") {
+    return parts[1];
+  }
+  
+  // Also support direct key (for backward compatibility, though Bearer is preferred)
+  if (parts.length === 1) {
+    return parts[0];
+  }
+  
+  return null;
+}
+
+// Authentication middleware for internal metrics endpoint
+function requireInternalMetricsAuth(req, res, next) {
+  const ip = getClientIp(req);
+  const ipHash = hashIpAddress(ip);
+  const requestId = req.requestId || makeRequestId();
+  
+  // Check if API key is configured
+  if (!INTERNAL_METRICS_API_KEY || typeof INTERNAL_METRICS_API_KEY !== "string" || INTERNAL_METRICS_API_KEY.trim().length === 0) {
+    // API key not configured - log security event and deny access
+    logJson("error", "internal_metrics_unauthorized_access", {
+      event: "internal_metrics_unauthorized_access",
+      requestId: requestId,
+      ipHash: ipHash,
+      reason: "api_key_not_configured",
+      timestamp: nowIso(),
+    });
+    
+    res.status(401).json({
+      requestId: requestId,
+      error: "Unauthorized",
+    });
+    return;
+  }
+  
+  // Step 1: Check IP allowlist (if configured) - defense-in-depth
+  if (!isIpAllowed(ip)) {
+    logJson("warn", "internal_metrics_unauthorized_access", {
+      event: "internal_metrics_unauthorized_access",
+      requestId: requestId,
+      ipHash: ipHash,
+      reason: "ip_not_in_allowlist",
+      timestamp: nowIso(),
+    });
+    
+    res.status(401).json({
+      requestId: requestId,
+      error: "Unauthorized",
+    });
+    return;
+  }
+  
+  // Step 2: Validate API key
+  const providedKey = extractApiKey(req);
+  
+  if (!providedKey) {
+    logJson("warn", "internal_metrics_unauthorized_access", {
+      event: "internal_metrics_unauthorized_access",
+      requestId: requestId,
+      ipHash: ipHash,
+      reason: "missing_authorization_header",
+      timestamp: nowIso(),
+    });
+    
+    res.status(401).json({
+      requestId: requestId,
+      error: "Unauthorized",
+    });
+    return;
+  }
+  
+  // Constant-time comparison to prevent timing attacks
+  const expectedKey = INTERNAL_METRICS_API_KEY.trim();
+  const providedKeyTrimmed = providedKey.trim();
+  
+  // Use crypto.timingSafeEqual for constant-time comparison (requires Buffers)
+  let keyMatch = false;
+  try {
+    if (expectedKey.length === providedKeyTrimmed.length) {
+      const expectedBuffer = Buffer.from(expectedKey, 'utf8');
+      const providedBuffer = Buffer.from(providedKeyTrimmed, 'utf8');
+      keyMatch = crypto.timingSafeEqual(expectedBuffer, providedBuffer);
+    }
+  } catch (e) {
+    // If comparison fails for any reason, treat as mismatch
+    keyMatch = false;
+  }
+  
+  if (!keyMatch) {
+    logJson("warn", "internal_metrics_unauthorized_access", {
+      event: "internal_metrics_unauthorized_access",
+      requestId: requestId,
+      ipHash: ipHash,
+      reason: "invalid_api_key",
+      timestamp: nowIso(),
+    });
+    
+    res.status(401).json({
+      requestId: requestId,
+      error: "Unauthorized",
+    });
+    return;
+  }
+  
+  // Authentication successful - proceed to handler
+  next();
+}
+
+// Internal metrics endpoint (for operators only, protected by authentication)
+app.get("/internal/metrics", requireInternalMetricsAuth, (req, res) => {
   const metrics = getInjectionMetrics();
   return res.json({
     requestId: req.requestId,
@@ -4150,7 +4551,8 @@ app.listen(port, () => {
   logJson("info", "boot", {
     version: version,
     port: port,
-    shopifyEnabled: Boolean(shopifyClient),
+    shopifyEnabled: shopifyEnabled,
+    shopifyDomainValidated: shopifyDomainValidated ? true : false,
   });
 });
 
