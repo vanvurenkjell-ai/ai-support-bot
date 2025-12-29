@@ -152,8 +152,70 @@ function isAllowedOrigin(origin) {
   }
 }
 
-// CORS configuration with strict origin validation
-app.use(
+// ============================================================================
+// TEMP DEBUG: Permissive CORS middleware for widget endpoints ONLY
+// ============================================================================
+// TODO: Remove after confirming client-specific origin allowlist config works
+// This bypasses the strict CORS allowlist ONLY for /widget-config, /chat, /health
+// All other routes still use the strict allowlist below
+// ============================================================================
+function widgetCors(req, res, next) {
+  const origin = req.headers.origin || null;
+  
+  // Allow any origin for widget endpoints (temporary debug)
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  } else {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
+  
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Widget-Key, Authorization");
+  res.setHeader("Access-Control-Allow-Credentials", "false");
+  res.setHeader("Vary", "Origin");
+  
+  // Log that bypass is active (safe guard - logJson/nowIso may not be defined yet)
+  try {
+    if (typeof logJson === "function" && typeof nowIso === "function") {
+      logJson("info", "widget_cors_bypass_enabled", {
+        event: "widget_cors_bypass_enabled",
+        path: req.path,
+        origin: origin,
+        requestId: req.requestId || null,
+        timestamp: nowIso(),
+      });
+    }
+  } catch (e) {
+    // Silently ignore if logging functions not available yet
+  }
+  
+  // Handle preflight OPTIONS requests
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  
+  next();
+}
+
+// Register widget routes with permissive CORS BEFORE global strict CORS middleware
+// This ensures widget endpoints bypass the strict allowlist while other routes remain protected
+
+// OPTIONS preflight handlers for widget endpoints
+app.options("/widget-config", widgetCors);
+app.options("/chat", widgetCors);
+app.options("/health", widgetCors);
+
+// ============================================================================
+// CORS configuration with strict origin validation (for all non-widget routes)
+// TEMP DEBUG: Skip widget endpoints - they use widgetCors middleware instead
+// ============================================================================
+app.use((req, res, next) => {
+  // TEMP DEBUG: Skip CORS for widget endpoints (they use widgetCors middleware)
+  if (req.path === "/widget-config" || req.path === "/chat" || req.path === "/health") {
+    return next();
+  }
+  
+  // Apply strict CORS for all other routes
   cors({
     origin: function (origin, callback) {
       // Allow requests with no origin (e.g., mobile apps, Postman, curl)
@@ -200,8 +262,8 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
     exposedHeaders: [],
     maxAge: 86400, // 24 hours
-  })
-);
+  })(req, res, next);
+});
 
 app.use(express.json());
 
@@ -3622,8 +3684,8 @@ app.get("/", (req, res) => {
 });
 
 // SECURITY: /health endpoint - public but safe (no secrets, no PII)
-// CORS: Allowed for all widget client origins (same as widget-config and chat)
-app.get("/health", (req, res) => {
+// TEMP DEBUG: Using widgetCors middleware (permissive) - remove after confirming allowlist config
+app.get("/health", widgetCors, (req, res) => {
   // Only expose safe, non-sensitive information
   const version = process.env.VERSION || process.env.RENDER_GIT_COMMIT || BUILD_VERSION || "unknown";
   // Do NOT expose: API keys, tokens, internal config, git commit hashes (unless intended)
@@ -4023,7 +4085,8 @@ if (typeof requireWidgetAuth !== "function") {
 }
 
 // Widget configuration endpoint (public by default, optional per-client auth)
-app.get("/widget-config", requireWidgetAuth, (req, res) => {
+// TEMP DEBUG: Using widgetCors middleware (permissive) - remove after confirming allowlist config
+app.get("/widget-config", widgetCors, requireWidgetAuth, (req, res) => {
   const clientIdRaw = req.query.client;
   
   if (!clientIdRaw || !String(clientIdRaw).trim()) {
@@ -4073,7 +4136,8 @@ app.get("/widget-config", requireWidgetAuth, (req, res) => {
 });
 
 // Chat endpoint (public by default, optional per-client auth)
-app.post("/chat", requireWidgetAuth, async (req, res) => {
+// TEMP DEBUG: Using widgetCors middleware (permissive) - remove after confirming allowlist config
+app.post("/chat", widgetCors, requireWidgetAuth, async (req, res) => {
   const ip = getClientIp(req);
 
   let clientId = "Advantum";
