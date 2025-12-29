@@ -5091,6 +5091,10 @@ CRITICAL RULES:
   }
 });
 
+// Serve static assets from public/ directory
+// This serves widget.js and other static files at root level (e.g., /widget.js)
+app.use(express.static(path.join(__dirname, "public")));
+
 app.use((req, res) => {
   res.status(404).send("Not Found");
 });
@@ -5108,6 +5112,8 @@ app.listen(port, "0.0.0.0", () => {
     env: process.env.NODE_ENV || "development",
     shopifyEnabled: shopifyEnabled,
     shopifyDomainValidated: shopifyDomainValidated ? true : false,
+    staticAssetsEnabled: true,
+    staticAssetsPath: "/public",
     timestamp: nowIso(),
   });
 });
