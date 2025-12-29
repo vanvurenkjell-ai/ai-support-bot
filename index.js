@@ -10,7 +10,7 @@ const OpenAI = require("openai");
 const axios = require("axios");
 
 const app = express();
-const port = process.env.PORT || 3001;
+const port = Number(process.env.PORT) || 3000;
 
 // Optional: set this in Render env vars to know exactly what version is deployed
 const BUILD_VERSION = process.env.BUILD_VERSION || "dev";
@@ -3802,6 +3802,132 @@ function requireInternalAuth(req, res, next) {
 const requireInternalMetricsAuth = requireInternalAuth;
 
 // ============================================================================
+// WIDGET AUTHENTICATION MIDDLEWARE
+// ============================================================================
+// Per-client optional authentication for widget endpoints
+// If client config has api.publicWidgetKey, validates it
+// If no key configured, allows public access (backward compatible)
+// ============================================================================
+function requireWidgetAuth(req, res, next) {
+  const requestId = req.requestId || makeRequestId();
+  const ip = getClientIp(req);
+  const ipHash = hashIpAddress(ip);
+  
+  // Extract client ID from query (GET) or body (POST)
+  const clientIdRaw = req.query?.client || req.body?.client || null;
+  
+  if (!clientIdRaw || !String(clientIdRaw).trim()) {
+    // Client ID is required for widget endpoints
+    logJson("warn", "widget_auth_blocked", {
+      event: "widget_auth_blocked",
+      requestId: requestId,
+      ipHash: ipHash,
+      reason: "missing_client_id",
+      route: req.path,
+      timestamp: nowIso(),
+    });
+    
+    res.status(400).json({
+      requestId: requestId,
+      error: "missing_client",
+      message: "Client parameter is required",
+    });
+    return;
+  }
+  
+  const clientId = sanitizeClientId(clientIdRaw);
+  const clientEntry = getClientOrNull(clientId);
+  
+  if (!clientEntry) {
+    // Client not found - generic error for security
+    logJson("warn", "widget_auth_blocked", {
+      event: "widget_auth_blocked",
+      requestId: requestId,
+      ipHash: ipHash,
+      reason: "invalid_client",
+      clientId: clientId,
+      route: req.path,
+      timestamp: nowIso(),
+    });
+    
+    res.status(404).json({
+      requestId: requestId,
+      error: "invalid_client",
+      message: "Deze chat is niet juist geconfigureerd. Neem contact op met support.",
+    });
+    return;
+  }
+  
+  // Check if widget authentication is configured for this client
+  const publicWidgetKey = clientEntry.config?.api?.publicWidgetKey;
+  
+  if (!publicWidgetKey || typeof publicWidgetKey !== "string" || publicWidgetKey.trim().length === 0) {
+    // No widget key configured - allow public access (backward compatible)
+    return next();
+  }
+  
+  // Widget key is configured - validate it
+  // Check X-Widget-Key header first, then query parameter as fallback
+  const providedKey = req.headers["x-widget-key"] || req.query?.widgetKey || null;
+  
+  if (!providedKey || typeof providedKey !== "string") {
+    logJson("warn", "widget_auth_blocked", {
+      event: "widget_auth_blocked",
+      requestId: requestId,
+      ipHash: ipHash,
+      reason: "missing_widget_key",
+      clientId: clientId,
+      route: req.path,
+      timestamp: nowIso(),
+    });
+    
+    res.status(401).json({
+      requestId: requestId,
+      error: "Unauthorized",
+      message: "Widget authentication required",
+    });
+    return;
+  }
+  
+  // Constant-time comparison to prevent timing attacks
+  const expectedKey = publicWidgetKey.trim();
+  const providedKeyTrimmed = String(providedKey).trim();
+  
+  let keyMatch = false;
+  try {
+    if (expectedKey.length === providedKeyTrimmed.length) {
+      const expectedBuffer = Buffer.from(expectedKey, 'utf8');
+      const providedBuffer = Buffer.from(providedKeyTrimmed, 'utf8');
+      keyMatch = crypto.timingSafeEqual(expectedBuffer, providedBuffer);
+    }
+  } catch (e) {
+    keyMatch = false;
+  }
+  
+  if (!keyMatch) {
+    logJson("warn", "widget_auth_blocked", {
+      event: "widget_auth_blocked",
+      requestId: requestId,
+      ipHash: ipHash,
+      reason: "invalid_widget_key",
+      clientId: clientId,
+      route: req.path,
+      timestamp: nowIso(),
+    });
+    
+    res.status(401).json({
+      requestId: requestId,
+      error: "Unauthorized",
+      message: "Invalid widget key",
+    });
+    return;
+  }
+  
+  // Authentication successful - proceed to handler
+  next();
+}
+
+// ============================================================================
 // PROTECT ALL /internal/* ROUTES
 // ============================================================================
 // Global middleware ensures all /internal/* routes are protected
@@ -3860,6 +3986,24 @@ function rateLimitWidgetConfig(req, res, next) {
 }
 
 app.use(rateLimitWidgetConfig);
+
+// ============================================================================
+// STARTUP VALIDATION: Widget Auth Middleware
+// ============================================================================
+// Fail-closed validation: ensure requireWidgetAuth is defined before use
+// This prevents runtime crashes and ensures security middleware is loaded
+// ============================================================================
+if (typeof requireWidgetAuth !== "function") {
+  const errorMsg = "SEC-BOOT: Widget auth enabled but requireWidgetAuth middleware missing/invalid. Refusing to start.";
+  logJson("error", "startup_validation_failed", {
+    event: "startup_validation_failed",
+    component: "requireWidgetAuth",
+    error: errorMsg,
+    timestamp: nowIso(),
+  });
+  console.error(errorMsg);
+  process.exit(1);
+}
 
 // Widget configuration endpoint (public by default, optional per-client auth)
 app.get("/widget-config", requireWidgetAuth, (req, res) => {
@@ -4954,13 +5098,17 @@ app.use((req, res) => {
 // Initialize client registry on startup
 initializeClientRegistry();
 
-app.listen(port, () => {
+// Start server - bind to 0.0.0.0 for Render compatibility
+app.listen(port, "0.0.0.0", () => {
   const version = process.env.VERSION || process.env.RENDER_GIT_COMMIT || BUILD_VERSION || "unknown";
-  logJson("info", "boot", {
+  logJson("info", "server_listening", {
+    event: "server_listening",
     version: version,
     port: port,
+    env: process.env.NODE_ENV || "development",
     shopifyEnabled: shopifyEnabled,
     shopifyDomainValidated: shopifyDomainValidated ? true : false,
+    timestamp: nowIso(),
   });
 });
 
