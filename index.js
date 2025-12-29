@@ -430,7 +430,8 @@ app.get("/widget.js", (req, res) => {
       const existing = results.find(r => r.exists);
       
       if (!existing) {
-        // Neither file exists - return 404
+        // Neither file exists - return 404 (plain text, not JSON)
+        res.status(404).type("text/plain").send("Not Found");
         logJson("warn", "widget_served", {
           event: "widget_served",
           requestId: requestId,
@@ -438,7 +439,15 @@ app.get("/widget.js", (req, res) => {
           widgetPath: null,
           timestamp: nowIso(),
         });
-        res.status(404).send("Not Found");
+        // Log response headers for debugging
+        logJson("info", "widget_response_headers", {
+          event: "widget_response_headers",
+          requestId: requestId,
+          status: 404,
+          contentType: res.getHeader("Content-Type"),
+          servedFrom: "missing",
+          timestamp: nowIso(),
+        });
         return;
       }
       
@@ -450,12 +459,25 @@ app.get("/widget.js", (req, res) => {
         .then((stats) => {
           const fileSize = stats.size;
           
-          // Set headers (ensure served as JavaScript, not HTML)
+          // Set status and Content-Type FIRST (before streaming)
+          // Explicitly set Content-Type with charset to ensure Safari accepts it
+          res.status(200);
           res.setHeader("Content-Type", "application/javascript; charset=utf-8");
-          res.setHeader("X-Content-Type-Options", "nosniff");
           res.setHeader("Cache-Control", "no-store");
           res.setHeader("Content-Length", fileSize);
-          res.status(200);
+          // NOTE: X-Content-Type-Options: nosniff is set by global security middleware (line 195)
+          // We explicitly set correct Content-Type above, so nosniff is safe
+          
+          // Log response headers for verification
+          logJson("info", "widget_response_headers", {
+            event: "widget_response_headers",
+            requestId: requestId,
+            status: 200,
+            contentType: res.getHeader("Content-Type"),
+            servedFrom: servedFrom,
+            widgetPath: widgetPath,
+            timestamp: nowIso(),
+          });
           
           // Stream the file
           const stream = fs.createReadStream(widgetPath);
@@ -473,7 +495,8 @@ app.get("/widget.js", (req, res) => {
                 servedFrom: servedFrom,
                 timestamp: nowIso(),
               });
-              res.status(500).send("// Widget file read error");
+              // Send plain text error (not JSON, not HTML)
+              res.status(500).type("text/plain").send("// Widget file read error");
             }
           });
           
@@ -508,7 +531,8 @@ app.get("/widget.js", (req, res) => {
         timestamp: nowIso(),
       });
       if (!res.headersSent) {
-        res.status(500).send("// Widget file not available");
+        // Send plain text error (not JSON, not HTML)
+        res.status(500).type("text/plain").send("// Widget file not available");
       }
     });
 });
