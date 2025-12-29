@@ -414,111 +414,100 @@ app.use((req, res, next) => {
 // ============================================================================
 app.get("/widget.js", (req, res) => {
   const requestId = req.requestId || makeRequestId();
-  const publicDir = path.resolve(process.cwd(), "public");
-  const widgetPath = path.join(publicDir, "widget.js");
   
-  // Log request received
-  logJson("info", "widget_request", {
-    event: "widget_request",
-    requestId: requestId,
-    url: req.url,
-    cwd: process.cwd(),
-    widgetPath: widgetPath,
-    timestamp: nowIso(),
-  });
+  // Try two possible paths: public/widget.js first, then root/widget.js
+  const candidateA = path.resolve(process.cwd(), "public", "widget.js");
+  const candidateB = path.resolve(process.cwd(), "widget.js");
   
-  // Use fs.promises.stat to check if file exists and get size
-  fs.promises.stat(widgetPath)
-    .then((stats) => {
-      // File exists and is readable
-      const fileSize = stats.size;
+  // Check which file exists (first existing file wins, prefer public/widget.js over root/widget.js)
+  Promise.all([
+    fs.promises.stat(candidateA).then(() => ({ path: candidateA, source: "public/widget.js", exists: true })).catch(() => ({ path: candidateA, source: "public/widget.js", exists: false })),
+    fs.promises.stat(candidateB).then(() => ({ path: candidateB, source: "root/widget.js", exists: true })).catch(() => ({ path: candidateB, source: "root/widget.js", exists: false }))
+  ])
+    .then((results) => {
+      // Find first existing file (results[0] = candidateA, results[1] = candidateB)
+      // Prefer public/widget.js (candidateA) if both exist
+      const existing = results.find(r => r.exists);
       
-      // Set headers (ensure served as JavaScript, not HTML)
-      res.setHeader("Content-Type", "application/javascript; charset=utf-8");
-      res.setHeader("X-Content-Type-Options", "nosniff");
-      res.setHeader("Cache-Control", "no-store"); // Temporary for debugging
-      res.setHeader("Content-Length", fileSize);
-      res.status(200);
-      
-      // Stream the file
-      const stream = fs.createReadStream(widgetPath);
-      
-      // Handle stream errors
-      stream.on("error", (err) => {
-        // Only log if response hasn't been sent
-        if (!res.headersSent) {
-          logJson("error", "widget_serve_failed", {
-            event: "widget_serve_failed",
-            requestId: requestId,
-            error: err.message || String(err),
-            errorCode: err.code || null,
-            widgetPath: widgetPath,
-            cwd: process.cwd(),
-            timestamp: nowIso(),
-          });
-          res.status(500).send("// Widget file read error");
-        }
-      });
-      
-      // Handle client disconnect
-      req.on("close", () => {
-        stream.destroy();
-      });
-      
-      // Pipe to response
-      stream.pipe(res);
-      
-      // Log success when stream finishes
-      stream.on("end", () => {
-        // Sanity check: verify first bytes are JavaScript (not HTML error page)
-        if (process.env.DEBUG_WIDGET === "1" || process.env.NODE_ENV !== "production") {
-          fs.readFile(widgetPath, "utf8", (err, content) => {
-            if (!err && content) {
-              const first50 = content.substring(0, 50).replace(/\n/g, "\\n");
-              logJson("info", "widget_serve_debug", {
-                event: "widget_serve_debug",
-                requestId: requestId,
-                bytes: fileSize,
-                first50chars: first50,
-                timestamp: nowIso(),
-              });
-            }
-          });
-        }
-        logJson("info", "widget_served", {
+      if (!existing) {
+        // Neither file exists - return 404
+        logJson("warn", "widget_served", {
           event: "widget_served",
           requestId: requestId,
-          bytes: fileSize,
-          widgetPath: widgetPath,
-          timestamp: nowIso(),
-        });
-      });
-    })
-    .catch((err) => {
-      // File doesn't exist or can't be accessed
-      if (err.code === "ENOENT") {
-        // File not found - return 404
-        logJson("warn", "widget_serve_failed", {
-          event: "widget_serve_failed",
-          requestId: requestId,
-          error: "File not found",
-          errorCode: "ENOENT",
-          widgetPath: widgetPath,
-          cwd: process.cwd(),
+          servedFrom: "missing",
+          widgetPath: null,
           timestamp: nowIso(),
         });
         res.status(404).send("Not Found");
-      } else {
-        // Other error - return 500
-        logJson("error", "widget_serve_failed", {
-          event: "widget_serve_failed",
-          requestId: requestId,
-          error: err.message || String(err),
-          errorCode: err.code || null,
-          widgetPath: widgetPath,
-          cwd: process.cwd(),
-          timestamp: nowIso(),
+        return;
+      }
+      
+      const widgetPath = existing.path;
+      const servedFrom = existing.source;
+      
+      // File exists - get size and stream it
+      return fs.promises.stat(widgetPath)
+        .then((stats) => {
+          const fileSize = stats.size;
+          
+          // Set headers (ensure served as JavaScript, not HTML)
+          res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+          res.setHeader("X-Content-Type-Options", "nosniff");
+          res.setHeader("Cache-Control", "no-store");
+          res.setHeader("Content-Length", fileSize);
+          res.status(200);
+          
+          // Stream the file
+          const stream = fs.createReadStream(widgetPath);
+          
+          // Handle stream errors
+          stream.on("error", (err) => {
+            // Only log if response hasn't been sent
+            if (!res.headersSent) {
+              logJson("error", "widget_serve_failed", {
+                event: "widget_serve_failed",
+                requestId: requestId,
+                error: err.message || String(err),
+                errorCode: err.code || null,
+                widgetPath: widgetPath,
+                servedFrom: servedFrom,
+                timestamp: nowIso(),
+              });
+              res.status(500).send("// Widget file read error");
+            }
+          });
+          
+          // Handle client disconnect
+          req.on("close", () => {
+            stream.destroy();
+          });
+          
+          // Pipe to response
+          stream.pipe(res);
+          
+          // Log success when stream finishes
+          stream.on("end", () => {
+            logJson("info", "widget_served", {
+              event: "widget_served",
+              requestId: requestId,
+              servedFrom: servedFrom,
+              widgetPath: widgetPath,
+              bytes: fileSize,
+              timestamp: nowIso(),
+            });
+          });
         });
+    })
+    .catch((err) => {
+      // Unexpected error during file check
+      logJson("error", "widget_serve_failed", {
+        event: "widget_serve_failed",
+        requestId: requestId,
+        error: err.message || String(err),
+        errorCode: err.code || null,
+        timestamp: nowIso(),
+      });
+      if (!res.headersSent) {
         res.status(500).send("// Widget file not available");
       }
     });
