@@ -433,8 +433,9 @@ app.get("/widget.js", (req, res) => {
       // File exists and is readable
       const fileSize = stats.size;
       
-      // Set headers
+      // Set headers (ensure served as JavaScript, not HTML)
       res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+      res.setHeader("X-Content-Type-Options", "nosniff");
       res.setHeader("Cache-Control", "no-store"); // Temporary for debugging
       res.setHeader("Content-Length", fileSize);
       res.status(200);
@@ -469,6 +470,21 @@ app.get("/widget.js", (req, res) => {
       
       // Log success when stream finishes
       stream.on("end", () => {
+        // Sanity check: verify first bytes are JavaScript (not HTML error page)
+        if (process.env.DEBUG_WIDGET === "1" || process.env.NODE_ENV !== "production") {
+          fs.readFile(widgetPath, "utf8", (err, content) => {
+            if (!err && content) {
+              const first50 = content.substring(0, 50).replace(/\n/g, "\\n");
+              logJson("info", "widget_serve_debug", {
+                event: "widget_serve_debug",
+                requestId: requestId,
+                bytes: fileSize,
+                first50chars: first50,
+                timestamp: nowIso(),
+              });
+            }
+          });
+        }
         logJson("info", "widget_served", {
           event: "widget_served",
           requestId: requestId,
