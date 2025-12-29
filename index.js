@@ -2736,6 +2736,17 @@ function normalizeClientConfig(rawCfg, clientId) {
     };
   }
 
+  // API config (optional widget authentication)
+  if (rawCfg.api && typeof rawCfg.api === "object") {
+    normalized.api = {
+      publicWidgetKey: rawCfg.api.publicWidgetKey ? String(rawCfg.api.publicWidgetKey).trim() : null,
+    };
+  } else {
+    normalized.api = {
+      publicWidgetKey: null, // No widget key = public endpoint (backward compatible)
+    };
+  }
+
   return normalized;
 }
 
@@ -3569,17 +3580,42 @@ function buildOrderNotFoundReply(clientConfig, clientId, orderNumber) {
 }
 
 // ---- Routes ----
+// ============================================================================
+// ENDPOINT CLASSIFICATION & AUTHENTICATION STRATEGY
+// ============================================================================
+//
+// PUBLIC ENDPOINTS (no authentication required):
+//   - GET  /              : Root endpoint (status check)
+//   - GET  /health        : Health check (safe for public, no secrets)
+//   - POST /chat          : Widget chat endpoint (public by default, optional per-client key)
+//   - GET  /widget-config : Widget configuration (public by default, optional per-client key)
+//
+// PROTECTED ENDPOINTS (operator-only, require INTERNAL_API_KEY):
+//   - GET  /internal/*    : All internal endpoints (metrics, monitoring, etc.)
+//   - Any route under /internal/* MUST be protected
+//
+// WIDGET ENDPOINTS (optional per-client API key):
+//   - POST /chat          : Can require X-Widget-Key header if client has publicWidgetKey configured
+//   - GET  /widget-config : Can require X-Widget-Key header if client has publicWidgetKey configured
+//   - If client does NOT have publicWidgetKey: endpoints remain public (backward compatible)
+//
+// ============================================================================
+
 app.get("/", (req, res) => {
   return res.json({ ok: true, message: "AI support backend running.", requestId: req.requestId, status: "ok" });
 });
 
+// SECURITY: /health endpoint - public but safe (no secrets, no PII)
 app.get("/health", (req, res) => {
+  // Only expose safe, non-sensitive information
   const version = process.env.VERSION || process.env.RENDER_GIT_COMMIT || BUILD_VERSION || "unknown";
+  // Do NOT expose: API keys, tokens, internal config, git commit hashes (unless intended)
+  // Only expose: status, uptime, version (if safe), timestamp
   return res.json({
     status: "ok",
     requestId: req.requestId,
     uptimeSec: Math.round(process.uptime()),
-    version: version,
+    version: version, // Safe to expose (build version)
     timestamp: nowIso(),
   });
 });
@@ -3599,13 +3635,19 @@ function parseIpAllowlist(envValue) {
     .filter(ip => ip.length > 0);
 }
 
-const INTERNAL_METRICS_API_KEY = process.env.INTERNAL_METRICS_API_KEY;
-const INTERNAL_METRICS_IP_ALLOWLIST = parseIpAllowlist(process.env.INTERNAL_METRICS_IP_ALLOWLIST);
+// ============================================================================
+// INTERNAL ENDPOINT AUTHENTICATION
+// ============================================================================
+// Generalizes internal auth for all /internal/* routes
+// ============================================================================
+
+const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || process.env.INTERNAL_METRICS_API_KEY; // Support both names for backward compatibility
+const INTERNAL_IP_ALLOWLIST = parseIpAllowlist(process.env.INTERNAL_IP_ALLOWLIST || process.env.INTERNAL_METRICS_IP_ALLOWLIST);
 
 // Check if IP is in allowlist (if allowlist is configured)
-function isIpAllowed(ip) {
+function isIpAllowed(ip, allowlist) {
   // If no allowlist configured, skip IP check (API key alone is sufficient)
-  if (INTERNAL_METRICS_IP_ALLOWLIST.length === 0) {
+  if (!allowlist || allowlist.length === 0) {
     return true;
   }
   
@@ -3617,13 +3659,13 @@ function isIpAllowed(ip) {
   const normalizedIp = String(ip).trim();
   
   // Check exact match
-  if (INTERNAL_METRICS_IP_ALLOWLIST.includes(normalizedIp)) {
+  if (allowlist.includes(normalizedIp)) {
     return true;
   }
   
   // Check without brackets for IPv6
   const withoutBrackets = normalizedIp.replace(/^\[|\]$/g, "");
-  if (INTERNAL_METRICS_IP_ALLOWLIST.includes(withoutBrackets)) {
+  if (allowlist.includes(withoutBrackets)) {
     return true;
   }
   
@@ -3651,20 +3693,22 @@ function extractApiKey(req) {
   return null;
 }
 
-// Authentication middleware for internal metrics endpoint
-function requireInternalMetricsAuth(req, res, next) {
+// Generalized authentication middleware for all /internal/* endpoints
+function requireInternalAuth(req, res, next) {
   const ip = getClientIp(req);
   const ipHash = hashIpAddress(ip);
   const requestId = req.requestId || makeRequestId();
   
   // Check if API key is configured
-  if (!INTERNAL_METRICS_API_KEY || typeof INTERNAL_METRICS_API_KEY !== "string" || INTERNAL_METRICS_API_KEY.trim().length === 0) {
+  if (!INTERNAL_API_KEY || typeof INTERNAL_API_KEY !== "string" || INTERNAL_API_KEY.trim().length === 0) {
     // API key not configured - log security event and deny access
-    logJson("error", "internal_metrics_unauthorized_access", {
-      event: "internal_metrics_unauthorized_access",
+    logJson("error", "auth_blocked", {
+      event: "auth_blocked",
+      scope: "internal",
       requestId: requestId,
       ipHash: ipHash,
       reason: "api_key_not_configured",
+      route: req.path,
       timestamp: nowIso(),
     });
     
@@ -3676,12 +3720,14 @@ function requireInternalMetricsAuth(req, res, next) {
   }
   
   // Step 1: Check IP allowlist (if configured) - defense-in-depth
-  if (!isIpAllowed(ip)) {
-    logJson("warn", "internal_metrics_unauthorized_access", {
-      event: "internal_metrics_unauthorized_access",
+  if (!isIpAllowed(ip, INTERNAL_IP_ALLOWLIST)) {
+    logJson("warn", "auth_blocked", {
+      event: "auth_blocked",
+      scope: "internal",
       requestId: requestId,
       ipHash: ipHash,
       reason: "ip_not_in_allowlist",
+      route: req.path,
       timestamp: nowIso(),
     });
     
@@ -3696,11 +3742,13 @@ function requireInternalMetricsAuth(req, res, next) {
   const providedKey = extractApiKey(req);
   
   if (!providedKey) {
-    logJson("warn", "internal_metrics_unauthorized_access", {
-      event: "internal_metrics_unauthorized_access",
+    logJson("warn", "auth_blocked", {
+      event: "auth_blocked",
+      scope: "internal",
       requestId: requestId,
       ipHash: ipHash,
       reason: "missing_authorization_header",
+      route: req.path,
       timestamp: nowIso(),
     });
     
@@ -3712,7 +3760,7 @@ function requireInternalMetricsAuth(req, res, next) {
   }
   
   // Constant-time comparison to prevent timing attacks
-  const expectedKey = INTERNAL_METRICS_API_KEY.trim();
+  const expectedKey = INTERNAL_API_KEY.trim();
   const providedKeyTrimmed = providedKey.trim();
   
   // Use crypto.timingSafeEqual for constant-time comparison (requires Buffers)
@@ -3729,11 +3777,13 @@ function requireInternalMetricsAuth(req, res, next) {
   }
   
   if (!keyMatch) {
-    logJson("warn", "internal_metrics_unauthorized_access", {
-      event: "internal_metrics_unauthorized_access",
+    logJson("warn", "auth_blocked", {
+      event: "auth_blocked",
+      scope: "internal",
       requestId: requestId,
       ipHash: ipHash,
       reason: "invalid_api_key",
+      route: req.path,
       timestamp: nowIso(),
     });
     
@@ -3748,8 +3798,19 @@ function requireInternalMetricsAuth(req, res, next) {
   next();
 }
 
+// Backward compatibility alias
+const requireInternalMetricsAuth = requireInternalAuth;
+
+// ============================================================================
+// PROTECT ALL /internal/* ROUTES
+// ============================================================================
+// Global middleware ensures all /internal/* routes are protected
+// This prevents accidentally exposing internal endpoints
+// ============================================================================
+app.use("/internal", requireInternalAuth);
+
 // Internal metrics endpoint (for operators only, protected by authentication)
-app.get("/internal/metrics", requireInternalMetricsAuth, (req, res) => {
+app.get("/internal/metrics", (req, res) => {
   const metrics = getInjectionMetrics();
   return res.json({
     requestId: req.requestId,
@@ -3800,7 +3861,8 @@ function rateLimitWidgetConfig(req, res, next) {
 
 app.use(rateLimitWidgetConfig);
 
-app.get("/widget-config", (req, res) => {
+// Widget configuration endpoint (public by default, optional per-client auth)
+app.get("/widget-config", requireWidgetAuth, (req, res) => {
   const clientIdRaw = req.query.client;
   
   if (!clientIdRaw || !String(clientIdRaw).trim()) {
@@ -3849,7 +3911,8 @@ app.get("/widget-config", (req, res) => {
   }
 });
 
-app.post("/chat", async (req, res) => {
+// Chat endpoint (public by default, optional per-client auth)
+app.post("/chat", requireWidgetAuth, async (req, res) => {
   const ip = getClientIp(req);
 
   let clientId = "Advantum";
