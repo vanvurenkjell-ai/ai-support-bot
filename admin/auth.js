@@ -41,7 +41,7 @@ const sessionConfig = {
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production", // Secure cookies in production (HTTPS only)
+    secure: "auto", // Automatically detect HTTPS (works with Render proxy when trust proxy is set)
     sameSite: "lax", // CSRF protection: lax for GET requests, stricter for POST
     maxAge: 1000 * 60 * 60 * 24, // 24 hours
     path: "/admin", // Cookie only sent for /admin routes
@@ -70,7 +70,7 @@ function logAdminEvent(level, event, fields) {
 
 // Authentication middleware: require admin session
 function requireAdminAuth(req, res, next) {
-  if (!req.session || !req.session.adminAuthenticated || req.session.adminEmail !== ADMIN_EMAIL) {
+  if (!req.session || !req.session.admin || !req.session.admin.email || req.session.admin.email !== ADMIN_EMAIL) {
     // Log unauthorized access attempt
     const requestId = req.requestId || "unknown";
     const ip = req.ip || "unknown"; // req.ip is set by trust proxy setting in index.js

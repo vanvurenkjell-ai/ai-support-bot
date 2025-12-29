@@ -85,18 +85,23 @@ function adminSecurityHeaders(req, res, next) {
 // Apply security headers to all admin routes
 router.use(adminSecurityHeaders);
 
-// Login page (GET /admin/login)
-router.get("/login", (req, res) => {
-  // If already authenticated, redirect to admin dashboard
-  if (req.session?.adminAuthenticated && req.session?.adminEmail === ADMIN_EMAIL) {
-    return res.redirect("/admin");
-  }
+// Helper function to escape HTML (XSS protection)
+function escapeHtml(text) {
+  if (!text) return "";
+  const map = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#039;",
+  };
+  return String(text).replace(/[&<>"']/g, (m) => map[m]);
+}
 
-  // Generate CSRF token for login form
-  const csrfToken = generateCsrfToken();
-  setCsrfToken(req, csrfToken);
-
-  const html = `
+// Helper function to render login page with optional error message
+function renderLoginPage(csrfToken, errorMessage = null) {
+  const errorHtml = errorMessage ? `<p style="color: red;">${escapeHtml(errorMessage)}</p>` : "";
+  return `
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -106,6 +111,7 @@ router.get("/login", (req, res) => {
 </head>
 <body>
   <h1>Admin Login</h1>
+  ${errorHtml}
   <form method="POST" action="/admin/login">
     <input type="hidden" name="csrfToken" value="${csrfToken}">
     <div>
@@ -121,7 +127,20 @@ router.get("/login", (req, res) => {
 </body>
 </html>
   `;
-  res.send(html);
+}
+
+// Login page (GET /admin/login)
+router.get("/login", (req, res) => {
+  // If already authenticated, redirect to admin dashboard
+  if (req.session?.admin && req.session.admin.email === ADMIN_EMAIL) {
+    return res.redirect("/admin");
+  }
+
+  // Generate CSRF token for login form
+  const csrfToken = generateCsrfToken();
+  setCsrfToken(req, csrfToken);
+
+  res.send(renderLoginPage(csrfToken));
 });
 
 // Login handler (POST /admin/login)
@@ -130,6 +149,10 @@ router.post("/login", rateLimitLogin, requireCsrf, async (req, res) => {
   const ip = getClientIp(req);
   const { email, password } = req.body || {};
 
+  // Generate CSRF token for error page
+  const csrfToken = generateCsrfToken();
+  setCsrfToken(req, csrfToken);
+
   if (!email || !password) {
     // Log failed login attempt (no password)
     logAdminEvent("warn", "admin_login_failed", {
@@ -137,58 +160,63 @@ router.post("/login", rateLimitLogin, requireCsrf, async (req, res) => {
       ip: ip,
       reason: "missing_credentials",
     });
-    return res.status(400).json({
-      error: "Bad Request",
-      message: "Email and password are required",
-    });
+    return res.status(400).send(renderLoginPage(csrfToken, "Email and password are required"));
   }
 
   // Verify credentials
   if (!verifyAdminCredentials(email, password)) {
-    // Log failed login attempt (no password)
+    // Log failed login attempt (no password) - use generic message for user
     logAdminEvent("warn", "admin_login_failed", {
       requestId: requestId,
       ip: ip,
       email: email,
       reason: "invalid_credentials",
     });
-    return res.status(401).json({
-      error: "Unauthorized",
-      message: "Invalid email or password",
-    });
+    return res.status(401).send(renderLoginPage(csrfToken, "Invalid email or password"));
   }
 
   try {
     // Regenerate session to prevent session fixation
     await regenerateSession(req);
 
-    // Set authenticated session
-    req.session.adminAuthenticated = true;
-    req.session.adminEmail = ADMIN_EMAIL;
+    // Set authenticated session with structured data
+    req.session.admin = {
+      email: ADMIN_EMAIL,
+      loggedInAt: Date.now(),
+    };
 
     // Generate new CSRF token for subsequent requests
-    const csrfToken = generateCsrfToken();
-    setCsrfToken(req, csrfToken);
+    const newCsrfToken = generateCsrfToken();
+    setCsrfToken(req, newCsrfToken);
 
-    // Log successful login
-    logAdminEvent("info", "admin_login_success", {
-      requestId: requestId,
-      ip: ip,
-      email: ADMIN_EMAIL,
+    // Explicitly save session before redirecting
+    req.session.save((err) => {
+      if (err) {
+        logAdminEvent("error", "admin_login_error", {
+          requestId: requestId,
+          ip: ip,
+          error: err?.message || String(err),
+        });
+        return res.status(500).send(renderLoginPage(csrfToken, "Login failed. Please try again."));
+      }
+
+      // Log successful login
+      logAdminEvent("info", "admin_login_success", {
+        requestId: requestId,
+        ip: ip,
+        email: ADMIN_EMAIL,
+      });
+
+      // Redirect to admin dashboard after session is saved
+      return res.redirect("/admin");
     });
-
-    // Redirect to admin dashboard
-    return res.redirect("/admin");
   } catch (error) {
     logAdminEvent("error", "admin_login_error", {
       requestId: requestId,
       ip: ip,
       error: error?.message || String(error),
     });
-    return res.status(500).json({
-      error: "Internal Server Error",
-      message: "Login failed",
-    });
+    return res.status(500).send(renderLoginPage(csrfToken, "Login failed. Please try again."));
   }
 });
 
@@ -196,12 +224,13 @@ router.post("/login", rateLimitLogin, requireCsrf, async (req, res) => {
 router.post("/logout", requireAdminAuth, requireCsrf, (req, res) => {
   const requestId = req.requestId || "unknown";
   const ip = getClientIp(req);
+  const adminEmail = req.session?.admin?.email || "unknown";
 
   // Log logout
   logAdminEvent("info", "admin_logout", {
     requestId: requestId,
     ip: ip,
-    email: req.session?.adminEmail || "unknown",
+    email: adminEmail,
   });
 
   // Destroy session
@@ -222,7 +251,7 @@ router.get("/", requireAdminAuth, (req, res) => {
   const csrfToken = generateCsrfToken();
   setCsrfToken(req, csrfToken);
 
-  const adminEmail = req.session?.adminEmail || ADMIN_EMAIL;
+  const adminEmail = req.session?.admin?.email || ADMIN_EMAIL;
   const html = `
 <!DOCTYPE html>
 <html lang="en">
@@ -249,23 +278,10 @@ router.get("/health", requireAdminAuth, (req, res) => {
   return res.json({
     status: "ok",
     authenticated: true,
-    email: req.session?.adminEmail || ADMIN_EMAIL,
+    email: req.session?.admin?.email || ADMIN_EMAIL,
     timestamp: new Date().toISOString(),
   });
 });
-
-// Helper function to escape HTML (XSS protection)
-function escapeHtml(text) {
-  if (!text) return "";
-  const map = {
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#039;",
-  };
-  return String(text).replace(/[&<>"']/g, (m) => map[m]);
-}
 
 module.exports = router;
 
