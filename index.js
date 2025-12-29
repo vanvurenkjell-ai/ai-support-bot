@@ -5092,8 +5092,38 @@ CRITICAL RULES:
 });
 
 // Serve static assets from public/ directory
-// This serves widget.js and other static files at root level (e.g., /widget.js)
-app.use(express.static(path.join(__dirname, "public")));
+// Use process.cwd() for production compatibility (runtime root = repo root, no Backend folder)
+const publicDir = path.resolve(process.cwd(), "public");
+app.use(express.static(publicDir));
+
+// Fallback route for /widget.js to guarantee delivery even if static middleware fails
+app.get("/widget.js", (req, res) => {
+  try {
+    const widgetPath = path.join(publicDir, "widget.js");
+    res.sendFile(widgetPath, (err) => {
+      if (err) {
+        logJson("error", "widget_serve_failed", {
+          event: "widget_serve_failed",
+          error: err.message || String(err),
+          widgetPath: widgetPath,
+          publicDir: publicDir,
+          cwd: process.cwd(),
+          timestamp: nowIso(),
+        });
+        res.status(500).send("// Widget file not available");
+      }
+    });
+  } catch (e) {
+    logJson("error", "widget_serve_failed", {
+      event: "widget_serve_failed",
+      error: e && e.message ? e.message : String(e),
+      publicDir: publicDir,
+      cwd: process.cwd(),
+      timestamp: nowIso(),
+    });
+    res.status(500).send("// Widget file not available");
+  }
+});
 
 app.use((req, res) => {
   res.status(404).send("Not Found");
@@ -5105,6 +5135,26 @@ initializeClientRegistry();
 // Start server - bind to 0.0.0.0 for Render compatibility
 app.listen(port, "0.0.0.0", () => {
   const version = process.env.VERSION || process.env.RENDER_GIT_COMMIT || BUILD_VERSION || "unknown";
+  
+  // Verify widget.js exists and log static asset status
+  const widgetPath = path.join(publicDir, "widget.js");
+  const widgetExists = (() => {
+    try {
+      return fs.existsSync(widgetPath);
+    } catch (e) {
+      return false;
+    }
+  })();
+  
+  logJson("info", "static_widget_ready", {
+    event: "static_widget_ready",
+    publicDir: publicDir,
+    widgetPath: widgetPath,
+    widgetExists: widgetExists,
+    cwd: process.cwd(),
+    timestamp: nowIso(),
+  });
+  
   logJson("info", "server_listening", {
     event: "server_listening",
     version: version,
@@ -5113,7 +5163,8 @@ app.listen(port, "0.0.0.0", () => {
     shopifyEnabled: shopifyEnabled,
     shopifyDomainValidated: shopifyDomainValidated ? true : false,
     staticAssetsEnabled: true,
-    staticAssetsPath: "/public",
+    staticAssetsPath: publicDir,
+    widgetExists: widgetExists,
     timestamp: nowIso(),
   });
 });
