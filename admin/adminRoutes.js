@@ -156,8 +156,10 @@ router.post("/login", rateLimitLogin, requireCsrf, async (req, res) => {
   if (!email || !password) {
     // Log failed login attempt (no password)
     logAdminEvent("warn", "admin_login_failed", {
+      event: "admin_login_failed",
       requestId: requestId,
       ip: ip,
+      sessionId: req.sessionID || null,
       reason: "missing_credentials",
     });
     return res.status(400).send(renderLoginPage(csrfToken, "Email and password are required"));
@@ -165,11 +167,14 @@ router.post("/login", rateLimitLogin, requireCsrf, async (req, res) => {
 
   // Verify credentials
   if (!verifyAdminCredentials(email, password)) {
-    // Log failed login attempt (no password) - use generic message for user
+    // Log failed login attempt (no password) - normalize email for logging (no secrets)
+    const emailNormalized = email ? String(email).toLowerCase().trim() : null;
     logAdminEvent("warn", "admin_login_failed", {
+      event: "admin_login_failed",
       requestId: requestId,
       ip: ip,
-      email: email,
+      emailAttempt: emailNormalized,
+      sessionId: req.sessionID || null,
       reason: "invalid_credentials",
     });
     return res.status(401).send(renderLoginPage(csrfToken, "Invalid email or password"));
@@ -200,11 +205,15 @@ router.post("/login", rateLimitLogin, requireCsrf, async (req, res) => {
         return res.status(500).send(renderLoginPage(csrfToken, "Login failed. Please try again."));
       }
 
-      // Log successful login
+      // Log successful login with session diagnostic info
+      const hasSetCookie = !!res.getHeader("Set-Cookie");
       logAdminEvent("info", "admin_login_success", {
+        event: "admin_login_success",
         requestId: requestId,
         ip: ip,
         email: ADMIN_EMAIL,
+        sessionId: req.sessionID || null,
+        hasSetCookie: hasSetCookie,
       });
 
       // Redirect to admin dashboard after session is saved
@@ -248,6 +257,21 @@ router.post("/logout", requireAdminAuth, requireCsrf, (req, res) => {
 
 // Admin dashboard (GET /admin)
 router.get("/", requireAdminAuth, (req, res) => {
+  // Log admin page access for diagnostics
+  const requestId = req.requestId || "unknown";
+  const ip = getClientIp(req);
+  const hasCookieHeader = !!req.headers.cookie;
+  const hasAdminSession = !!(req.session && req.session.admin && req.session.admin.email);
+  logAdminEvent("info", "admin_page_hit", {
+    event: "admin_page_hit",
+    requestId: requestId,
+    ip: ip,
+    sessionId: req.sessionID || null,
+    hasCookieHeader: hasCookieHeader,
+    hasAdminSession: hasAdminSession,
+    email: req.session?.admin?.email || null,
+  });
+
   const csrfToken = generateCsrfToken();
   setCsrfToken(req, csrfToken);
 
@@ -280,6 +304,29 @@ router.get("/health", requireAdminAuth, (req, res) => {
     authenticated: true,
     email: req.session?.admin?.email || ADMIN_EMAIL,
     timestamp: new Date().toISOString(),
+  });
+});
+
+// TEMP DEBUG: remove after session issue resolved
+// Debug endpoint to inspect session state
+router.get("/debug-session", requireAdminAuth, (req, res) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  
+  const hasCookieHeader = !!req.headers.cookie;
+  const cookieHeaderLen = req.headers.cookie ? String(req.headers.cookie).length : 0;
+  const hasSession = !!(req.session && typeof req.session === "object");
+  const sessionKeys = hasSession ? Object.keys(req.session) : [];
+  
+  return res.json({
+    ok: true,
+    hasCookieHeader: hasCookieHeader,
+    cookieHeaderLen: cookieHeaderLen,
+    sessionId: req.sessionID || null,
+    hasSession: hasSession,
+    adminEmail: req.session?.admin?.email || null,
+    sessionKeys: sessionKeys,
   });
 });
 
