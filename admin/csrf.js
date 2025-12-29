@@ -41,12 +41,16 @@ function constantTimeCompare(a, b) {
   return result === 0;
 }
 
-// CSRF protection middleware for POST requests
+// CSRF protection middleware for state-changing requests only
+// GET, HEAD, and OPTIONS are safe methods and bypass CSRF validation
 function requireCsrf(req, res, next) {
-  if (req.method !== "POST") {
+  // Skip CSRF validation for safe/read-only HTTP methods
+  const safeMethods = ["GET", "HEAD", "OPTIONS"];
+  if (safeMethods.includes(req.method)) {
     return next();
   }
 
+  // Require CSRF token for state-changing methods (POST, PUT, DELETE, PATCH, etc.)
   const tokenFromRequest = req.body?.csrfToken || req.headers["x-csrf-token"];
   const sessionToken = getCsrfToken(req);
 
