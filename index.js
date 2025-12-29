@@ -406,6 +406,108 @@ app.use((req, res, next) => {
   next();
 });
 
+// ============================================================================
+// WIDGET.JS ROUTE (Fail-safe, early registration)
+// ============================================================================
+// Dedicated route handler for /widget.js that does NOT depend on express.static
+// Registered early to avoid interference from auth middleware or error handlers
+// ============================================================================
+app.get("/widget.js", (req, res) => {
+  const requestId = req.requestId || makeRequestId();
+  const publicDir = path.resolve(process.cwd(), "public");
+  const widgetPath = path.join(publicDir, "widget.js");
+  
+  // Log request received
+  logJson("info", "widget_request", {
+    event: "widget_request",
+    requestId: requestId,
+    url: req.url,
+    cwd: process.cwd(),
+    widgetPath: widgetPath,
+    timestamp: nowIso(),
+  });
+  
+  // Use fs.promises.stat to check if file exists and get size
+  fs.promises.stat(widgetPath)
+    .then((stats) => {
+      // File exists and is readable
+      const fileSize = stats.size;
+      
+      // Set headers
+      res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store"); // Temporary for debugging
+      res.setHeader("Content-Length", fileSize);
+      res.status(200);
+      
+      // Stream the file
+      const stream = fs.createReadStream(widgetPath);
+      
+      // Handle stream errors
+      stream.on("error", (err) => {
+        // Only log if response hasn't been sent
+        if (!res.headersSent) {
+          logJson("error", "widget_serve_failed", {
+            event: "widget_serve_failed",
+            requestId: requestId,
+            error: err.message || String(err),
+            errorCode: err.code || null,
+            widgetPath: widgetPath,
+            cwd: process.cwd(),
+            timestamp: nowIso(),
+          });
+          res.status(500).send("// Widget file read error");
+        }
+      });
+      
+      // Handle client disconnect
+      req.on("close", () => {
+        stream.destroy();
+      });
+      
+      // Pipe to response
+      stream.pipe(res);
+      
+      // Log success when stream finishes
+      stream.on("end", () => {
+        logJson("info", "widget_served", {
+          event: "widget_served",
+          requestId: requestId,
+          bytes: fileSize,
+          widgetPath: widgetPath,
+          timestamp: nowIso(),
+        });
+      });
+    })
+    .catch((err) => {
+      // File doesn't exist or can't be accessed
+      if (err.code === "ENOENT") {
+        // File not found - return 404
+        logJson("warn", "widget_serve_failed", {
+          event: "widget_serve_failed",
+          requestId: requestId,
+          error: "File not found",
+          errorCode: "ENOENT",
+          widgetPath: widgetPath,
+          cwd: process.cwd(),
+          timestamp: nowIso(),
+        });
+        res.status(404).send("Not Found");
+      } else {
+        // Other error - return 500
+        logJson("error", "widget_serve_failed", {
+          event: "widget_serve_failed",
+          requestId: requestId,
+          error: err.message || String(err),
+          errorCode: err.code || null,
+          widgetPath: widgetPath,
+          cwd: process.cwd(),
+          timestamp: nowIso(),
+        });
+        res.status(500).send("// Widget file not available");
+      }
+    });
+});
+
 // ---- Sanitizing helpers needed early for rate limiting ----
 function sanitizeClientId(id) {
   const fallback = "Advantum";
@@ -5091,39 +5193,10 @@ CRITICAL RULES:
   }
 });
 
-// Serve static assets from public/ directory
+// Serve static assets from public/ directory (for other static files, widget.js handled above)
 // Use process.cwd() for production compatibility (runtime root = repo root, no Backend folder)
 const publicDir = path.resolve(process.cwd(), "public");
 app.use(express.static(publicDir));
-
-// Fallback route for /widget.js to guarantee delivery even if static middleware fails
-app.get("/widget.js", (req, res) => {
-  try {
-    const widgetPath = path.join(publicDir, "widget.js");
-    res.sendFile(widgetPath, (err) => {
-      if (err) {
-        logJson("error", "widget_serve_failed", {
-          event: "widget_serve_failed",
-          error: err.message || String(err),
-          widgetPath: widgetPath,
-          publicDir: publicDir,
-          cwd: process.cwd(),
-          timestamp: nowIso(),
-        });
-        res.status(500).send("// Widget file not available");
-      }
-    });
-  } catch (e) {
-    logJson("error", "widget_serve_failed", {
-      event: "widget_serve_failed",
-      error: e && e.message ? e.message : String(e),
-      publicDir: publicDir,
-      cwd: process.cwd(),
-      timestamp: nowIso(),
-    });
-    res.status(500).send("// Widget file not available");
-  }
-});
 
 app.use((req, res) => {
   res.status(404).send("Not Found");
