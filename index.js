@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
+const path = require("path");
 const crypto = require("crypto");
 const https = require("https");
 const { URL } = require("url");
@@ -23,7 +24,169 @@ const AXIOM_ENABLED = Boolean(AXIOM_TOKEN && AXIOM_DATASET);
 // IMPORTANT on Render/Proxies: this makes req.ip work properly
 app.set("trust proxy", 1);
 
-app.use(cors());
+// ============================================================================
+// CORS CONFIGURATION (STRICT ALLOWLIST)
+// ============================================================================
+// Prevents CSRF and unauthorized cross-origin API usage
+// ============================================================================
+
+// Parse allowed origins from environment
+function parseAllowedOrigins(envValue) {
+  if (!envValue || typeof envValue !== "string") return [];
+  return envValue
+    .split(",")
+    .map(origin => origin.trim())
+    .filter(origin => origin.length > 0);
+}
+
+const CORS_ALLOWED_ORIGINS_RAW = parseAllowedOrigins(process.env.CORS_ALLOWED_ORIGINS);
+const isDevelopment = process.env.NODE_ENV !== "production";
+
+// Normalize and validate allowed origins
+const CORS_ALLOWED_ORIGINS = [];
+const CORS_WILDCARD_PATTERNS = [];
+
+for (const origin of CORS_ALLOWED_ORIGINS_RAW) {
+  try {
+    // Check if it's a wildcard pattern (e.g., https://*.myshopify.com)
+    if (origin.includes("*")) {
+      // Only allow wildcards for myshopify.com subdomains
+      if (origin.match(/^https:\/\/\*\.myshopify\.com$/i)) {
+        CORS_WILDCARD_PATTERNS.push("myshopify.com");
+      } else {
+        // Reject other wildcard patterns for security
+        console.warn(`[CORS] Invalid wildcard pattern: ${origin}. Only https://*.myshopify.com is allowed.`);
+      }
+    } else {
+      // Validate it's a proper URL
+      const url = new URL(origin);
+      if (url.protocol !== "https:" && url.protocol !== "http:") {
+        console.warn(`[CORS] Invalid protocol for origin: ${origin} (${url.protocol}). Only http:// and https:// are allowed.`);
+        continue;
+      }
+      
+      // Only allow http:// in development
+      if (url.protocol === "http:" && !isDevelopment) {
+        console.warn(`[CORS] HTTP origin not allowed in production: ${origin}`);
+        continue;
+      }
+      
+      CORS_ALLOWED_ORIGINS.push(origin.toLowerCase());
+    }
+  } catch (e) {
+    console.warn(`[CORS] Invalid origin format: ${origin}. Error: ${e && e.message ? e.message : String(e)}`);
+  }
+}
+
+// Check if origin is allowed
+function isAllowedOrigin(origin) {
+  if (!origin || typeof origin !== "string") {
+    return false;
+  }
+
+  // Reject null origin (unless explicitly needed for local dev)
+  if (origin === "null" || origin === "undefined") {
+    return false;
+  }
+
+  // Reject file:// protocol
+  if (origin.startsWith("file://")) {
+    return false;
+  }
+
+  try {
+    const url = new URL(origin);
+    const originLower = origin.toLowerCase();
+    const hostname = url.hostname.toLowerCase();
+
+    // In development, allow localhost and 127.0.0.1
+    if (isDevelopment) {
+      if (hostname === "localhost" || hostname === "127.0.0.1" || hostname.startsWith("localhost:") || hostname.startsWith("127.0.0.1:")) {
+        // Only allow http:// in development
+        if (url.protocol === "http:") {
+          return true;
+        }
+      }
+    }
+
+    // Reject localhost in production
+    if (!isDevelopment && (hostname === "localhost" || hostname === "127.0.0.1")) {
+      return false;
+    }
+
+    // Check exact match in allowlist
+    if (CORS_ALLOWED_ORIGINS.includes(originLower)) {
+      return true;
+    }
+
+    // Check wildcard patterns (e.g., *.myshopify.com)
+    for (const pattern of CORS_WILDCARD_PATTERNS) {
+      if (hostname.endsWith("." + pattern) || hostname === pattern) {
+        // Ensure it's HTTPS (wildcards should only be HTTPS)
+        if (url.protocol === "https:") {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  } catch (e) {
+    // Invalid URL format
+    return false;
+  }
+}
+
+// CORS configuration with strict origin validation
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      // Allow requests with no origin (e.g., mobile apps, Postman, curl)
+      // But be cautious - this should be limited
+      if (!origin) {
+        // In production, reject requests without origin (browser requests should have origin)
+        if (!isDevelopment) {
+          callback(new Error("CORS: Origin header required"), false);
+          return;
+        }
+        // In development, allow no-origin requests (for testing)
+        callback(null, true);
+        return;
+      }
+
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+      } else {
+        // Log blocked origin (hostname only for privacy)
+        // Note: This runs before requestId middleware, so we'll generate one if needed
+        try {
+          const url = new URL(origin);
+          const hostname = url.hostname;
+          // Use logJson if available (it will be by the time requests come in)
+          if (typeof logJson === "function" && typeof nowIso === "function") {
+            logJson("warn", "cors_origin_blocked", {
+              event: "cors_origin_blocked",
+              hostname: hostname,
+              requestId: null, // RequestId middleware runs after CORS
+              timestamp: nowIso(),
+            });
+          } else {
+            // Fallback for edge cases
+            console.warn(`[CORS] Origin blocked: ${hostname}`);
+          }
+        } catch (e) {
+          // Invalid origin format, already rejected
+        }
+        callback(new Error("CORS: Origin not allowed"), false);
+      }
+    },
+    credentials: false, // Set to false unless cookies/auth tokens are needed
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    exposedHeaders: [],
+    maxAge: 86400, // 24 hours
+  })
+);
+
 app.use(express.json());
 
 // SECURITY: Add security headers to all responses
@@ -1546,11 +1709,11 @@ if (SHOPIFY_STORE_DOMAIN_RAW && SHOPIFY_API_TOKEN) {
       // Build safe base URL
       const baseURL = buildShopifyBaseUrl(validation.domain, SHOPIFY_API_VERSION);
       shopifyDomainValidated = validation.domain;
-      shopifyClient = axios.create({
+  shopifyClient = axios.create({
         baseURL: baseURL,
-        headers: { "X-Shopify-Access-Token": SHOPIFY_API_TOKEN },
-        timeout: 5000,
-      });
+    headers: { "X-Shopify-Access-Token": SHOPIFY_API_TOKEN },
+    timeout: 5000,
+  });
       shopifyEnabled = true;
       
       logJson("info", "shopify_client_initialized", {
@@ -2336,6 +2499,147 @@ function retrieveScopedKnowledge(chunks, intent, message, requestId, clientId, s
   };
 }
 
+// ============================================================================
+// CLIENT DIRECTORY RESOLUTION (PATH TRAVERSAL PROTECTION)
+// ============================================================================
+// Provably safe client folder resolution with strict containment enforcement
+// ============================================================================
+
+// Absolute base directory for clients (resolved at module load)
+const CLIENTS_ROOT = path.resolve(__dirname, "Clients");
+
+// ClientId validation pattern (strict allowlist)
+const CLIENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,50}$/;
+const CLIENT_ID_MAX_LENGTH = 50;
+
+// Resolve client directory path safely (prevents path traversal)
+function resolveClientDir(clientId, requestId = null) {
+  // Step 1: Validate clientId is present and is a string
+  if (!clientId || typeof clientId !== "string") {
+    if (requestId && typeof logJson === "function") {
+      logJson("warn", "client_path_traversal_blocked", {
+        event: "client_path_traversal_blocked",
+        requestId: requestId,
+        clientId: String(clientId || ""),
+        reason: "clientid_missing_or_invalid_type",
+        timestamp: typeof nowIso === "function" ? nowIso() : new Date().toISOString(),
+      });
+    }
+    return null;
+  }
+
+  const clientIdRaw = String(clientId).trim();
+
+  // Step 2: Reject empty or too long
+  if (clientIdRaw.length === 0) {
+    if (requestId && typeof logJson === "function") {
+      logJson("warn", "client_path_traversal_blocked", {
+        event: "client_path_traversal_blocked",
+        requestId: requestId,
+        clientId: clientIdRaw,
+        reason: "clientid_empty",
+        timestamp: typeof nowIso === "function" ? nowIso() : new Date().toISOString(),
+      });
+    }
+    return null;
+  }
+
+  if (clientIdRaw.length > CLIENT_ID_MAX_LENGTH) {
+    if (requestId && typeof logJson === "function") {
+      logJson("warn", "client_path_traversal_blocked", {
+        event: "client_path_traversal_blocked",
+        requestId: requestId,
+        clientId: clientIdRaw,
+        reason: "clientid_too_long",
+        timestamp: typeof nowIso === "function" ? nowIso() : new Date().toISOString(),
+      });
+    }
+    return null;
+  }
+
+  // Step 3: Decode URL-encoded traversal attempts safely
+  let decodedClientId = clientIdRaw;
+  try {
+    decodedClientId = decodeURIComponent(clientIdRaw);
+  } catch (e) {
+    // Invalid encoding - reject
+    if (requestId && typeof logJson === "function") {
+      logJson("warn", "client_path_traversal_blocked", {
+        event: "client_path_traversal_blocked",
+        requestId: requestId,
+        clientId: clientIdRaw,
+        reason: "url_encoding_invalid",
+        timestamp: typeof nowIso === "function" ? nowIso() : new Date().toISOString(),
+      });
+    }
+    return null;
+  }
+
+  // Step 4: Check for traversal patterns after decoding
+  if (
+    decodedClientId.includes("..") ||
+    decodedClientId.includes("/") ||
+    decodedClientId.includes("\\") ||
+    decodedClientId.includes("\0") || // null byte
+    decodedClientId.includes("%2e") || // encoded dot
+    decodedClientId.includes("%2f") || // encoded slash
+    decodedClientId.includes("%5c")    // encoded backslash
+  ) {
+    if (requestId && typeof logJson === "function") {
+      logJson("warn", "client_path_traversal_blocked", {
+        event: "client_path_traversal_blocked",
+        requestId: requestId,
+        clientId: clientIdRaw,
+        reason: "traversal_detected",
+        timestamp: typeof nowIso === "function" ? nowIso() : new Date().toISOString(),
+      });
+    }
+    return null;
+  }
+
+  // Step 5: Validate against strict allowlist pattern
+  if (!CLIENT_ID_PATTERN.test(decodedClientId)) {
+    if (requestId && typeof logJson === "function") {
+      logJson("warn", "client_path_traversal_blocked", {
+        event: "client_path_traversal_blocked",
+        requestId: requestId,
+        clientId: clientIdRaw,
+        reason: "invalid_chars",
+        timestamp: typeof nowIso === "function" ? nowIso() : new Date().toISOString(),
+      });
+    }
+    return null;
+  }
+
+  // Step 6: Build candidate path using path.join() (safe)
+  const candidatePath = path.join(CLIENTS_ROOT, decodedClientId);
+
+  // Step 7: Resolve to absolute path
+  const resolvedPath = path.resolve(candidatePath);
+
+  // Step 8: Enforce containment - resolved path must be within CLIENTS_ROOT
+  const clientsRootNormalized = path.normalize(CLIENTS_ROOT);
+  const resolvedNormalized = path.normalize(resolvedPath);
+
+  // Check that resolved path starts with CLIENTS_ROOT + path.sep
+  // This prevents escaping even if path contains symlinks
+  if (!resolvedNormalized.startsWith(clientsRootNormalized + path.sep) && resolvedNormalized !== clientsRootNormalized) {
+    if (requestId && typeof logJson === "function") {
+      logJson("warn", "client_path_traversal_blocked", {
+        event: "client_path_traversal_blocked",
+        requestId: requestId,
+        clientId: clientIdRaw,
+        reason: "containment_failed",
+        timestamp: typeof nowIso === "function" ? nowIso() : new Date().toISOString(),
+      });
+    }
+    return null;
+  }
+
+  // Step 9: Return safe path
+  return resolvedPath;
+}
+
 // ---- Client Registry & Validation ----
 const clientRegistry = new Map();
 
@@ -2436,7 +2740,12 @@ function normalizeClientConfig(rawCfg, clientId) {
 }
 
 function validateClientFolder(clientId) {
-  const base = `./Clients/${clientId}`;
+  // Use safe resolver
+  const base = resolveClientDir(clientId);
+  if (!base) {
+    return { valid: false, missingFiles: ["folder"], errors: [`Invalid client ID: ${clientId}`] };
+  }
+
   const missingFiles = [];
   const errors = [];
 
@@ -2449,7 +2758,7 @@ function validateClientFolder(clientId) {
   }
 
   for (const file of REQUIRED_CLIENT_FILES) {
-    const filePath = `${base}/${file}`;
+    const filePath = path.join(base, file);
     if (!fs.existsSync(filePath)) {
       missingFiles.push(file);
     }
@@ -2459,7 +2768,7 @@ function validateClientFolder(clientId) {
     errors.push(`Missing required files: ${missingFiles.join(", ")}`);
   }
 
-  const clientConfigPath = `${base}/client-config.json`;
+  const clientConfigPath = path.join(base, "client-config.json");
   if (fs.existsSync(clientConfigPath)) {
     try {
       const configRaw = readFile(clientConfigPath);
@@ -2480,27 +2789,43 @@ function validateClientFolder(clientId) {
 }
 
 function initializeClientRegistry() {
-  const clientsDir = "./Clients";
-  if (!fs.existsSync(clientsDir)) {
+  if (!fs.existsSync(CLIENTS_ROOT)) {
+    if (typeof logJson === "function") {
     logJson("warn", "client_registry_init", { error: "Clients directory not found" });
+    }
     return;
   }
 
   try {
-    const entries = fs.readdirSync(clientsDir, { withFileTypes: true });
+    const entries = fs.readdirSync(CLIENTS_ROOT, { withFileTypes: true });
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       if (entry.name.startsWith(".")) continue;
 
       const clientId = entry.name;
+
+      // Validate clientId against allowlist pattern before processing
+      if (!CLIENT_ID_PATTERN.test(clientId)) {
+        if (typeof logJson === "function") {
+          logJson("warn", "client_validation_failed", {
+            clientId: clientId,
+            reason: "invalid_clientid_pattern",
+            message: "Client folder name does not match allowed pattern",
+          });
+        }
+        continue; // Skip invalid folder names
+      }
+
       const validation = validateClientFolder(clientId);
 
       if (!validation.valid) {
+        if (typeof logJson === "function") {
         logJson("warn", "client_validation_failed", {
           clientId: clientId,
           missingFiles: validation.missingFiles,
           errors: validation.errors,
         });
+        }
         clientRegistry.set(clientId, {
           status: "invalid",
           missingFiles: validation.missingFiles,
@@ -2510,8 +2835,19 @@ function initializeClientRegistry() {
       }
 
       try {
-        const base = `./Clients/${clientId}`;
-        const configRaw = readFile(`${base}/client-config.json`);
+        const base = resolveClientDir(clientId);
+        if (!base) {
+          if (typeof logJson === "function") {
+            logJson("warn", "client_path_resolution_failed", {
+              clientId: clientId,
+              reason: "path_resolution_failed",
+            });
+          }
+          continue;
+        }
+
+        const configPath = path.join(base, "client-config.json");
+        const configRaw = readFile(configPath);
         const config = safeJsonParse(configRaw, {});
         const normalizedConfig = normalizeClientConfig(config, clientId);
 
@@ -2520,10 +2856,12 @@ function initializeClientRegistry() {
           config: normalizedConfig,
         });
       } catch (e) {
+        if (typeof logJson === "function") {
         logJson("warn", "client_config_normalize_failed", {
           clientId: clientId,
           error: e && e.message ? e.message : String(e),
         });
+        }
         clientRegistry.set(clientId, {
           status: "invalid",
           validationErrors: [e && e.message ? e.message : "Config normalization failed"],
@@ -2551,16 +2889,22 @@ function getClientOrNull(clientIdRaw) {
   return { clientId, config: entry.config };
 }
 
-function loadClient(clientIdRaw) {
+function loadClient(clientIdRaw, requestId = null) {
   const clientId = sanitizeClientId(clientIdRaw);
-  const base = `./Clients/${clientId}`;
+  const base = resolveClientDir(clientId, requestId);
 
-  if (!fs.existsSync(base)) {
-    throw new Error(`Client folder not found: ${base}`);
+  if (!base) {
+    throw new Error(`Invalid client ID: ${clientId}`);
   }
 
-  const brandVoice = readFile(`${base}/Brand voice.md`);
-  const supportRules = readFile(`${base}/Customer support rules.md`);
+  if (!fs.existsSync(base)) {
+    throw new Error(`Client folder not found: ${clientId}`);
+  }
+
+  const brandVoicePath = path.join(base, "Brand voice.md");
+  const supportRulesPath = path.join(base, "Customer support rules.md");
+  const brandVoice = readFile(brandVoicePath);
+  const supportRules = readFile(supportRulesPath);
 
   const files = [
     "FAQ.md",
@@ -2576,7 +2920,8 @@ function loadClient(clientIdRaw) {
 
   const allChunks = [];
   for (const file of files) {
-    const content = readFile(`${base}/${file}`);
+    const filePath = path.join(base, file);
+    const content = readFile(filePath);
     if (!content || !content.trim()) continue;
     const chunks = chunkMarkdown(file, content, 900);
     for (const c of chunks) allChunks.push({ source: file, heading: c.heading || "", text: c.text });
@@ -3585,21 +3930,21 @@ app.post("/chat", async (req, res) => {
 
     let data;
     try {
-      data = loadClient(clientId);
-      } catch (e) {
-        logJson("error", "load_client_failed", {
-          requestId: req.requestId,
-          clientId: clientId,
-          error: e && e.message ? e.message : String(e),
-        });
-        res.status(404);
+      data = loadClient(clientId, req.requestId);
+    } catch (e) {
+      logJson("error", "load_client_failed", {
+        requestId: req.requestId,
+        clientId: clientId,
+        error: e && e.message ? e.message : String(e),
+      });
+      res.status(404);
         // SECURITY: Generic error message - don't reveal internal structure
-        return res.json({
-          requestId: req.requestId,
-          reply: "Deze chat is niet juist geconfigureerd. Neem contact op met support.",
-          error: "invalid_client",
-        });
-      }
+      return res.json({
+        requestId: req.requestId,
+        reply: "Deze chat is niet juist geconfigureerd. Neem contact op met support.",
+        error: "invalid_client",
+      });
+    }
 
     // Use normalized config from registry
     data.clientConfig = clientEntry.config;
