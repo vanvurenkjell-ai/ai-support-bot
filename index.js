@@ -211,7 +211,8 @@ app.options("/health", widgetCors);
 // ============================================================================
 app.use((req, res, next) => {
   // TEMP DEBUG: Skip CORS for widget endpoints (they use widgetCors middleware)
-  if (req.path === "/widget-config" || req.path === "/chat" || req.path === "/health") {
+  // Also skip CORS for /admin routes (same-origin, credentials needed)
+  if (req.path === "/widget-config" || req.path === "/chat" || req.path === "/health" || req.path.startsWith("/admin")) {
     return next();
   }
   
@@ -5222,6 +5223,20 @@ CRITICAL RULES:
     });
   }
 });
+
+// ============================================================================
+// ADMIN PORTAL ROUTES
+// ============================================================================
+// Session-based admin authentication portal
+// ============================================================================
+const adminRouter = require("./admin/adminRoutes");
+const { sessionMiddleware } = require("./admin/auth");
+
+// Apply session middleware for /admin routes
+app.use("/admin", sessionMiddleware);
+
+// Mount admin routes
+app.use("/admin", adminRouter);
 
 app.use((req, res) => {
   res.status(404).send("Not Found");
