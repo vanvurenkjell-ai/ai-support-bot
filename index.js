@@ -78,7 +78,18 @@ for (const origin of CORS_ALLOWED_ORIGINS_RAW) {
   }
 }
 
-// Check if origin is allowed
+// Extract origin from a URL (for client config contactUrl)
+function extractOriginFromUrl(urlString) {
+  if (!urlString || typeof urlString !== "string") return null;
+  try {
+    const url = new URL(urlString);
+    return `${url.protocol}//${url.hostname}`.toLowerCase();
+  } catch (e) {
+    return null;
+  }
+}
+
+// Check if origin is allowed (includes client-specific origins from config)
 function isAllowedOrigin(origin) {
   if (!origin || typeof origin !== "string") {
     return false;
@@ -114,8 +125,13 @@ function isAllowedOrigin(origin) {
       return false;
     }
 
-    // Check exact match in allowlist
+    // Check exact match in global allowlist
     if (CORS_ALLOWED_ORIGINS.includes(originLower)) {
+      return true;
+    }
+
+    // Check client-specific allowed origins (extracted from client configs)
+    if (clientAllowedOrigins.has(originLower)) {
       return true;
     }
 
@@ -404,137 +420,6 @@ app.use((req, res, next) => {
   });
 
   next();
-});
-
-// ============================================================================
-// WIDGET.JS ROUTE (Fail-safe, early registration)
-// ============================================================================
-// Dedicated route handler for /widget.js that does NOT depend on express.static
-// Registered early to avoid interference from auth middleware or error handlers
-// ============================================================================
-app.get("/widget.js", (req, res) => {
-  const requestId = req.requestId || makeRequestId();
-  
-  // Try two possible paths: public/widget.js first, then root/widget.js
-  const candidateA = path.resolve(process.cwd(), "public", "widget.js");
-  const candidateB = path.resolve(process.cwd(), "widget.js");
-  
-  // Check which file exists (first existing file wins, prefer public/widget.js over root/widget.js)
-  Promise.all([
-    fs.promises.stat(candidateA).then(() => ({ path: candidateA, source: "public/widget.js", exists: true })).catch(() => ({ path: candidateA, source: "public/widget.js", exists: false })),
-    fs.promises.stat(candidateB).then(() => ({ path: candidateB, source: "root/widget.js", exists: true })).catch(() => ({ path: candidateB, source: "root/widget.js", exists: false }))
-  ])
-    .then((results) => {
-      // Find first existing file (results[0] = candidateA, results[1] = candidateB)
-      // Prefer public/widget.js (candidateA) if both exist
-      const existing = results.find(r => r.exists);
-      
-      if (!existing) {
-        // Neither file exists - return 404 (plain text, not JSON)
-        res.status(404).type("text/plain").send("Not Found");
-        logJson("warn", "widget_served", {
-          event: "widget_served",
-          requestId: requestId,
-          servedFrom: "missing",
-          widgetPath: null,
-          timestamp: nowIso(),
-        });
-        // Log response headers for debugging
-        logJson("info", "widget_response_headers", {
-          event: "widget_response_headers",
-          requestId: requestId,
-          status: 404,
-          contentType: res.getHeader("Content-Type"),
-          servedFrom: "missing",
-          timestamp: nowIso(),
-        });
-        return;
-      }
-      
-      const widgetPath = existing.path;
-      const servedFrom = existing.source;
-      
-      // File exists - get size and stream it
-      return fs.promises.stat(widgetPath)
-        .then((stats) => {
-          const fileSize = stats.size;
-          
-          // Set status and Content-Type FIRST (before streaming)
-          // Explicitly set Content-Type with charset to ensure Safari accepts it
-          res.status(200);
-          res.setHeader("Content-Type", "application/javascript; charset=utf-8");
-          res.setHeader("Cache-Control", "no-store");
-          res.setHeader("Content-Length", fileSize);
-          // NOTE: X-Content-Type-Options: nosniff is set by global security middleware (line 195)
-          // We explicitly set correct Content-Type above, so nosniff is safe
-          
-          // Log response headers for verification
-          logJson("info", "widget_response_headers", {
-            event: "widget_response_headers",
-            requestId: requestId,
-            status: 200,
-            contentType: res.getHeader("Content-Type"),
-            servedFrom: servedFrom,
-            widgetPath: widgetPath,
-            timestamp: nowIso(),
-          });
-          
-          // Stream the file
-          const stream = fs.createReadStream(widgetPath);
-          
-          // Handle stream errors
-          stream.on("error", (err) => {
-            // Only log if response hasn't been sent
-            if (!res.headersSent) {
-              logJson("error", "widget_serve_failed", {
-                event: "widget_serve_failed",
-                requestId: requestId,
-                error: err.message || String(err),
-                errorCode: err.code || null,
-                widgetPath: widgetPath,
-                servedFrom: servedFrom,
-                timestamp: nowIso(),
-              });
-              // Send plain text error (not JSON, not HTML)
-              res.status(500).type("text/plain").send("// Widget file read error");
-            }
-          });
-          
-          // Handle client disconnect
-          req.on("close", () => {
-            stream.destroy();
-          });
-          
-          // Pipe to response
-          stream.pipe(res);
-          
-          // Log success when stream finishes
-          stream.on("end", () => {
-            logJson("info", "widget_served", {
-              event: "widget_served",
-              requestId: requestId,
-              servedFrom: servedFrom,
-              widgetPath: widgetPath,
-              bytes: fileSize,
-              timestamp: nowIso(),
-            });
-          });
-        });
-    })
-    .catch((err) => {
-      // Unexpected error during file check
-      logJson("error", "widget_serve_failed", {
-        event: "widget_serve_failed",
-        requestId: requestId,
-        error: err.message || String(err),
-        errorCode: err.code || null,
-        timestamp: nowIso(),
-      });
-      if (!res.headersSent) {
-        // Send plain text error (not JSON, not HTML)
-        res.status(500).type("text/plain").send("// Widget file not available");
-      }
-    });
 });
 
 // ---- Sanitizing helpers needed early for rate limiting ----
@@ -3737,6 +3622,7 @@ app.get("/", (req, res) => {
 });
 
 // SECURITY: /health endpoint - public but safe (no secrets, no PII)
+// CORS: Allowed for all widget client origins (same as widget-config and chat)
 app.get("/health", (req, res) => {
   // Only expose safe, non-sensitive information
   const version = process.env.VERSION || process.env.RENDER_GIT_COMMIT || BUILD_VERSION || "unknown";
@@ -4235,7 +4121,11 @@ app.post("/chat", requireWidgetAuth, async (req, res) => {
     const message = sanitizeUserMessage(req.body.message);
     if (!message) {
       res.status(400);
-      return res.json({ requestId: req.requestId, error: "Invalid message" });
+      return res.json({ 
+        requestId: req.requestId, 
+        reply: "Het bericht is ongeldig. Probeer het opnieuw.",
+        error: "invalid_message"
+      });
     }
 
     const clientIdRaw = req.query.client;
@@ -4327,7 +4217,8 @@ app.post("/chat", requireWidgetAuth, async (req, res) => {
       
       return res.status(429).json({
         requestId: req.requestId,
-        error: errorMessage,
+        reply: errorMessage,
+        error: "rate_limited"
       });
     }
 
@@ -5185,6 +5076,30 @@ CRITICAL RULES:
       handoffPayload: null,
     };
 
+    const durationMs = Date.now() - (req.requestStartTime || Date.now());
+    const origin = req.headers.origin || null;
+    const referer = req.headers.referer || null;
+    logJson("info", "chat_request", {
+      event: "chat_request",
+      requestId: req.requestId,
+      clientId: clientId || null,
+      origin: origin,
+      referer: referer,
+      statusCode: 200,
+      durationMs: durationMs,
+      errorType: null,
+      sessionId: sessionId || null,
+      intent: effectiveIntent || null,
+      shopifyLookupAttempted: shopifyLookupAttempted,
+      shopifyFound: shopifyFound,
+      shopifyError: shopifyError,
+      llmProvider: "openai",
+      llmModel: llmModel,
+      llmLatencyMs: llmLatencyMs,
+      tokenUsage: tokenUsage,
+      timestamp: nowIso(),
+    });
+
     return res.json({
       requestId: req.requestId,
       reply,
@@ -5195,11 +5110,30 @@ CRITICAL RULES:
       facts: getFacts(sessionId),
     });
   } catch (e) {
-    logJson("error", "chat_error", {
+    const durationMs = Date.now() - (req.requestStartTime || Date.now());
+    const origin = req.headers.origin || null;
+    const referer = req.headers.referer || null;
+    
+    // Determine error type for observability
+    let errorType = "UNKNOWN";
+    if (e && e.message) {
+      const msg = String(e.message).toLowerCase();
+      if (msg.includes("cors")) errorType = "CORS_BLOCKED";
+      else if (msg.includes("unauthorized") || msg.includes("auth")) errorType = "AUTH_DENIED";
+      else if (msg.includes("rate limit") || msg.includes("too many")) errorType = "RATE_LIMITED";
+      else if (msg.includes("shopify")) errorType = "UPSTREAM_SHOPIFY_FAIL";
+      else if (msg.includes("llm") || msg.includes("openai")) errorType = "LLM_FAIL";
+    }
+    
+    logJson("error", "chat_request", {
+      event: "chat_request",
       requestId: req.requestId,
-      route: "/chat",
-      method: "POST",
       clientId: clientId || null,
+      origin: origin,
+      referer: referer,
+      statusCode: 500,
+      durationMs: durationMs,
+      errorType: errorType,
       sessionId: sessionId || null,
       intent: effectiveIntent || null,
       shopifyLookupAttempted: shopifyLookupAttempted,
@@ -5211,21 +5145,19 @@ CRITICAL RULES:
       tokenUsage: tokenUsage,
       error: e && e.message ? e.message : String(e),
       errorStack: e && e.stack ? String(e.stack).slice(0, 500) : null,
+      timestamp: nowIso(),
     });
 
     res.status(500);
     // SECURITY: Never expose internal error details to users
+    // Frontend expects 'reply' field, not just 'error'
     return res.json({ 
-      requestId: req.requestId, 
-      error: sanitizeErrorMessage(e, "Server error. Please try again later.") 
+      requestId: req.requestId,
+      reply: "Er is een fout opgetreden. Probeer het later opnieuw.",
+      error: "chat_unavailable"
     });
   }
 });
-
-// Serve static assets from public/ directory (for other static files, widget.js handled above)
-// Use process.cwd() for production compatibility (runtime root = repo root, no Backend folder)
-const publicDir = path.resolve(process.cwd(), "public");
-app.use(express.static(publicDir));
 
 app.use((req, res) => {
   res.status(404).send("Not Found");
@@ -5237,26 +5169,6 @@ initializeClientRegistry();
 // Start server - bind to 0.0.0.0 for Render compatibility
 app.listen(port, "0.0.0.0", () => {
   const version = process.env.VERSION || process.env.RENDER_GIT_COMMIT || BUILD_VERSION || "unknown";
-  
-  // Verify widget.js exists and log static asset status
-  const widgetPath = path.join(publicDir, "widget.js");
-  const widgetExists = (() => {
-    try {
-      return fs.existsSync(widgetPath);
-    } catch (e) {
-      return false;
-    }
-  })();
-  
-  logJson("info", "static_widget_ready", {
-    event: "static_widget_ready",
-    publicDir: publicDir,
-    widgetPath: widgetPath,
-    widgetExists: widgetExists,
-    cwd: process.cwd(),
-    timestamp: nowIso(),
-  });
-  
   logJson("info", "server_listening", {
     event: "server_listening",
     version: version,
@@ -5264,9 +5176,6 @@ app.listen(port, "0.0.0.0", () => {
     env: process.env.NODE_ENV || "development",
     shopifyEnabled: shopifyEnabled,
     shopifyDomainValidated: shopifyDomainValidated ? true : false,
-    staticAssetsEnabled: true,
-    staticAssetsPath: publicDir,
-    widgetExists: widgetExists,
     timestamp: nowIso(),
   });
 });
