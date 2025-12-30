@@ -260,20 +260,69 @@ router.post("/logout", requireAdminAuth, requireCsrf, (req, res) => {
   });
 });
 
+// Helper: Get Clients directory root (same logic as index.js)
+function getClientsRoot() {
+  // Try multiple possible locations for Clients directory
+  // 1. From Backend/admin/ -> ../.. -> repo root -> Clients
+  const fromAdminDir = path.resolve(__dirname, "..", "..", "Clients");
+  // 2. From Backend/ -> Clients (matching index.js approach, though it may not exist)
+  const fromBackendDir = path.resolve(__dirname, "..", "Clients");
+  // 3. Try process.cwd() + Clients (if running from repo root)
+  const fromCwd = path.resolve(process.cwd(), "Clients");
+  
+  // Check which one exists (prefer fromAdminDir first)
+  if (fs.existsSync(fromAdminDir)) {
+    return fromAdminDir;
+  }
+  if (fs.existsSync(fromBackendDir)) {
+    return fromBackendDir;
+  }
+  if (fs.existsSync(fromCwd)) {
+    return fromCwd;
+  }
+  // Default to fromAdminDir even if it doesn't exist (will error later)
+  return fromAdminDir;
+}
+
 // Helper: Get client list from Clients directory
 function getClientList() {
   try {
-    const clientsRoot = path.resolve(__dirname, "..", "..", "Clients");
+    const clientsRoot = getClientsRoot();
+    logAdminEvent("debug", "admin_clients_list_scan", {
+      event: "admin_clients_list_scan",
+      clientsRoot: clientsRoot,
+      exists: fs.existsSync(clientsRoot),
+    });
+    
     if (!fs.existsSync(clientsRoot)) {
+      logAdminEvent("warn", "admin_clients_root_not_found", {
+        event: "admin_clients_root_not_found",
+        clientsRoot: clientsRoot,
+      });
       return [];
     }
+    
     const entries = fs.readdirSync(clientsRoot, { withFileTypes: true });
-    return entries
+    const clients = entries
       .filter(entry => entry.isDirectory())
       .map(entry => entry.name)
       .filter(name => /^[a-zA-Z0-9_-]{1,40}$/.test(name))
       .sort();
+    
+    logAdminEvent("info", "admin_clients_list_found", {
+      event: "admin_clients_list_found",
+      clientsRoot: clientsRoot,
+      count: clients.length,
+      clientIds: clients,
+    });
+    
+    return clients;
   } catch (error) {
+    logAdminEvent("error", "admin_clients_list_error", {
+      event: "admin_clients_list_error",
+      error: error?.message || String(error),
+      stack: error?.stack ? String(error.stack).slice(0, 200) : null,
+    });
     return [];
   }
 }
@@ -283,7 +332,7 @@ function getClientConfigPath(clientId) {
   if (!clientId || typeof clientId !== "string" || !/^[a-zA-Z0-9_-]{1,40}$/.test(clientId.trim())) {
     return null;
   }
-  const clientsRoot = path.resolve(__dirname, "..", "..", "Clients");
+  const clientsRoot = getClientsRoot();
   const clientDir = path.join(clientsRoot, clientId.trim());
   const configPath = path.join(clientDir, "client-config.json");
   const resolvedPath = path.resolve(configPath);
@@ -369,9 +418,20 @@ router.get("/clients", requireAdminAuth, (req, res) => {
   setCsrfToken(req, csrfToken);
 
   const clients = getClientList();
+  const clientsRoot = getClientsRoot();
+  
+  // DEBUG: Log the scan results
+  logAdminEvent("debug", "admin_clients_list_debug", {
+    event: "admin_clients_list_debug",
+    requestId: requestId,
+    clientsRoot: clientsRoot,
+    clientsFound: clients.length,
+    clientIds: clients,
+  });
+  
   const clientsList = clients.length > 0
     ? `<ul>${clients.map(clientId => `<li><a href="/admin/clients/${escapeHtml(clientId)}">${escapeHtml(clientId)}</a></li>`).join("")}</ul>`
-    : "<p>No clients found.</p>";
+    : `<p>No clients found. (Scanned: ${escapeHtml(clientsRoot)})</p>`;
 
   const html = `
 <!DOCTYPE html>
@@ -466,7 +526,7 @@ router.get("/clients/:clientId", requireAdminAuth, (req, res) => {
     <h3>Widget</h3>
     <div style="margin-bottom: 15px;">
       <label>Title: <input type="text" name="widget[title]" value="${escapeHtml(getValue(config, "widget.title", ""))}" style="width: 400px;" maxlength="60"></label><br>
-      <label>Greeting: <textarea name="widget[greeting]" style="width: 400px; height: 60px;" maxlength="200">${escapeHtml(getValue(config, "widget.greeting", ""))}</textarea></label><br>
+      <label>Greeting: <textarea name="widget[greeting]" style="width: 400px; height: 60px;" maxlength="240">${escapeHtml(getValue(config, "widget.greeting", ""))}</textarea></label><br>
     </div>
     
     <h3>Logo URL</h3>
@@ -477,20 +537,20 @@ router.get("/clients/:clientId", requireAdminAuth, (req, res) => {
     <h3>Entry Screen</h3>
     <div style="margin-bottom: 15px;">
       <label><input type="checkbox" name="entryScreen[enabled]" ${getValue(config, "entryScreen.enabled", false) ? "checked" : ""}> Enabled</label><br>
-      <label>Title: <input type="text" name="entryScreen[title]" value="${escapeHtml(getValue(config, "entryScreen.title", ""))}" style="width: 400px;" maxlength="80"></label><br>
-      <label>Disclaimer: <textarea name="entryScreen[disclaimer]" style="width: 400px; height: 60px;" maxlength="300">${escapeHtml(getValue(config, "entryScreen.disclaimer", ""))}</textarea></label><br>
-      <label>Primary Button Label: <input type="text" name="entryScreen[primaryButton][label]" value="${escapeHtml(getValue(config, "entryScreen.primaryButton.label", ""))}" style="width: 300px;" maxlength="40"></label><br>
-      <label>Secondary Button 1 Label: <input type="text" name="entryScreen[secondaryButtons][0][label]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.0.label", ""))}" style="width: 300px;" maxlength="40"></label><br>
-      <label>Secondary Button 1 URL: <input type="text" name="entryScreen[secondaryButtons][0][url]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.0.url", ""))}" style="width: 400px;" maxlength="300"></label><br>
-      <label>Secondary Button 2 Label: <input type="text" name="entryScreen[secondaryButtons][1][label]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.1.label", ""))}" style="width: 300px;" maxlength="40"></label><br>
-      <label>Secondary Button 2 URL: <input type="text" name="entryScreen[secondaryButtons][1][url]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.1.url", ""))}" style="width: 400px;" maxlength="300"></label><br>
+      <label>Title: <input type="text" name="entryScreen[title]" value="${escapeHtml(getValue(config, "entryScreen.title", ""))}" style="width: 400px;" maxlength="60"></label><br>
+      <label>Disclaimer: <textarea name="entryScreen[disclaimer]" style="width: 400px; height: 60px;" maxlength="240">${escapeHtml(getValue(config, "entryScreen.disclaimer", ""))}</textarea></label><br>
+      <label>Primary Button Label: <input type="text" name="entryScreen[primaryButton][label]" value="${escapeHtml(getValue(config, "entryScreen.primaryButton.label", ""))}" style="width: 300px;" maxlength="30"></label><br>
+      <label>Secondary Button 1 Label: <input type="text" name="entryScreen[secondaryButtons][0][label]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.0.label", ""))}" style="width: 300px;" maxlength="30"></label><br>
+      <label>Secondary Button 1 URL: <input type="text" name="entryScreen[secondaryButtons][0][url]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.0.url", ""))}" style="width: 400px;" maxlength="200"></label><br>
+      <label>Secondary Button 2 Label: <input type="text" name="entryScreen[secondaryButtons][1][label]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.1.label", ""))}" style="width: 300px;" maxlength="30"></label><br>
+      <label>Secondary Button 2 URL: <input type="text" name="entryScreen[secondaryButtons][1][url]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.1.url", ""))}" style="width: 400px;" maxlength="200"></label><br>
     </div>
     
     <h3>Support</h3>
     <div style="margin-bottom: 15px;">
       <label>Email: <input type="email" name="support[email]" value="${escapeHtml(getValue(config, "support.email", ""))}" style="width: 300px;" maxlength="120"></label><br>
-      <label>Contact URL: <input type="text" name="support[contactUrl]" value="${escapeHtml(getValue(config, "support.contactUrl", ""))}" style="width: 500px;" maxlength="300"></label><br>
-      <label>Contact URL Message Param: <input type="text" name="support[contactUrlMessageParam]" value="${escapeHtml(getValue(config, "support.contactUrlMessageParam", ""))}" style="width: 200px;" maxlength="40"></label><br>
+      <label>Contact URL: <input type="text" name="support[contactUrl]" value="${escapeHtml(getValue(config, "support.contactUrl", ""))}" style="width: 500px;" maxlength="200"></label><br>
+      <label>Contact URL Message Param: <input type="text" name="support[contactUrlMessageParam]" value="${escapeHtml(getValue(config, "support.contactUrlMessageParam", ""))}" style="width: 200px;" maxlength="30"></label><br>
     </div>
     
     <button type="submit" style="background: #28a745; color: white; border: none; padding: 10px 20px; cursor: pointer; font-size: 16px;">Save Changes</button>
@@ -665,4 +725,21 @@ router.get("/debug-session", requireAdminAuth, (req, res) => {
 });
 
 module.exports = router;
+
+/*
+HOW TO TEST (Manual Checklist):
+1. Login: Visit /admin, login with ADMIN_EMAIL/ADMIN_PASSWORD env vars
+2. Go to Clients: Click "Clients" in navigation, should see list of client IDs (Advantum, testbrand, etc.)
+3. Edit Client: Click "Advantum", should show edit form with current config values pre-filled
+4. Edit and Save: 
+   - Change widget.title to a new value (max 60 chars)
+   - Change widget.greeting to a new value (max 240 chars)
+   - Change colors.primary to a valid hex color (e.g., #FF0000)
+   - Click "Save Changes"
+5. Verify: Should redirect with "✓ Changes saved successfully!" message
+6. Verify File: Check Clients/Advantum/client-config.json on server, should contain updated values
+7. Reload: Refresh the edit page, form should show the updated values (persistence confirmed)
+8. Test Validation: Try saving with invalid color or URL not starting with https://, should show validation error
+9. Test Protection: Logout, try accessing /admin/clients directly, should redirect to login
+*/
 

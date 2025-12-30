@@ -35,10 +35,22 @@ function validateClientId(clientId) {
   return { valid: true, clientId: trimmed };
 }
 
+// Helper: Get Clients directory root (same logic as adminRoutes.js)
+function getClientsRoot() {
+  // Try multiple possible locations for Clients directory
+  const fromAdminDir = path.resolve(__dirname, "..", "..", "Clients");
+  const fromBackendDir = path.resolve(__dirname, "..", "Clients");
+  const fromCwd = path.resolve(process.cwd(), "Clients");
+  
+  if (fs.existsSync(fromAdminDir)) return fromAdminDir;
+  if (fs.existsSync(fromBackendDir)) return fromBackendDir;
+  if (fs.existsSync(fromCwd)) return fromCwd;
+  return fromAdminDir; // Default
+}
+
 // Get safe path to client config
 function getClientConfigPath(clientId) {
-  // Clients folder is at repo root, admin routes are in Backend/admin/
-  const clientsRoot = path.resolve(__dirname, "..", "..", "Clients");
+  const clientsRoot = getClientsRoot();
   const clientDir = path.join(clientsRoot, clientId);
   const configPath = path.join(clientDir, "client-config.json");
   
@@ -58,7 +70,7 @@ function getClientConfigPath(clientId) {
 // Get list of client IDs from Clients directory
 function getClientList() {
   try {
-    const clientsRoot = path.resolve(__dirname, "..", "..", "Clients");
+    const clientsRoot = getClientsRoot();
     if (!fs.existsSync(clientsRoot)) {
       return [];
     }
@@ -143,7 +155,7 @@ function validateConfigUpdate(input) {
     }
     if (input.widget.greeting !== undefined) {
       const greeting = String(input.widget.greeting || "").trim();
-      if (greeting.length <= 200) {
+      if (greeting.length <= 240) {
         allowed.widget.greeting = greeting;
       } else {
         errors.push("widget.greeting");
@@ -168,7 +180,7 @@ function validateConfigUpdate(input) {
     }
     if (input.entryScreen.title !== undefined) {
       const title = String(input.entryScreen.title || "").trim();
-      if (title.length <= 80) {
+      if (title.length <= 60) {
         allowed.entryScreen.title = title;
       } else {
         errors.push("entryScreen.title");
@@ -176,7 +188,7 @@ function validateConfigUpdate(input) {
     }
     if (input.entryScreen.disclaimer !== undefined) {
       const disclaimer = String(input.entryScreen.disclaimer || "").trim();
-      if (disclaimer.length <= 300) {
+      if (disclaimer.length <= 240) {
         allowed.entryScreen.disclaimer = disclaimer;
       } else {
         errors.push("entryScreen.disclaimer");
@@ -186,7 +198,7 @@ function validateConfigUpdate(input) {
       allowed.entryScreen.primaryButton = {};
       if (input.entryScreen.primaryButton.label !== undefined) {
         const label = String(input.entryScreen.primaryButton.label || "").trim();
-        if (label.length <= 40) {
+        if (label.length <= 30) {
           allowed.entryScreen.primaryButton.label = label;
         } else {
           errors.push("entryScreen.primaryButton.label");
@@ -210,7 +222,7 @@ function validateConfigUpdate(input) {
               const label = String(btn.label || "").trim();
               const action = String(btn.action || "").trim();
               const url = String(btn.url || "").trim();
-              if (label.length <= 40 && action === "link" && isValidUrl(url, 300)) {
+              if (label.length <= 30 && action === "link" && isValidUrl(url, 200)) {
                 allowed.entryScreen.secondaryButtons.push({ label, action: "link", url });
               } else {
                 errors.push(`entryScreen.secondaryButtons[${i}]`);
@@ -239,7 +251,7 @@ function validateConfigUpdate(input) {
       }
     }
     if (input.support.contactUrl !== undefined) {
-      if (isValidUrl(input.support.contactUrl, 300)) {
+      if (isValidUrl(input.support.contactUrl, 200)) {
         allowed.support.contactUrl = String(input.support.contactUrl).trim();
       } else {
         errors.push("support.contactUrl");
@@ -247,7 +259,7 @@ function validateConfigUpdate(input) {
     }
     if (input.support.contactUrlMessageParam !== undefined) {
       const param = String(input.support.contactUrlMessageParam || "").trim();
-      if (param.length <= 40 && /^[a-zA-Z0-9_]+$/.test(param)) {
+      if (param.length <= 30 && /^[a-zA-Z0-9_]+$/.test(param)) {
         allowed.support.contactUrlMessageParam = param;
       } else {
         errors.push("support.contactUrlMessageParam");
