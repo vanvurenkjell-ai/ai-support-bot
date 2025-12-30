@@ -260,156 +260,17 @@ router.post("/logout", requireAdminAuth, requireCsrf, (req, res) => {
   });
 });
 
-// Helper: Get Clients directory root (same logic as index.js)
-function getClientsRoot() {
-  // Try multiple possible locations for Clients directory
-  // 1. From Backend/admin/ -> ../.. -> repo root -> Clients
-  const fromAdminDir = path.resolve(__dirname, "..", "..", "Clients");
-  // 2. From Backend/ -> Clients (matching index.js approach, though it may not exist)
-  const fromBackendDir = path.resolve(__dirname, "..", "Clients");
-  // 3. Try process.cwd() + Clients (if running from repo root)
-  const fromCwd = path.resolve(process.cwd(), "Clients");
-  
-  // Check which one exists (prefer fromAdminDir first)
-  if (fs.existsSync(fromAdminDir)) {
-    return fromAdminDir;
-  }
-  if (fs.existsSync(fromBackendDir)) {
-    return fromBackendDir;
-  }
-  if (fs.existsSync(fromCwd)) {
-    return fromCwd;
-  }
-  // Default to fromAdminDir even if it doesn't exist (will error later)
-  return fromAdminDir;
-}
-
-// Helper: Get client list from Clients directory
-function getClientList() {
-  try {
-    const clientsRoot = getClientsRoot();
-    logAdminEvent("debug", "admin_clients_list_scan", {
-      event: "admin_clients_list_scan",
-      clientsRoot: clientsRoot,
-      exists: fs.existsSync(clientsRoot),
-    });
-    
-    if (!fs.existsSync(clientsRoot)) {
-      logAdminEvent("warn", "admin_clients_root_not_found", {
-        event: "admin_clients_root_not_found",
-        clientsRoot: clientsRoot,
-      });
-      return [];
-    }
-    
-    const entries = fs.readdirSync(clientsRoot, { withFileTypes: true });
-    const clients = entries
-      .filter(entry => entry.isDirectory())
-      .map(entry => entry.name)
-      .filter(name => /^[a-zA-Z0-9_-]{1,40}$/.test(name))
-      .sort();
-    
-    logAdminEvent("info", "admin_clients_list_found", {
-      event: "admin_clients_list_found",
-      clientsRoot: clientsRoot,
-      count: clients.length,
-      clientIds: clients,
-    });
-    
-    return clients;
-  } catch (error) {
-    logAdminEvent("error", "admin_clients_list_error", {
-      event: "admin_clients_list_error",
-      error: error?.message || String(error),
-      stack: error?.stack ? String(error.stack).slice(0, 200) : null,
-    });
-    return [];
-  }
-}
-
-// Validate clientId format (2-40 chars, starts with letter, only alphanumeric/underscore/hyphen)
-function validateClientId(clientId) {
-  if (!clientId || typeof clientId !== "string") {
-    return { valid: false, reason: "missing_or_invalid_type" };
-  }
-  const trimmed = clientId.trim();
-  if (trimmed.length < 2 || trimmed.length > 40) {
-    return { valid: false, reason: "invalid_length" };
-  }
-  if (!/^[a-zA-Z]/.test(trimmed)) {
-    return { valid: false, reason: "must_start_with_letter" };
-  }
-  if (!/^[a-zA-Z0-9_-]+$/.test(trimmed)) {
-    return { valid: false, reason: "invalid_chars" };
-  }
-  return { valid: true, clientId: trimmed };
-}
-
-// Get client config path (with path traversal protection)
-function getClientConfigPath(clientId) {
-  const validation = validateClientId(clientId);
-  if (!validation.valid) {
-    return null;
-  }
-  const clientsRoot = getClientsRoot();
-  const clientDir = path.join(clientsRoot, validation.clientId);
-  const configPath = path.join(clientDir, "client-config.json");
-  const resolvedPath = path.resolve(configPath);
-  const clientsRootNormalized = path.normalize(clientsRoot);
-  const resolvedNormalized = path.normalize(resolvedPath);
-  if (!resolvedNormalized.startsWith(clientsRootNormalized + path.sep) && resolvedNormalized !== clientsRootNormalized) {
-    return null;
-  }
-  return { path: resolvedPath, dir: clientDir };
-}
-
-// List all client IDs from Clients directory
-function listClients() {
-  return getClientList();
-}
-
-// Read client config from disk
-function readClientConfig(clientId) {
-  const pathResult = getClientConfigPath(clientId);
-  if (!pathResult || !fs.existsSync(pathResult.path)) {
-    return null;
-  }
-  try {
-    const configContent = fs.readFileSync(pathResult.path, "utf8");
-    return JSON.parse(configContent);
-  } catch (error) {
-    logAdminEvent("error", "admin_client_read_error", {
-      event: "admin_client_read_error",
-      clientId: clientId,
-      error: error?.message || String(error),
-    });
-    return null;
-  }
-}
-
-// Write client config to disk
-function writeClientConfig(clientId, config) {
-  const pathResult = getClientConfigPath(clientId);
-  if (!pathResult) {
-    return { success: false, error: "Invalid client ID" };
-  }
-  try {
-    // Ensure directory exists
-    if (!fs.existsSync(pathResult.dir)) {
-      fs.mkdirSync(pathResult.dir, { recursive: true });
-    }
-    const configJson = JSON.stringify(config, null, 2) + "\n";
-    fs.writeFileSync(pathResult.path, configJson, "utf8");
-    return { success: true, path: pathResult.path };
-  } catch (error) {
-    logAdminEvent("error", "admin_client_write_error", {
-      event: "admin_client_write_error",
-      clientId: clientId,
-      error: error?.message || String(error),
-    });
-    return { success: false, error: error?.message || String(error) };
-  }
-}
+// Use centralized clientsStore module for all client config operations
+const {
+  getClientsRoot,
+  validateClientId,
+  getClientConfigPath,
+  listClientIds,
+  readClientConfig,
+  writeClientConfigAtomic,
+  deleteClient,
+  getClientConfigStats,
+} = clientsStore;
 
 // Create default client config
 function createDefaultConfig(clientId, displayName = null) {
@@ -452,7 +313,7 @@ function createDefaultConfig(clientId, displayName = null) {
   };
 }
 
-// Create new client
+// Create new client (wrapper using clientsStore)
 function createClient(clientId, displayName = null) {
   const validation = validateClientId(clientId);
   if (!validation.valid) {
@@ -460,25 +321,23 @@ function createClient(clientId, displayName = null) {
   }
   
   const pathResult = getClientConfigPath(validation.clientId);
-  if (!pathResult) {
+  if (!pathResult.valid) {
     return { success: false, error: "Invalid client ID path" };
   }
   
-  // Check if client already exists
+  // Check if client already exists (409 Conflict)
   if (fs.existsSync(pathResult.path)) {
-    return { success: false, error: "Client already exists" };
+    return { success: false, error: "Client already exists", statusCode: 409 };
   }
   
   try {
-    // Create directory if it doesn't exist
-    if (!fs.existsSync(pathResult.dir)) {
-      fs.mkdirSync(pathResult.dir, { recursive: true });
-    }
-    
     // Create default config
     const defaultConfig = createDefaultConfig(validation.clientId, displayName);
-    const configJson = JSON.stringify(defaultConfig, null, 2) + "\n";
-    fs.writeFileSync(pathResult.path, configJson, "utf8");
+    const writeResult = writeClientConfigAtomic(validation.clientId, defaultConfig);
+    
+    if (!writeResult.success) {
+      return writeResult;
+    }
     
     return { success: true, path: pathResult.path };
   } catch (error) {
@@ -491,8 +350,8 @@ function createClient(clientId, displayName = null) {
   }
 }
 
-// Delete client (remove directory and config file)
-function deleteClient(clientId) {
+// Delete client wrapper with protection for "Advantum"
+function deleteClientSafe(clientId) {
   const validation = validateClientId(clientId);
   if (!validation.valid) {
     return { success: false, error: `Invalid client ID: ${validation.reason}` };
@@ -503,44 +362,7 @@ function deleteClient(clientId) {
     return { success: false, error: "Cannot delete protected client" };
   }
   
-  const pathResult = getClientConfigPath(validation.clientId);
-  if (!pathResult) {
-    return { success: false, error: "Invalid client ID path" };
-  }
-  
-  if (!fs.existsSync(pathResult.path)) {
-    return { success: false, error: "Client does not exist" };
-  }
-  
-  try {
-    // Remove config file
-    if (fs.existsSync(pathResult.path)) {
-      fs.unlinkSync(pathResult.path);
-    }
-    
-    // Try to remove directory (only if empty)
-    try {
-      if (fs.existsSync(pathResult.dir)) {
-        fs.rmdirSync(pathResult.dir);
-      }
-    } catch (dirError) {
-      // Directory not empty or other error - that's okay, we removed the config
-      logAdminEvent("warn", "admin_client_delete_dir_warning", {
-        event: "admin_client_delete_dir_warning",
-        clientId: validation.clientId,
-        error: dirError?.message || String(dirError),
-      });
-    }
-    
-    return { success: true };
-  } catch (error) {
-    logAdminEvent("error", "admin_client_delete_error", {
-      event: "admin_client_delete_error",
-      clientId: validation.clientId,
-      error: error?.message || String(error),
-    });
-    return { success: false, error: error?.message || String(error) };
-  }
+  return deleteClient(validation.clientId);
 }
 
 // Helper: Render navigation HTML
@@ -618,9 +440,10 @@ router.get("/clients", requireAdminAuth, (req, res) => {
   const csrfToken = generateCsrfToken();
   setCsrfToken(req, csrfToken);
 
-  const clients = listClients();
+  const clients = listClientIds();
   const created = req.query.created === "1";
   const deleted = req.query.deleted === "1";
+  const clientsRoot = getClientsRoot();
   
   const successMessage = created ? '<p style="color: green; font-weight: bold;">✓ Client created successfully!</p>' : '';
   const deletedMessage = deleted ? '<p style="color: green; font-weight: bold;">✓ Client deleted successfully!</p>' : '';
@@ -643,6 +466,10 @@ router.get("/clients", requireAdminAuth, (req, res) => {
   <h2>Clients</h2>
   ${successMessage}
   ${deletedMessage}
+  <div style="margin-bottom: 20px; padding: 10px; background: #e7f3ff; border: 1px solid #b3d9ff; border-radius: 4px;">
+    <p><strong>Config storage path:</strong> <code>${escapeHtml(clientsRoot)}</code></p>
+    <p style="margin-top: 5px; font-size: 0.9em; color: #666;">Clients created here are stored on the server; they will not appear in GitHub automatically.</p>
+  </div>
   <h3>Create New Client</h3>
   <form method="POST" action="/admin/clients" style="margin-bottom: 30px; padding: 15px; border: 1px solid #ccc; max-width: 500px;">
     <input type="hidden" name="csrfToken" value="${csrfToken}">
@@ -696,6 +523,7 @@ router.post("/clients", requireAdminAuth, requireCsrf, (req, res) => {
   const result = createClient(clientId, displayName);
   
   if (!result.success) {
+    const statusCode = result.statusCode || 400;
     logAdminEvent("warn", "admin_client_create_failed", {
       event: "admin_client_create_failed",
       requestId: requestId,
@@ -705,7 +533,7 @@ router.post("/clients", requireAdminAuth, requireCsrf, (req, res) => {
     });
     const csrfToken = generateCsrfToken();
     setCsrfToken(req, csrfToken);
-    return res.status(400).send(`
+    return res.status(statusCode).send(`
 <!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><title>Admin Portal - Create Client</title></head>
@@ -749,6 +577,9 @@ router.get("/clients/:clientId", requireAdminAuth, (req, res) => {
     return res.status(404).send("Client config not found");
   }
   
+  const pathResult = getClientConfigPath(validation.clientId);
+  const configStats = getClientConfigStats(validation.clientId);
+  
   logAdminEvent("info", "admin_client_edit_view", {
     event: "admin_client_edit_view",
     requestId: requestId,
@@ -760,6 +591,13 @@ router.get("/clients/:clientId", requireAdminAuth, (req, res) => {
   
   const successMessage = saved ? '<p style="color: green; font-weight: bold;">✓ Changes saved successfully!</p>' : '';
   const createdMessage = created ? '<p style="color: green; font-weight: bold;">✓ Client created successfully!</p>' : '';
+  
+  const configPathInfo = configStats ? `
+  <div style="margin-bottom: 20px; padding: 10px; background: #f5f5f5; border: 1px solid #ddd; border-radius: 4px;">
+    <p><strong>Config file path:</strong> <code>${escapeHtml(pathResult.path)}</code></p>
+    <p style="margin-top: 5px;"><strong>Last modified:</strong> ${escapeHtml(configStats.mtimeISO)}</p>
+  </div>
+  ` : '';
   
   // Helper to safely get nested value
   const getValue = (obj, path, defaultValue = "") => {
@@ -811,7 +649,7 @@ router.get("/clients/:clientId", requireAdminAuth, (req, res) => {
   ${createdMessage}
   ${successMessage}
   <p><a href="/admin/clients">← Back to clients</a></p>
-  
+  ${configPathInfo}
   <h3>Embed Instructions</h3>
   <div style="margin-bottom: 30px; padding: 15px; background: #f5f5f5; border: 1px solid #ddd;">
     <p><strong>For Shopify (.liquid):</strong></p>
@@ -933,16 +771,15 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res
   // Use the API validation logic by importing it
   const adminApiRoutes = require("./adminApiRoutes");
   const validateConfigUpdate = adminApiRoutes.validateConfigUpdate;
-  const getApiClientConfigPath = adminApiRoutes.getClientConfigPath;
   
-  // Validate clientId and get path (reuse API logic)
-  const pathResult = getApiClientConfigPath(clientId);
+  // Validate clientId and get path (use clientsStore)
+  const pathResult = getClientConfigPath(clientId);
   if (!pathResult.valid || !fs.existsSync(pathResult.path)) {
     return res.status(404).send("Client config not found");
   }
   
   try {
-    // Read existing config
+    // Read existing config (use clientsStore)
     const existingConfig = readClientConfig(clientId);
     if (!existingConfig) {
       return res.status(404).send("Client config not found");
@@ -1099,7 +936,7 @@ router.post("/clients/:clientId/delete", requireAdminAuth, requireCsrf, (req, re
     `);
   }
   
-  const result = deleteClient(clientId);
+  const result = deleteClientSafe(clientId);
   
   if (!result.success) {
     logAdminEvent("warn", "admin_client_delete_failed", {

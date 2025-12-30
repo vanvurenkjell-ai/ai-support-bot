@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const { requireAdminAuth } = require("./auth");
 const { requireCsrf } = require("./csrf");
+const clientsStore = require("../lib/clientsStore");
 
 // Simple logging helper
 function logAdminEvent(level, event, fields) {
@@ -20,73 +21,15 @@ function logAdminEvent(level, event, fields) {
   }
 }
 
-// Path traversal protection: validate clientId
-function validateClientId(clientId) {
-  if (!clientId || typeof clientId !== "string") {
-    return { valid: false, reason: "missing_or_invalid_type" };
-  }
-  const trimmed = String(clientId).trim();
-  if (trimmed.length === 0 || trimmed.length > 40) {
-    return { valid: false, reason: "invalid_length" };
-  }
-  if (!/^[a-zA-Z0-9_-]{1,40}$/.test(trimmed)) {
-    return { valid: false, reason: "invalid_chars" };
-  }
-  return { valid: true, clientId: trimmed };
-}
-
-// Helper: Get Clients directory root (same logic as adminRoutes.js)
-function getClientsRoot() {
-  // Try multiple possible locations for Clients directory
-  const fromAdminDir = path.resolve(__dirname, "..", "..", "Clients");
-  const fromBackendDir = path.resolve(__dirname, "..", "Clients");
-  const fromCwd = path.resolve(process.cwd(), "Clients");
-  
-  if (fs.existsSync(fromAdminDir)) return fromAdminDir;
-  if (fs.existsSync(fromBackendDir)) return fromBackendDir;
-  if (fs.existsSync(fromCwd)) return fromCwd;
-  return fromAdminDir; // Default
-}
-
-// Get safe path to client config
-function getClientConfigPath(clientId) {
-  const clientsRoot = getClientsRoot();
-  const clientDir = path.join(clientsRoot, clientId);
-  const configPath = path.join(clientDir, "client-config.json");
-  
-  // Resolve to absolute path
-  const resolvedPath = path.resolve(configPath);
-  const clientsRootNormalized = path.normalize(clientsRoot);
-  const resolvedNormalized = path.normalize(resolvedPath);
-  
-  // Enforce containment
-  if (!resolvedNormalized.startsWith(clientsRootNormalized + path.sep) && resolvedNormalized !== clientsRootNormalized) {
-    return { valid: false, path: null, reason: "containment_failed" };
-  }
-  
-  return { valid: true, path: resolvedPath, dir: clientDir };
-}
-
-// Get list of client IDs from Clients directory
-function getClientList() {
-  try {
-    const clientsRoot = getClientsRoot();
-    if (!fs.existsSync(clientsRoot)) {
-      return [];
-    }
-    const entries = fs.readdirSync(clientsRoot, { withFileTypes: true });
-    return entries
-      .filter(entry => entry.isDirectory())
-      .map(entry => entry.name)
-      .filter(name => /^[a-zA-Z0-9_-]{1,40}$/.test(name))
-      .sort();
-  } catch (error) {
-    logAdminEvent("error", "admin_client_list_error", {
-      error: error?.message || String(error),
-    });
-    return [];
-  }
-}
+// Use centralized clientsStore module
+const {
+  getClientsRoot,
+  validateClientId,
+  getClientConfigPath,
+  listClientIds,
+  readClientConfig,
+  writeClientConfigAtomic,
+} = clientsStore;
 
 // Color validation: allow hex, rgb/rgba, or named colors
 function isValidColor(color) {
@@ -322,8 +265,10 @@ router.get("/clients/:clientId", requireAdminAuth, (req, res) => {
       return res.status(404).json({ error: "Client config not found" });
     }
     
-    const configContent = fs.readFileSync(pathResult.path, "utf8");
-    const config = JSON.parse(configContent);
+    const config = readClientConfig(validation.clientId);
+    if (!config) {
+      return res.status(404).json({ error: "Client config not found" });
+    }
     
     logAdminEvent("info", "admin_api_client_get", {
       event: "admin_api_client_get",
@@ -379,8 +324,10 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, (req, res) => {
     }
     
     // Read existing config
-    const existingContent = fs.readFileSync(pathResult.path, "utf8");
-    const existingConfig = JSON.parse(existingContent);
+    const existingConfig = readClientConfig(validation.clientId);
+    if (!existingConfig) {
+      return res.status(404).json({ error: "Client config not found" });
+    }
     
     // Validate and sanitize update
     const validationResult = validateConfigUpdate(req.body);
@@ -428,8 +375,17 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, (req, res) => {
       updatedConfig.support = { ...updatedConfig.support, ...validationResult.allowed.support };
     }
     
-    // Write updated config
-    fs.writeFileSync(pathResult.path, JSON.stringify(updatedConfig, null, 2) + "\n", "utf8");
+    // Write updated config (atomic write)
+    const writeResult = writeClientConfigAtomic(validation.clientId, updatedConfig);
+    if (!writeResult.success) {
+      logAdminEvent("error", "admin_api_client_update_write_failed", {
+        event: "admin_api_client_update_write_failed",
+        requestId: requestId,
+        clientId: validation.clientId,
+        error: writeResult.error,
+      });
+      return res.status(500).json({ error: "Error writing client config" });
+    }
     
     logAdminEvent("info", "admin_api_client_update_success", {
       event: "admin_api_client_update_success",
@@ -454,8 +410,7 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, (req, res) => {
   }
 });
 
-// Export router and validation functions for reuse
+// Export router and validation function for reuse
 module.exports = router;
 module.exports.validateConfigUpdate = validateConfigUpdate;
-module.exports.getClientConfigPath = getClientConfigPath;
 

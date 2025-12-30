@@ -2585,8 +2585,9 @@ function retrieveScopedKnowledge(chunks, intent, message, requestId, clientId, s
 // Provably safe client folder resolution with strict containment enforcement
 // ============================================================================
 
-// Absolute base directory for clients (resolved at module load)
-const CLIENTS_ROOT = path.resolve(__dirname, "Clients");
+// Use centralized clientsStore for all client config operations
+const clientsStore = require("./lib/clientsStore");
+const { getClientsRoot, ensureClientsRoot, listClientIds, readClientConfig, getClientConfigPath } = clientsStore;
 
 // ClientId validation pattern (strict allowlist)
 const CLIENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,50}$/;
@@ -2691,18 +2692,31 @@ function resolveClientDir(clientId, requestId = null) {
     return null;
   }
 
-  // Step 6: Build candidate path using path.join() (safe)
+  // Step 6: Use clientsStore to get safe path (includes validation and containment check)
+  const pathResult = getClientConfigPath(decodedClientId);
+  if (!pathResult.valid) {
+    if (requestId && typeof logJson === "function") {
+      logJson("warn", "client_path_traversal_blocked", {
+        event: "client_path_traversal_blocked",
+        requestId: requestId,
+        clientId: clientIdRaw,
+        reason: pathResult.reason || "containment_failed",
+        timestamp: typeof nowIso === "function" ? nowIso() : new Date().toISOString(),
+      });
+    }
+    return null;
+  }
+  
+  // Return the client directory path (not config file path)
+  return pathResult.dir;
+  
+  // Legacy containment check (now handled by clientsStore.getClientConfigPath)
+  /*
+  const CLIENTS_ROOT = getClientsRoot();
   const candidatePath = path.join(CLIENTS_ROOT, decodedClientId);
-
-  // Step 7: Resolve to absolute path
   const resolvedPath = path.resolve(candidatePath);
-
-  // Step 8: Enforce containment - resolved path must be within CLIENTS_ROOT
   const clientsRootNormalized = path.normalize(CLIENTS_ROOT);
   const resolvedNormalized = path.normalize(resolvedPath);
-
-  // Check that resolved path starts with CLIENTS_ROOT + path.sep
-  // This prevents escaping even if path contains symlinks
   if (!resolvedNormalized.startsWith(clientsRootNormalized + path.sep) && resolvedNormalized !== clientsRootNormalized) {
     if (requestId && typeof logJson === "function") {
       logJson("warn", "client_path_traversal_blocked", {
@@ -2715,9 +2729,7 @@ function resolveClientDir(clientId, requestId = null) {
     }
     return null;
   }
-
-  // Step 9: Return safe path
-  return resolvedPath;
+  */
 }
 
 // ---- Client Registry & Validation ----
@@ -2880,42 +2892,23 @@ function validateClientFolder(clientId) {
 }
 
 function initializeClientRegistry() {
-  if (!fs.existsSync(CLIENTS_ROOT)) {
-    if (typeof logJson === "function") {
-    logJson("warn", "client_registry_init", { error: "Clients directory not found" });
-    }
-    return;
-  }
-
   try {
-    const entries = fs.readdirSync(CLIENTS_ROOT, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      if (entry.name.startsWith(".")) continue;
+    // Ensure clients root directory exists (create if needed)
+    ensureClientsRoot();
+    
+    const clientsRoot = getClientsRoot();
+    const clientIds = listClientIds();
 
-      const clientId = entry.name;
-
-      // Validate clientId against allowlist pattern before processing
-      if (!CLIENT_ID_PATTERN.test(clientId)) {
-        if (typeof logJson === "function") {
-          logJson("warn", "client_validation_failed", {
-            clientId: clientId,
-            reason: "invalid_clientid_pattern",
-            message: "Client folder name does not match allowed pattern",
-          });
-        }
-        continue; // Skip invalid folder names
-      }
-
+    for (const clientId of clientIds) {
       const validation = validateClientFolder(clientId);
 
       if (!validation.valid) {
         if (typeof logJson === "function") {
-        logJson("warn", "client_validation_failed", {
-          clientId: clientId,
-          missingFiles: validation.missingFiles,
-          errors: validation.errors,
-        });
+          logJson("warn", "client_validation_failed", {
+            clientId: clientId,
+            missingFiles: validation.missingFiles,
+            errors: validation.errors,
+          });
         }
         clientRegistry.set(clientId, {
           status: "invalid",
@@ -2937,9 +2930,18 @@ function initializeClientRegistry() {
           continue;
         }
 
-        const configPath = path.join(base, "client-config.json");
-        const configRaw = readFile(configPath);
-        const config = safeJsonParse(configRaw, {});
+        // Use clientsStore to read config
+        const config = readClientConfig(clientId);
+        if (!config) {
+          if (typeof logJson === "function") {
+            logJson("warn", "client_config_read_failed", {
+              clientId: clientId,
+              reason: "config_file_not_found_or_invalid",
+            });
+          }
+          continue;
+        }
+        
         const normalizedConfig = normalizeClientConfig(config, clientId);
 
         clientRegistry.set(clientId, {
@@ -2948,10 +2950,10 @@ function initializeClientRegistry() {
         });
       } catch (e) {
         if (typeof logJson === "function") {
-        logJson("warn", "client_config_normalize_failed", {
-          clientId: clientId,
-          error: e && e.message ? e.message : String(e),
-        });
+          logJson("warn", "client_config_normalize_failed", {
+            clientId: clientId,
+            error: e && e.message ? e.message : String(e),
+          });
         }
         clientRegistry.set(clientId, {
           status: "invalid",
@@ -2964,6 +2966,7 @@ function initializeClientRegistry() {
     logJson("info", "client_registry_initialized", {
       totalClients: clientRegistry.size,
       validClients: validCount,
+      clientsRoot: clientsRoot,
     });
   } catch (e) {
     logJson("error", "client_registry_init_error", {
@@ -4135,22 +4138,12 @@ app.get("/widget-config", widgetCors, requireWidgetAuth, (req, res) => {
 
   const clientId = sanitizeClientId(clientIdRaw);
 
-  // ROOT CAUSE FIX: Read config fresh from disk (bypass clientRegistry cache)
+  // ROOT CAUSE FIX: Read config fresh from disk using clientsStore (bypass clientRegistry cache)
   // Admin saves write to disk but clientRegistry is never invalidated.
   // Reading fresh ensures /widget-config always returns latest data after admin saves.
   try {
-    const base = resolveClientDir(clientId);
-    if (!base) {
-      res.status(404);
-      return res.json({
-        requestId: req.requestId,
-        error: "invalid_client",
-        message: "Deze chat is niet juist geconfigureerd. Neem contact op met support.",
-      });
-    }
-    
-    const configPath = path.join(base, "client-config.json");
-    if (!fs.existsSync(configPath)) {
+    const pathResult = getClientConfigPath(clientId);
+    if (!pathResult.valid) {
       res.status(404);
       return res.json({
         requestId: req.requestId,
@@ -4160,13 +4153,21 @@ app.get("/widget-config", widgetCors, requireWidgetAuth, (req, res) => {
     }
     
     // Read fresh from disk (not from cache)
-    const stats = fs.statSync(configPath);
-    const configMtime = stats.mtime.toISOString();
-    const configRaw = fs.readFileSync(configPath, "utf8");
-    const configParsed = safeJsonParse(configRaw, {});
-    const config = normalizeClientConfig(configParsed, clientId);
+    const config = readClientConfig(clientId);
+    if (!config) {
+      res.status(404);
+      return res.json({
+        requestId: req.requestId,
+        error: "invalid_client",
+        message: "Deze chat is niet juist geconfigureerd. Neem contact op met support.",
+      });
+    }
     
-    const widgetConfig = buildWidgetConfig(config, clientId);
+    const stats = fs.statSync(pathResult.path);
+    const configMtime = stats.mtime.toISOString();
+    const normalizedConfig = normalizeClientConfig(config, clientId);
+    
+    const widgetConfig = buildWidgetConfig(normalizedConfig, clientId);
     const entryScreenTitle = widgetConfig.entryScreen?.title || null;
     
     // Prevent HTTP caching - always serve fresh config
@@ -4183,7 +4184,7 @@ app.get("/widget-config", widgetCors, requireWidgetAuth, (req, res) => {
       requestId: req.requestId,
       clientId: clientId,
       entryScreenTitle: entryScreenTitle,
-      configSourcePath: configPath,
+      configSourcePath: pathResult.path,
       configMtime: configMtime,
     });
 
