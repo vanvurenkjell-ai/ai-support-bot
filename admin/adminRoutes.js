@@ -1,5 +1,7 @@
 const express = require("express");
 const router = express.Router();
+const fs = require("fs");
+const path = require("path");
 const { sessionMiddleware, requireAdminAuth, verifyAdminCredentials, regenerateSession, ADMIN_EMAIL } = require("./auth");
 const { generateCsrfToken, setCsrfToken, getCsrfToken, requireCsrf } = require("./csrf");
 
@@ -85,8 +87,8 @@ function adminSecurityHeaders(req, res, next) {
 // Apply security headers to all admin routes
 router.use(adminSecurityHeaders);
 
-// Parse URL-encoded form data (for login/logout forms)
-router.use(express.urlencoded({ extended: false }));
+// Parse URL-encoded form data (for login/logout forms and client config forms)
+router.use(express.urlencoded({ extended: true }));
 
 // Helper function to escape HTML (XSS protection)
 function escapeHtml(text) {
@@ -258,6 +260,62 @@ router.post("/logout", requireAdminAuth, requireCsrf, (req, res) => {
   });
 });
 
+// Helper: Get client list from Clients directory
+function getClientList() {
+  try {
+    const clientsRoot = path.resolve(__dirname, "..", "..", "Clients");
+    if (!fs.existsSync(clientsRoot)) {
+      return [];
+    }
+    const entries = fs.readdirSync(clientsRoot, { withFileTypes: true });
+    return entries
+      .filter(entry => entry.isDirectory())
+      .map(entry => entry.name)
+      .filter(name => /^[a-zA-Z0-9_-]{1,40}$/.test(name))
+      .sort();
+  } catch (error) {
+    return [];
+  }
+}
+
+// Helper: Get client config path (with path traversal protection)
+function getClientConfigPath(clientId) {
+  if (!clientId || typeof clientId !== "string" || !/^[a-zA-Z0-9_-]{1,40}$/.test(clientId.trim())) {
+    return null;
+  }
+  const clientsRoot = path.resolve(__dirname, "..", "..", "Clients");
+  const clientDir = path.join(clientsRoot, clientId.trim());
+  const configPath = path.join(clientDir, "client-config.json");
+  const resolvedPath = path.resolve(configPath);
+  const clientsRootNormalized = path.normalize(clientsRoot);
+  const resolvedNormalized = path.normalize(resolvedPath);
+  if (!resolvedNormalized.startsWith(clientsRootNormalized + path.sep) && resolvedNormalized !== clientsRootNormalized) {
+    return null;
+  }
+  return resolvedPath;
+}
+
+// Helper: Render navigation HTML
+function renderNav(currentPage = "dashboard", csrfToken) {
+  const navItems = [
+    { path: "/admin", label: "Dashboard", active: currentPage === "dashboard" },
+    { path: "/admin/clients", label: "Clients", active: currentPage === "clients" },
+  ];
+  return `
+    <nav style="margin-bottom: 20px; border-bottom: 1px solid #ccc; padding-bottom: 10px;">
+      ${navItems.map(item => `
+        <a href="${escapeHtml(item.path)}" style="margin-right: 15px; text-decoration: ${item.active ? "none" : "underline"}; color: ${item.active ? "#000" : "#0066cc"};">
+          ${escapeHtml(item.label)}
+        </a>
+      `).join("")}
+      <form method="POST" action="/admin/logout" style="display: inline; margin-left: 15px;">
+        <input type="hidden" name="csrfToken" value="${csrfToken}">
+        <button type="submit" style="background: #dc3545; color: white; border: none; padding: 5px 10px; cursor: pointer;">Logout</button>
+      </form>
+    </nav>
+  `;
+}
+
 // Admin dashboard (GET /admin)
 router.get("/", requireAdminAuth, (req, res) => {
   // Log admin page access for diagnostics
@@ -285,19 +343,292 @@ router.get("/", requireAdminAuth, (req, res) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Admin Portal</title>
+  <title>Admin Portal - Dashboard</title>
 </head>
 <body>
   <h1>Admin Portal</h1>
-  <p>You are logged in as <strong>${escapeHtml(adminEmail)}</strong></p>
-  <form method="POST" action="/admin/logout">
-    <input type="hidden" name="csrfToken" value="${csrfToken}">
-    <button type="submit">Logout</button>
-  </form>
+  <p>Logged in as <strong>${escapeHtml(adminEmail)}</strong></p>
+  ${renderNav("dashboard", csrfToken)}
+  <h2>Dashboard</h2>
+  <p>Welcome to the admin portal. Use the navigation above to manage clients.</p>
 </body>
 </html>
   `;
   res.send(html);
+});
+
+// Clients list (GET /admin/clients)
+router.get("/clients", requireAdminAuth, (req, res) => {
+  const requestId = req.requestId || "unknown";
+  logAdminEvent("info", "admin_clients_list_view", {
+    event: "admin_clients_list_view",
+    requestId: requestId,
+  });
+
+  const csrfToken = generateCsrfToken();
+  setCsrfToken(req, csrfToken);
+
+  const clients = getClientList();
+  const clientsList = clients.length > 0
+    ? `<ul>${clients.map(clientId => `<li><a href="/admin/clients/${escapeHtml(clientId)}">${escapeHtml(clientId)}</a></li>`).join("")}</ul>`
+    : "<p>No clients found.</p>";
+
+  const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin Portal - Clients</title>
+</head>
+<body>
+  <h1>Admin Portal</h1>
+  ${renderNav("clients", csrfToken)}
+  <h2>Clients</h2>
+  ${clientsList}
+</body>
+</html>
+  `;
+  res.send(html);
+});
+
+// Client config editor (GET /admin/clients/:clientId)
+router.get("/clients/:clientId", requireAdminAuth, (req, res) => {
+  const requestId = req.requestId || "unknown";
+  const clientId = req.params.clientId;
+  const saved = req.query.saved === "1";
+  
+  if (!clientId || typeof clientId !== "string" || !/^[a-zA-Z0-9_-]{1,40}$/.test(clientId.trim())) {
+    return res.status(400).send("Invalid client ID");
+  }
+  
+  const configPath = getClientConfigPath(clientId);
+  if (!configPath || !fs.existsSync(configPath)) {
+    return res.status(404).send("Client config not found");
+  }
+  
+  try {
+    const configContent = fs.readFileSync(configPath, "utf8");
+    const config = JSON.parse(configContent);
+    
+    logAdminEvent("info", "admin_client_edit_view", {
+      event: "admin_client_edit_view",
+      requestId: requestId,
+      clientId: clientId,
+    });
+    
+    const csrfToken = generateCsrfToken();
+    setCsrfToken(req, csrfToken);
+    
+    const successMessage = saved ? '<p style="color: green; font-weight: bold;">✓ Changes saved successfully!</p>' : '';
+    
+    // Helper to safely get nested value
+    const getValue = (obj, path, defaultValue = "") => {
+      const parts = path.split(".");
+      let current = obj;
+      for (const part of parts) {
+        if (current && typeof current === "object" && part in current) {
+          current = current[part];
+        } else {
+          return defaultValue;
+        }
+      }
+      return current != null ? String(current) : defaultValue;
+    };
+    
+    const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin Portal - Edit ${escapeHtml(clientId)}</title>
+</head>
+<body>
+  <h1>Admin Portal</h1>
+  ${renderNav("clients", csrfToken)}
+  <h2>Edit Client: ${escapeHtml(clientId)}</h2>
+  ${successMessage}
+  <p><a href="/admin/clients">← Back to clients</a></p>
+  
+  <form method="POST" action="/admin/clients/${escapeHtml(clientId)}" style="max-width: 800px;">
+    <input type="hidden" name="csrfToken" value="${csrfToken}">
+    
+    <h3>Colors</h3>
+    <div style="margin-bottom: 15px;">
+      <label>Primary: <input type="text" name="colors[primary]" value="${escapeHtml(getValue(config, "colors.primary", ""))}" style="width: 200px;"></label><br>
+      <label>Accent: <input type="text" name="colors[accent]" value="${escapeHtml(getValue(config, "colors.accent", ""))}" style="width: 200px;"></label><br>
+      <label>Background: <input type="text" name="colors[background]" value="${escapeHtml(getValue(config, "colors.background", ""))}" style="width: 200px;"></label><br>
+      <label>User Bubble: <input type="text" name="colors[userBubble]" value="${escapeHtml(getValue(config, "colors.userBubble", ""))}" style="width: 200px;"></label><br>
+      <label>Bot Bubble: <input type="text" name="colors[botBubble]" value="${escapeHtml(getValue(config, "colors.botBubble", ""))}" style="width: 200px;"></label><br>
+    </div>
+    
+    <h3>Widget</h3>
+    <div style="margin-bottom: 15px;">
+      <label>Title: <input type="text" name="widget[title]" value="${escapeHtml(getValue(config, "widget.title", ""))}" style="width: 400px;" maxlength="60"></label><br>
+      <label>Greeting: <textarea name="widget[greeting]" style="width: 400px; height: 60px;" maxlength="200">${escapeHtml(getValue(config, "widget.greeting", ""))}</textarea></label><br>
+    </div>
+    
+    <h3>Logo URL</h3>
+    <div style="margin-bottom: 15px;">
+      <label>Logo URL: <input type="text" name="logoUrl" value="${escapeHtml(getValue(config, "logoUrl", ""))}" style="width: 500px;" maxlength="300"></label><br>
+    </div>
+    
+    <h3>Entry Screen</h3>
+    <div style="margin-bottom: 15px;">
+      <label><input type="checkbox" name="entryScreen[enabled]" ${getValue(config, "entryScreen.enabled", false) ? "checked" : ""}> Enabled</label><br>
+      <label>Title: <input type="text" name="entryScreen[title]" value="${escapeHtml(getValue(config, "entryScreen.title", ""))}" style="width: 400px;" maxlength="80"></label><br>
+      <label>Disclaimer: <textarea name="entryScreen[disclaimer]" style="width: 400px; height: 60px;" maxlength="300">${escapeHtml(getValue(config, "entryScreen.disclaimer", ""))}</textarea></label><br>
+      <label>Primary Button Label: <input type="text" name="entryScreen[primaryButton][label]" value="${escapeHtml(getValue(config, "entryScreen.primaryButton.label", ""))}" style="width: 300px;" maxlength="40"></label><br>
+      <label>Secondary Button 1 Label: <input type="text" name="entryScreen[secondaryButtons][0][label]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.0.label", ""))}" style="width: 300px;" maxlength="40"></label><br>
+      <label>Secondary Button 1 URL: <input type="text" name="entryScreen[secondaryButtons][0][url]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.0.url", ""))}" style="width: 400px;" maxlength="300"></label><br>
+      <label>Secondary Button 2 Label: <input type="text" name="entryScreen[secondaryButtons][1][label]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.1.label", ""))}" style="width: 300px;" maxlength="40"></label><br>
+      <label>Secondary Button 2 URL: <input type="text" name="entryScreen[secondaryButtons][1][url]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.1.url", ""))}" style="width: 400px;" maxlength="300"></label><br>
+    </div>
+    
+    <h3>Support</h3>
+    <div style="margin-bottom: 15px;">
+      <label>Email: <input type="email" name="support[email]" value="${escapeHtml(getValue(config, "support.email", ""))}" style="width: 300px;" maxlength="120"></label><br>
+      <label>Contact URL: <input type="text" name="support[contactUrl]" value="${escapeHtml(getValue(config, "support.contactUrl", ""))}" style="width: 500px;" maxlength="300"></label><br>
+      <label>Contact URL Message Param: <input type="text" name="support[contactUrlMessageParam]" value="${escapeHtml(getValue(config, "support.contactUrlMessageParam", ""))}" style="width: 200px;" maxlength="40"></label><br>
+    </div>
+    
+    <button type="submit" style="background: #28a745; color: white; border: none; padding: 10px 20px; cursor: pointer; font-size: 16px;">Save Changes</button>
+  </form>
+</body>
+</html>
+    `;
+    res.send(html);
+  } catch (error) {
+    logAdminEvent("error", "admin_client_edit_error", {
+      event: "admin_client_edit_error",
+      requestId: requestId,
+      clientId: clientId,
+      error: error?.message || String(error),
+    });
+    return res.status(500).send("Error loading client config");
+  }
+});
+
+// Client config update (POST /admin/clients/:clientId) - form submission
+router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res) => {
+  const requestId = req.requestId || "unknown";
+  const clientId = req.params.clientId;
+  
+  if (!clientId || typeof clientId !== "string" || !/^[a-zA-Z0-9_-]{1,40}$/.test(clientId.trim())) {
+    return res.status(400).send("Invalid client ID");
+  }
+  
+  // Transform form data to API format
+  const updateData = {};
+  if (req.body.colors) {
+    updateData.colors = req.body.colors;
+  }
+  if (req.body.widget) {
+    updateData.widget = req.body.widget;
+  }
+  if (req.body.logoUrl !== undefined) {
+    updateData.logoUrl = req.body.logoUrl;
+  }
+  if (req.body.entryScreen) {
+    updateData.entryScreen = { ...req.body.entryScreen };
+    // Fix secondary buttons array - form sends as indexed array
+    if (req.body.entryScreen.secondaryButtons && Array.isArray(req.body.entryScreen.secondaryButtons)) {
+      const buttons = [];
+      for (const btn of req.body.entryScreen.secondaryButtons) {
+        if (btn && btn.label && btn.url) {
+          buttons.push({ label: btn.label, action: "link", url: btn.url });
+        }
+      }
+      updateData.entryScreen.secondaryButtons = buttons.slice(0, 2); // Max 2
+    }
+    // Ensure primaryButton.action is set
+    if (updateData.entryScreen.primaryButton && !updateData.entryScreen.primaryButton.action) {
+      updateData.entryScreen.primaryButton.action = "openChat";
+    }
+  }
+  if (req.body.support) {
+    updateData.support = req.body.support;
+  }
+  
+  // Use the API validation logic by importing it
+  const adminApiRoutes = require("./adminApiRoutes");
+  const validateConfigUpdate = adminApiRoutes.validateConfigUpdate;
+  const getApiClientConfigPath = adminApiRoutes.getClientConfigPath;
+  
+  // Validate clientId and get path (reuse API logic)
+  const pathResult = getApiClientConfigPath(clientId);
+  if (!pathResult.valid || !fs.existsSync(pathResult.path)) {
+    return res.status(404).send("Client config not found");
+  }
+  
+  try {
+    // Read existing config
+    const existingContent = fs.readFileSync(pathResult.path, "utf8");
+    const existingConfig = JSON.parse(existingContent);
+    
+    // Validate update (reuse API validation)
+    const validationResult = validateConfigUpdate(updateData);
+    if (validationResult.errors.length > 0) {
+      logAdminEvent("warn", "admin_client_update_validation_failed", {
+        event: "admin_client_update_validation_failed",
+        requestId: requestId,
+        clientId: clientId,
+        errors: validationResult.errors,
+      });
+      return res.status(400).send(`Validation failed: ${validationResult.errors.join(", ")}`);
+    }
+    
+    // Merge allowed fields into existing config
+    const updatedConfig = JSON.parse(JSON.stringify(existingConfig));
+    if (validationResult.allowed.colors) {
+      updatedConfig.colors = { ...updatedConfig.colors, ...validationResult.allowed.colors };
+    }
+    if (validationResult.allowed.widget) {
+      updatedConfig.widget = { ...updatedConfig.widget, ...validationResult.allowed.widget };
+    }
+    if (validationResult.allowed.logoUrl !== undefined) {
+      updatedConfig.logoUrl = validationResult.allowed.logoUrl;
+    }
+    if (validationResult.allowed.entryScreen) {
+      updatedConfig.entryScreen = { ...updatedConfig.entryScreen, ...validationResult.allowed.entryScreen };
+      if (validationResult.allowed.entryScreen.primaryButton) {
+        updatedConfig.entryScreen.primaryButton = {
+          ...updatedConfig.entryScreen.primaryButton,
+          ...validationResult.allowed.entryScreen.primaryButton,
+        };
+      }
+      if (validationResult.allowed.entryScreen.secondaryButtons !== undefined) {
+        updatedConfig.entryScreen.secondaryButtons = validationResult.allowed.entryScreen.secondaryButtons;
+      }
+    }
+    if (validationResult.allowed.support) {
+      updatedConfig.support = { ...updatedConfig.support, ...validationResult.allowed.support };
+    }
+    
+    // Write updated config
+    fs.writeFileSync(pathResult.path, JSON.stringify(updatedConfig, null, 2) + "\n", "utf8");
+    
+    logAdminEvent("info", "admin_client_update_success", {
+      event: "admin_client_update_success",
+      requestId: requestId,
+      clientId: clientId,
+      updatedFields: Object.keys(validationResult.allowed),
+    });
+    
+    // Redirect back to edit page with success message
+    const csrfToken = generateCsrfToken();
+    setCsrfToken(req, csrfToken);
+    return res.redirect(`/admin/clients/${encodeURIComponent(clientId)}?saved=1`);
+  } catch (error) {
+    logAdminEvent("error", "admin_client_update_error", {
+      event: "admin_client_update_error",
+      requestId: requestId,
+      clientId: clientId,
+      error: error?.message || String(error),
+    });
+    return res.status(500).send("Error updating client config");
+  }
 });
 
 // Health check endpoint (GET /admin/health)
