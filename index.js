@@ -948,7 +948,8 @@ const COST_CLIENT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 const COST_CLIENT_MAX_TOKENS = 200000; // Max tokens per client per hour (approximate)
 
 // Per-request hard token cap (prevents single request from draining budget)
-const MAX_TOKENS_PER_REQUEST = 3000; // Hard cap per LLM call
+// Increased to allow normal conversations while still preventing abuse
+const MAX_TOKENS_PER_REQUEST = 8000; // Hard cap per LLM call (increased from 3000 to allow normal questions)
 
 // Token estimation constants (approximate, conservative)
 const TOKENS_PER_CHAR = 0.25; // Rough estimate: ~4 chars per token
@@ -3255,9 +3256,9 @@ function isKnowledgeInsufficient(contextString, knowledgeResult) {
   }
   
   // Check if very short (below minimal threshold for meaningful content)
-  // Threshold: less than 50 characters likely indicates insufficient knowledge
-  // (Lower threshold because facts are now shorter and more focused)
-  if (contextString.trim().length < 50) return true;
+  // Increased threshold: less than 30 characters likely indicates insufficient knowledge
+  // (Very low threshold to avoid false positives - even a single short fact should be enough)
+  if (contextString.trim().length < 30) return true;
   
   return false;
 }
@@ -4714,18 +4715,35 @@ app.post("/chat", widgetCors, requireWidgetAuth, async (req, res) => {
     const historyMessages = buildHistoryMessages(sessionId);
     const currentMeta = getMeta(sessionId);
     
-    // Knowledge gap detection (only if not already handling missing info clarification)
+    // ============================================================================
+    // KNOWLEDGE GAP DETECTION & CLARIFICATION FLOW
+    // ============================================================================
+    // CRITICAL: Always ask clarification BEFORE escalating
+    // Escalation only happens AFTER user responds to clarification
+    // ============================================================================
+    
+    // Check if we're currently awaiting clarification response
     const knowledgeGapClarificationAsked = currentMeta.knowledgeGapClarificationAsked || false;
+    const previousKnowledgeGapTopic = currentMeta.knowledgeGapTopic || null;
+    
+    // Check if knowledge is insufficient (but be lenient - allow LLM to try first)
     const knowledgeInsufficient = isKnowledgeInsufficient(context, knowledgeResult);
     
+    // CRITICAL FIX: Only check knowledge gap if:
+    // 1. Not already handling missing info clarification (expectedSlot)
+    // 2. Knowledge is truly insufficient (empty or very minimal)
+    // 3. We haven't already asked clarification for this topic
     if (knowledgeInsufficient && !currentMeta.expectedSlot) {
-      // Only check knowledge gap if we're not already asking for missing info clarification
-      if (!knowledgeGapClarificationAsked) {
-        // First time detecting knowledge gap: ask one clarification
-        const knowledgeGapTopic = effectiveIntent.mainIntent || "unknown";
+      // Check if this is a NEW knowledge gap (different topic or first time)
+      const isNewKnowledgeGap = !knowledgeGapClarificationAsked || 
+                                 (previousKnowledgeGapTopic && previousKnowledgeGapTopic !== effectiveIntent.mainIntent);
+      
+      if (isNewKnowledgeGap) {
+        // First time detecting knowledge gap for this topic: ask ONE clarification
+        const knowledgeGapTopicForClarification = effectiveIntent.mainIntent || "unknown";
         setMeta(sessionId, {
           knowledgeGapClarificationAsked: true,
-          knowledgeGapTopic: knowledgeGapTopic,
+          knowledgeGapTopic: knowledgeGapTopicForClarification,
           knowledgeGapDetectedCount: (currentMeta.knowledgeGapDetectedCount || 0) + 1,
           lastKnowledgeGapAt: Date.now(),
         });
@@ -4733,14 +4751,14 @@ app.post("/chat", widgetCors, requireWidgetAuth, async (req, res) => {
         const reply = buildKnowledgeGapClarificationReply(data.clientConfig.language || "nl");
         appendToHistory(sessionId, "assistant", reply);
         
-        const knowledgeGapClarificationTopicInfo = normalizeTopic({ intent: effectiveIntent, orderNumber: effectiveIntent.orderNumber, escalateReason: null, knowledgeGapTopic: knowledgeGapTopic, facts: getFacts(sessionId) });
+        const knowledgeGapClarificationTopicInfo = normalizeTopic({ intent: effectiveIntent, orderNumber: effectiveIntent.orderNumber, escalateReason: null, knowledgeGapTopic: knowledgeGapTopicForClarification, facts: getFacts(sessionId) });
         
-        logJson("info", "knowledge_gap", {
+        logJson("info", "knowledge_gap_clarification_asked", {
           requestId: req.requestId,
           conversationId: conversationId,
           clientId: clientId,
           sessionId: sessionId,
-          knowledgeGapTopic: knowledgeGapTopic,
+          knowledgeGapTopic: knowledgeGapTopicForClarification,
           topic: knowledgeGapClarificationTopicInfo.topic,
           topicSource: knowledgeGapClarificationTopicInfo.topicSource,
         });
@@ -4756,7 +4774,7 @@ app.post("/chat", widgetCors, requireWidgetAuth, async (req, res) => {
           clarificationType: null,
           clarificationAttemptCount: null,
           knowledgeGapDetected: true,
-          knowledgeGapTopic: knowledgeGapTopic,
+          knowledgeGapTopic: knowledgeGapTopicForClarification,
           knowledgeGapClarificationAsked: true,
           knowledgeGapClarificationCount: 1,
           shopifyLookupAttempted: shopifyLookupAttempted,
@@ -4778,8 +4796,10 @@ app.post("/chat", widgetCors, requireWidgetAuth, async (req, res) => {
           escalated: false,
           facts: getFacts(sessionId),
         });
-      } else {
-        // Already asked clarification once, now escalate
+      } else if (knowledgeGapClarificationAsked && previousKnowledgeGapTopic === effectiveIntent.mainIntent) {
+        // Already asked clarification for this topic, user responded, but still insufficient
+        // NOW we can escalate (but only if knowledge is STILL insufficient after clarification)
+        // Check escalation throttling
         // Check escalation throttling
         const escalationCheck = checkAbuseControls(req, clientId, sessionId, true);
         if (escalationCheck.blocked && escalationCheck.reason === "escalation_limit") {
@@ -4801,7 +4821,8 @@ app.post("/chat", widgetCors, requireWidgetAuth, async (req, res) => {
           });
         }
         
-        const knowledgeGapTopic = currentMeta.knowledgeGapTopic || effectiveIntent.mainIntent || "unknown";
+        // Escalate after clarification was asked and user responded
+        const escalationKnowledgeGapTopic = previousKnowledgeGapTopic || effectiveIntent.mainIntent || "unknown";
         const reply = buildKnowledgeGapEscalationReply(data.clientConfig || {}, data.clientId);
         appendToHistory(sessionId, "assistant", reply);
         
@@ -4819,7 +4840,7 @@ app.post("/chat", widgetCors, requireWidgetAuth, async (req, res) => {
           orderNumberPresent: Boolean(knowledgeGapFacts.orderNumber || effectiveIntent.orderNumber),
           escalateReason: "knowledge_gap",
           missingInfoType: null,
-          knowledgeGapTopic: knowledgeGapTopic,
+          knowledgeGapTopic: escalationKnowledgeGapTopic,
           clientConfig: data.clientConfig || {},
           clientId: data.clientId,
           conversationId: conversationId,
@@ -4994,33 +5015,69 @@ CRITICAL RULES:
     
     if (costPreCheck.blocked) {
       // Cost limit would be exceeded - block BEFORE LLM call
+      // BUT: Only block if it's truly excessive (per-request cap) or budget exhausted
+      // Do NOT block for normal questions - let them through to normal flow
       const lang = (data.clientConfig && data.clientConfig.language) || "nl";
       const isEn = String(lang).toLowerCase().startsWith("en");
       
-      let costLimitMessage;
+      // Only block for per-request cap (truly huge requests) or budget exhaustion
+      // For budget issues, escalate normally with proper handoff
       if (costPreCheck.reason === "per_request_cap_exceeded") {
-        // Request too large - degrade to escalation
-        costLimitMessage = isEn
+        // Request is genuinely too large (e.g., >8000 tokens estimated)
+        // This is rare and indicates abuse or extremely long input
+        const costLimitMessage = isEn
           ? "This request is too complex for me to handle via chat. Please contact our support team directly for assistance."
           : "Deze vraag is te complex voor mij om via de chat te beantwoorden. Neem direct contact op met ons supportteam voor hulp.";
+        
+        return res.json({
+          requestId: req.requestId,
+          reply: costLimitMessage,
+          intent: effectiveIntent,
+          shopify: null,
+          routed: true,
+          escalated: true,
+          escalateToHuman: true,
+          escalateReason: "cost_limit",
+          facts: getFacts(sessionId),
+        });
       } else {
-        // Budget insufficient - polite throttling message
-        costLimitMessage = isEn
+        // Budget insufficient - escalate with proper handoff (not "too complex")
+        const costLimitMessage = isEn
           ? "I've reached my usage limit for this conversation. Please contact our support team directly for further assistance."
           : "Ik heb mijn gebruikslimiet voor dit gesprek bereikt. Neem direct contact op met ons supportteam voor verdere hulp.";
+        
+        // Build proper handoff for cost limit escalation
+        const topicInfo = normalizeTopic({ intent: effectiveIntent, orderNumber: effectiveIntent.orderNumber, escalateReason: "cost_limit", knowledgeGapTopic: null, facts: getFacts(sessionId) });
+        const handoff = buildHandoffPayload({
+          topic: topicInfo.topic,
+          topicSource: topicInfo.topicSource,
+          intentMain: effectiveIntent.mainIntent,
+          orderNumberPresent: Boolean(getFacts(sessionId).orderNumber || effectiveIntent.orderNumber),
+          escalateReason: "cost_limit",
+          missingInfoType: null,
+          knowledgeGapTopic: null,
+          clientConfig: data.clientConfig || {},
+          clientId: data.clientId,
+          conversationId: conversationId,
+          requestId: req.requestId,
+        });
+        
+        endConversation(sessionId, "escalated_to_human");
+        
+        return res.json({
+          requestId: req.requestId,
+          reply: costLimitMessage,
+          intent: effectiveIntent,
+          shopify: null,
+          routed: true,
+          escalated: true,
+          escalateToHuman: true,
+          escalateReason: "cost_limit",
+          handoffSummary: handoff.summary,
+          handoffPayload: handoff.payload,
+          facts: getFacts(sessionId),
+        });
       }
-      
-      return res.json({
-        requestId: req.requestId,
-        reply: costLimitMessage,
-        intent: effectiveIntent,
-        shopify: null,
-        routed: true,
-        escalated: costPreCheck.reason !== "per_request_cap_exceeded",
-        escalateToHuman: costPreCheck.reason !== "per_request_cap_exceeded",
-        escalateReason: costPreCheck.reason === "per_request_cap_exceeded" ? null : "cost_limit",
-        facts: getFacts(sessionId),
-      });
     }
     
     // ============================================================================
