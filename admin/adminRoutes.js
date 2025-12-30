@@ -327,13 +327,32 @@ function getClientList() {
   }
 }
 
-// Helper: Get client config path (with path traversal protection)
+// Validate clientId format (2-40 chars, starts with letter, only alphanumeric/underscore/hyphen)
+function validateClientId(clientId) {
+  if (!clientId || typeof clientId !== "string") {
+    return { valid: false, reason: "missing_or_invalid_type" };
+  }
+  const trimmed = clientId.trim();
+  if (trimmed.length < 2 || trimmed.length > 40) {
+    return { valid: false, reason: "invalid_length" };
+  }
+  if (!/^[a-zA-Z]/.test(trimmed)) {
+    return { valid: false, reason: "must_start_with_letter" };
+  }
+  if (!/^[a-zA-Z0-9_-]+$/.test(trimmed)) {
+    return { valid: false, reason: "invalid_chars" };
+  }
+  return { valid: true, clientId: trimmed };
+}
+
+// Get client config path (with path traversal protection)
 function getClientConfigPath(clientId) {
-  if (!clientId || typeof clientId !== "string" || !/^[a-zA-Z0-9_-]{1,40}$/.test(clientId.trim())) {
+  const validation = validateClientId(clientId);
+  if (!validation.valid) {
     return null;
   }
   const clientsRoot = getClientsRoot();
-  const clientDir = path.join(clientsRoot, clientId.trim());
+  const clientDir = path.join(clientsRoot, validation.clientId);
   const configPath = path.join(clientDir, "client-config.json");
   const resolvedPath = path.resolve(configPath);
   const clientsRootNormalized = path.normalize(clientsRoot);
@@ -341,7 +360,187 @@ function getClientConfigPath(clientId) {
   if (!resolvedNormalized.startsWith(clientsRootNormalized + path.sep) && resolvedNormalized !== clientsRootNormalized) {
     return null;
   }
-  return resolvedPath;
+  return { path: resolvedPath, dir: clientDir };
+}
+
+// List all client IDs from Clients directory
+function listClients() {
+  return getClientList();
+}
+
+// Read client config from disk
+function readClientConfig(clientId) {
+  const pathResult = getClientConfigPath(clientId);
+  if (!pathResult || !fs.existsSync(pathResult.path)) {
+    return null;
+  }
+  try {
+    const configContent = fs.readFileSync(pathResult.path, "utf8");
+    return JSON.parse(configContent);
+  } catch (error) {
+    logAdminEvent("error", "admin_client_read_error", {
+      event: "admin_client_read_error",
+      clientId: clientId,
+      error: error?.message || String(error),
+    });
+    return null;
+  }
+}
+
+// Write client config to disk
+function writeClientConfig(clientId, config) {
+  const pathResult = getClientConfigPath(clientId);
+  if (!pathResult) {
+    return { success: false, error: "Invalid client ID" };
+  }
+  try {
+    // Ensure directory exists
+    if (!fs.existsSync(pathResult.dir)) {
+      fs.mkdirSync(pathResult.dir, { recursive: true });
+    }
+    const configJson = JSON.stringify(config, null, 2) + "\n";
+    fs.writeFileSync(pathResult.path, configJson, "utf8");
+    return { success: true, path: pathResult.path };
+  } catch (error) {
+    logAdminEvent("error", "admin_client_write_error", {
+      event: "admin_client_write_error",
+      clientId: clientId,
+      error: error?.message || String(error),
+    });
+    return { success: false, error: error?.message || String(error) };
+  }
+}
+
+// Create default client config
+function createDefaultConfig(clientId, displayName = null) {
+  const name = displayName || clientId;
+  return {
+    version: "1.0.0",
+    brandName: name,
+    assistantName: `${name} klantenservice assistent`,
+    language: "nl",
+    noEmojis: true,
+    support: {
+      email: null,
+      contactUrl: null,
+      contactUrlMessageParam: "message",
+    },
+    widget: {
+      title: displayName || `${name} AI-assistent`,
+      greeting: `Hallo! Ik ben de ${name} klantenservice assistent. Fijn dat je er bent. Waar kan ik je mee helpen?`,
+    },
+    entryScreen: {
+      enabled: true,
+      title: displayName ? `Interesse in ${displayName}?` : null,
+      disclaimer: null,
+      primaryButton: { label: "Start chat", action: "openChat" },
+      secondaryButtons: [],
+    },
+    colors: {
+      primary: "#225ADF",
+      accent: "#2563eb",
+      background: "#ffffff",
+      userBubble: "#225ADF",
+      botBubble: "#ffffff",
+    },
+    features: {
+      orderLookup: true,
+      returns: true,
+      productAdvice: true,
+      humanHandoff: true,
+    },
+  };
+}
+
+// Create new client
+function createClient(clientId, displayName = null) {
+  const validation = validateClientId(clientId);
+  if (!validation.valid) {
+    return { success: false, error: `Invalid client ID: ${validation.reason}` };
+  }
+  
+  const pathResult = getClientConfigPath(validation.clientId);
+  if (!pathResult) {
+    return { success: false, error: "Invalid client ID path" };
+  }
+  
+  // Check if client already exists
+  if (fs.existsSync(pathResult.path)) {
+    return { success: false, error: "Client already exists" };
+  }
+  
+  try {
+    // Create directory if it doesn't exist
+    if (!fs.existsSync(pathResult.dir)) {
+      fs.mkdirSync(pathResult.dir, { recursive: true });
+    }
+    
+    // Create default config
+    const defaultConfig = createDefaultConfig(validation.clientId, displayName);
+    const configJson = JSON.stringify(defaultConfig, null, 2) + "\n";
+    fs.writeFileSync(pathResult.path, configJson, "utf8");
+    
+    return { success: true, path: pathResult.path };
+  } catch (error) {
+    logAdminEvent("error", "admin_client_create_error", {
+      event: "admin_client_create_error",
+      clientId: validation.clientId,
+      error: error?.message || String(error),
+    });
+    return { success: false, error: error?.message || String(error) };
+  }
+}
+
+// Delete client (remove directory and config file)
+function deleteClient(clientId) {
+  const validation = validateClientId(clientId);
+  if (!validation.valid) {
+    return { success: false, error: `Invalid client ID: ${validation.reason}` };
+  }
+  
+  // Safety: prevent deleting "Advantum" as a protected client
+  if (validation.clientId === "Advantum") {
+    return { success: false, error: "Cannot delete protected client" };
+  }
+  
+  const pathResult = getClientConfigPath(validation.clientId);
+  if (!pathResult) {
+    return { success: false, error: "Invalid client ID path" };
+  }
+  
+  if (!fs.existsSync(pathResult.path)) {
+    return { success: false, error: "Client does not exist" };
+  }
+  
+  try {
+    // Remove config file
+    if (fs.existsSync(pathResult.path)) {
+      fs.unlinkSync(pathResult.path);
+    }
+    
+    // Try to remove directory (only if empty)
+    try {
+      if (fs.existsSync(pathResult.dir)) {
+        fs.rmdirSync(pathResult.dir);
+      }
+    } catch (dirError) {
+      // Directory not empty or other error - that's okay, we removed the config
+      logAdminEvent("warn", "admin_client_delete_dir_warning", {
+        event: "admin_client_delete_dir_warning",
+        clientId: validation.clientId,
+        error: dirError?.message || String(dirError),
+      });
+    }
+    
+    return { success: true };
+  } catch (error) {
+    logAdminEvent("error", "admin_client_delete_error", {
+      event: "admin_client_delete_error",
+      clientId: validation.clientId,
+      error: error?.message || String(error),
+    });
+    return { success: false, error: error?.message || String(error) };
+  }
 }
 
 // Helper: Render navigation HTML
@@ -409,29 +608,26 @@ router.get("/", requireAdminAuth, (req, res) => {
 // Clients list (GET /admin/clients)
 router.get("/clients", requireAdminAuth, (req, res) => {
   const requestId = req.requestId || "unknown";
+  const ip = getClientIp(req);
   logAdminEvent("info", "admin_clients_list_view", {
     event: "admin_clients_list_view",
     requestId: requestId,
+    ip: ip,
   });
 
   const csrfToken = generateCsrfToken();
   setCsrfToken(req, csrfToken);
 
-  const clients = getClientList();
-  const clientsRoot = getClientsRoot();
+  const clients = listClients();
+  const created = req.query.created === "1";
+  const deleted = req.query.deleted === "1";
   
-  // DEBUG: Log the scan results
-  logAdminEvent("debug", "admin_clients_list_debug", {
-    event: "admin_clients_list_debug",
-    requestId: requestId,
-    clientsRoot: clientsRoot,
-    clientsFound: clients.length,
-    clientIds: clients,
-  });
+  const successMessage = created ? '<p style="color: green; font-weight: bold;">✓ Client created successfully!</p>' : '';
+  const deletedMessage = deleted ? '<p style="color: green; font-weight: bold;">✓ Client deleted successfully!</p>' : '';
   
   const clientsList = clients.length > 0
-    ? `<ul>${clients.map(clientId => `<li><a href="/admin/clients/${escapeHtml(clientId)}">${escapeHtml(clientId)}</a></li>`).join("")}</ul>`
-    : `<p>No clients found. (Scanned: ${escapeHtml(clientsRoot)})</p>`;
+    ? `<ul>${clients.map(clientId => `<li><a href="/admin/clients/${encodeURIComponent(clientId)}">${escapeHtml(clientId)}</a></li>`).join("")}</ul>`
+    : `<p>No clients found.</p>`;
 
   const html = `
 <!DOCTYPE html>
@@ -445,6 +641,21 @@ router.get("/clients", requireAdminAuth, (req, res) => {
   <h1>Admin Portal</h1>
   ${renderNav("clients", csrfToken)}
   <h2>Clients</h2>
+  ${successMessage}
+  ${deletedMessage}
+  <h3>Create New Client</h3>
+  <form method="POST" action="/admin/clients" style="margin-bottom: 30px; padding: 15px; border: 1px solid #ccc; max-width: 500px;">
+    <input type="hidden" name="csrfToken" value="${csrfToken}">
+    <div style="margin-bottom: 10px;">
+      <label>Client ID (required): <input type="text" name="clientId" required pattern="[a-zA-Z][a-zA-Z0-9_-]{1,39}" style="width: 200px;" placeholder="e.g. MyClient"></label><br>
+      <small>2-40 characters, must start with a letter, only letters/numbers/underscore/hyphen</small>
+    </div>
+    <div style="margin-bottom: 10px;">
+      <label>Display Name (optional): <input type="text" name="displayName" maxlength="60" style="width: 200px;" placeholder="e.g. My Client Name"></label>
+    </div>
+    <button type="submit" style="background: #28a745; color: white; border: none; padding: 8px 16px; cursor: pointer;">Create Client</button>
+  </form>
+  <h3>Existing Clients</h3>
   ${clientsList}
 </body>
 </html>
@@ -452,66 +663,164 @@ router.get("/clients", requireAdminAuth, (req, res) => {
   res.send(html);
 });
 
+// Create client (POST /admin/clients)
+router.post("/clients", requireAdminAuth, requireCsrf, (req, res) => {
+  const requestId = req.requestId || "unknown";
+  const ip = getClientIp(req);
+  const { clientId, displayName } = req.body || {};
+  
+  if (!clientId || typeof clientId !== "string") {
+    logAdminEvent("warn", "admin_client_create_failed", {
+      event: "admin_client_create_failed",
+      requestId: requestId,
+      ip: ip,
+      reason: "missing_client_id",
+    });
+    const csrfToken = generateCsrfToken();
+    setCsrfToken(req, csrfToken);
+    return res.status(400).send(`
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Admin Portal - Create Client</title></head>
+<body>
+  <h1>Admin Portal</h1>
+  ${renderNav("clients", csrfToken)}
+  <h2>Create Client</h2>
+  <p style="color: red;">Error: Client ID is required.</p>
+  <p><a href="/admin/clients">Back to clients</a></p>
+</body>
+</html>
+    `);
+  }
+  
+  const result = createClient(clientId, displayName);
+  
+  if (!result.success) {
+    logAdminEvent("warn", "admin_client_create_failed", {
+      event: "admin_client_create_failed",
+      requestId: requestId,
+      ip: ip,
+      clientId: clientId,
+      reason: result.error,
+    });
+    const csrfToken = generateCsrfToken();
+    setCsrfToken(req, csrfToken);
+    return res.status(400).send(`
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Admin Portal - Create Client</title></head>
+<body>
+  <h1>Admin Portal</h1>
+  ${renderNav("clients", csrfToken)}
+  <h2>Create Client</h2>
+  <p style="color: red;">Error: ${escapeHtml(result.error)}</p>
+  <p><a href="/admin/clients">Back to clients</a></p>
+</body>
+</html>
+    `);
+  }
+  
+  logAdminEvent("info", "admin_client_create_success", {
+    event: "admin_client_create_success",
+    requestId: requestId,
+    ip: ip,
+    clientId: clientId,
+    path: result.path,
+  });
+  
+  // Redirect to edit page
+  return res.redirect(`/admin/clients/${encodeURIComponent(clientId)}?created=1`);
+});
+
 // Client config editor (GET /admin/clients/:clientId)
 router.get("/clients/:clientId", requireAdminAuth, (req, res) => {
   const requestId = req.requestId || "unknown";
   const clientId = req.params.clientId;
   const saved = req.query.saved === "1";
+  const created = req.query.created === "1";
   
-  if (!clientId || typeof clientId !== "string" || !/^[a-zA-Z0-9_-]{1,40}$/.test(clientId.trim())) {
+  const validation = validateClientId(clientId);
+  if (!validation.valid) {
     return res.status(400).send("Invalid client ID");
   }
   
-  const configPath = getClientConfigPath(clientId);
-  if (!configPath || !fs.existsSync(configPath)) {
+  const config = readClientConfig(validation.clientId);
+  if (!config) {
     return res.status(404).send("Client config not found");
   }
   
-  try {
-    const configContent = fs.readFileSync(configPath, "utf8");
-    const config = JSON.parse(configContent);
-    
-    logAdminEvent("info", "admin_client_edit_view", {
-      event: "admin_client_edit_view",
-      requestId: requestId,
-      clientId: clientId,
-    });
-    
-    const csrfToken = generateCsrfToken();
-    setCsrfToken(req, csrfToken);
-    
-    const successMessage = saved ? '<p style="color: green; font-weight: bold;">✓ Changes saved successfully!</p>' : '';
-    
-    // Helper to safely get nested value
-    const getValue = (obj, path, defaultValue = "") => {
-      const parts = path.split(".");
-      let current = obj;
-      for (const part of parts) {
-        if (current && typeof current === "object" && part in current) {
-          current = current[part];
-        } else {
-          return defaultValue;
-        }
+  logAdminEvent("info", "admin_client_edit_view", {
+    event: "admin_client_edit_view",
+    requestId: requestId,
+    clientId: validation.clientId,
+  });
+  
+  const csrfToken = generateCsrfToken();
+  setCsrfToken(req, csrfToken);
+  
+  const successMessage = saved ? '<p style="color: green; font-weight: bold;">✓ Changes saved successfully!</p>' : '';
+  const createdMessage = created ? '<p style="color: green; font-weight: bold;">✓ Client created successfully!</p>' : '';
+  
+  // Helper to safely get nested value
+  const getValue = (obj, path, defaultValue = "") => {
+    const parts = path.split(".");
+    let current = obj;
+    for (const part of parts) {
+      if (current && typeof current === "object" && part in current) {
+        current = current[part];
+      } else {
+        return defaultValue;
       }
-      return current != null ? String(current) : defaultValue;
-    };
-    
-    const html = `
+    }
+    return current != null ? String(current) : defaultValue;
+  };
+  
+  // Embed instructions snippet
+  const embedSnippet = `<script>
+  (function() {
+    // Load widget script
+    var script = document.createElement('script');
+    script.src = 'https://ai-support-bot-a6n3.onrender.com/widget.js?client=${encodeURIComponent(validation.clientId)}';
+    script.async = true;
+    document.head.appendChild(script);
+  })();
+</script>`;
+  
+  const liquidSnippet = `{% comment %}
+  AI Support Bot Widget
+  Paste this code in your Shopify theme's layout/theme.liquid file before </body>
+  Or add it as a section/snippet in your theme customizer
+{% endcomment %}
+<script>
+  var clientId = "${escapeHtml(validation.clientId)}";
+  // ... rest of widget code (paste AI-support-bot.liquid content here, replacing "Advantum" with clientId variable)
+</script>`;
+  
+  const html = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Admin Portal - Edit ${escapeHtml(clientId)}</title>
+  <title>Admin Portal - Edit ${escapeHtml(validation.clientId)}</title>
 </head>
 <body>
   <h1>Admin Portal</h1>
   ${renderNav("clients", csrfToken)}
-  <h2>Edit Client: ${escapeHtml(clientId)}</h2>
+  <h2>Edit Client: ${escapeHtml(validation.clientId)}</h2>
+  ${createdMessage}
   ${successMessage}
   <p><a href="/admin/clients">← Back to clients</a></p>
   
-  <form method="POST" action="/admin/clients/${escapeHtml(clientId)}" style="max-width: 800px;">
+  <h3>Embed Instructions</h3>
+  <div style="margin-bottom: 30px; padding: 15px; background: #f5f5f5; border: 1px solid #ddd;">
+    <p><strong>For Shopify (.liquid):</strong></p>
+    <p>Copy the <code>AI-support-bot.liquid</code> file content and replace the hardcoded clientId value with your client ID (${escapeHtml(validation.clientId)}).</p>
+    <p>Then paste it in your theme's layout file (theme.liquid) before the closing <code>&lt;/body&gt;</code> tag, or add it as a section/snippet in the theme customizer.</p>
+    <p><strong>Important:</strong> Make sure to set <code>var clientId = "${escapeHtml(validation.clientId)}";</code> in the script.</p>
+  </div>
+  
+  <form method="POST" action="/admin/clients/${encodeURIComponent(validation.clientId)}" style="max-width: 800px;">
     <input type="hidden" name="csrfToken" value="${csrfToken}">
     
     <h3>Colors</h3>
@@ -555,29 +864,39 @@ router.get("/clients/:clientId", requireAdminAuth, (req, res) => {
     
     <button type="submit" style="background: #28a745; color: white; border: none; padding: 10px 20px; cursor: pointer; font-size: 16px;">Save Changes</button>
   </form>
+  
+  <hr style="margin: 40px 0;">
+  
+  <h3>Delete Client</h3>
+  <div style="padding: 15px; background: #fff3cd; border: 1px solid #ffc107; margin-bottom: 20px;">
+    <p><strong>Warning:</strong> This will permanently delete the client configuration. This action cannot be undone.</p>
+    ${validation.clientId === "Advantum" ? '<p style="color: red;"><strong>Note:</strong> This client is protected and cannot be deleted.</p>' : ''}
+  </div>
+  ${validation.clientId !== "Advantum" ? `
+  <form method="POST" action="/admin/clients/${encodeURIComponent(validation.clientId)}/delete" style="max-width: 500px;">
+    <input type="hidden" name="csrfToken" value="${csrfToken}">
+    <div style="margin-bottom: 15px;">
+      <label>Type the client ID to confirm deletion: <input type="text" name="confirmClientId" required style="width: 200px;"></label>
+    </div>
+    <button type="submit" style="background: #dc3545; color: white; border: none; padding: 10px 20px; cursor: pointer; font-size: 16px;">Delete Client</button>
+  </form>
+  ` : ''}
 </body>
 </html>
-    `;
-    res.send(html);
-  } catch (error) {
-    logAdminEvent("error", "admin_client_edit_error", {
-      event: "admin_client_edit_error",
-      requestId: requestId,
-      clientId: clientId,
-      error: error?.message || String(error),
-    });
-    return res.status(500).send("Error loading client config");
-  }
+  `;
+  res.send(html);
 });
 
 // Client config update (POST /admin/clients/:clientId) - form submission
 router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res) => {
   const requestId = req.requestId || "unknown";
-  const clientId = req.params.clientId;
+  const clientIdRaw = req.params.clientId;
   
-  if (!clientId || typeof clientId !== "string" || !/^[a-zA-Z0-9_-]{1,40}$/.test(clientId.trim())) {
+  const validation = validateClientId(clientIdRaw);
+  if (!validation.valid) {
     return res.status(400).send("Invalid client ID");
   }
+  const clientId = validation.clientId;
   
   // Transform form data to API format
   const updateData = {};
@@ -624,8 +943,10 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res
   
   try {
     // Read existing config
-    const existingContent = fs.readFileSync(pathResult.path, "utf8");
-    const existingConfig = JSON.parse(existingContent);
+    const existingConfig = readClientConfig(clientId);
+    if (!existingConfig) {
+      return res.status(404).send("Client config not found");
+    }
     
     // Validate update (reuse API validation)
     const validationResult = validateConfigUpdate(updateData);
@@ -705,6 +1026,117 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res
   }
 });
 
+// Delete client (POST /admin/clients/:clientId/delete)
+router.post("/clients/:clientId/delete", requireAdminAuth, requireCsrf, (req, res) => {
+  const requestId = req.requestId || "unknown";
+  const ip = getClientIp(req);
+  const clientIdRaw = req.params.clientId;
+  const { confirmClientId } = req.body || {};
+  
+  const validation = validateClientId(clientIdRaw);
+  if (!validation.valid) {
+    logAdminEvent("warn", "admin_client_delete_failed", {
+      event: "admin_client_delete_failed",
+      requestId: requestId,
+      ip: ip,
+      clientId: clientIdRaw,
+      reason: "invalid_client_id",
+    });
+    return res.status(400).send("Invalid client ID");
+  }
+  
+  const clientId = validation.clientId;
+  
+  // Safety: prevent deleting "Advantum" as a protected client
+  if (clientId === "Advantum") {
+    logAdminEvent("warn", "admin_client_delete_failed", {
+      event: "admin_client_delete_failed",
+      requestId: requestId,
+      ip: ip,
+      clientId: clientId,
+      reason: "protected_client",
+    });
+    const csrfToken = generateCsrfToken();
+    setCsrfToken(req, csrfToken);
+    return res.status(403).send(`
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Admin Portal - Delete Client</title></head>
+<body>
+  <h1>Admin Portal</h1>
+  ${renderNav("clients", csrfToken)}
+  <h2>Delete Client</h2>
+  <p style="color: red;">Error: Cannot delete protected client.</p>
+  <p><a href="/admin/clients/${encodeURIComponent(clientId)}">Back to client</a></p>
+</body>
+</html>
+    `);
+  }
+  
+  // Require confirmation - user must type the clientId exactly
+  if (!confirmClientId || String(confirmClientId).trim() !== clientId) {
+    logAdminEvent("warn", "admin_client_delete_failed", {
+      event: "admin_client_delete_failed",
+      requestId: requestId,
+      ip: ip,
+      clientId: clientId,
+      reason: "confirmation_mismatch",
+    });
+    const csrfToken = generateCsrfToken();
+    setCsrfToken(req, csrfToken);
+    return res.status(400).send(`
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Admin Portal - Delete Client</title></head>
+<body>
+  <h1>Admin Portal</h1>
+  ${renderNav("clients", csrfToken)}
+  <h2>Delete Client</h2>
+  <p style="color: red;">Error: Confirmation does not match client ID. Please type the client ID exactly.</p>
+  <p><a href="/admin/clients/${encodeURIComponent(clientId)}">Back to client</a></p>
+</body>
+</html>
+    `);
+  }
+  
+  const result = deleteClient(clientId);
+  
+  if (!result.success) {
+    logAdminEvent("warn", "admin_client_delete_failed", {
+      event: "admin_client_delete_failed",
+      requestId: requestId,
+      ip: ip,
+      clientId: clientId,
+      reason: result.error,
+    });
+    const csrfToken = generateCsrfToken();
+    setCsrfToken(req, csrfToken);
+    return res.status(400).send(`
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Admin Portal - Delete Client</title></head>
+<body>
+  <h1>Admin Portal</h1>
+  ${renderNav("clients", csrfToken)}
+  <h2>Delete Client</h2>
+  <p style="color: red;">Error: ${escapeHtml(result.error)}</p>
+  <p><a href="/admin/clients/${encodeURIComponent(clientId)}">Back to client</a></p>
+</body>
+</html>
+    `);
+  }
+  
+  logAdminEvent("info", "admin_client_delete_success", {
+    event: "admin_client_delete_success",
+    requestId: requestId,
+    ip: ip,
+    clientId: clientId,
+  });
+  
+  // Redirect to clients list with success message
+  return res.redirect("/admin/clients?deleted=1");
+});
+
 // Health check endpoint (GET /admin/health)
 router.get("/health", requireAdminAuth, (req, res) => {
   return res.json({
@@ -744,16 +1176,33 @@ module.exports = router;
 HOW TO TEST (Manual Checklist):
 1. Login: Visit /admin, login with ADMIN_EMAIL/ADMIN_PASSWORD env vars
 2. Go to Clients: Click "Clients" in navigation, should see list of client IDs (Advantum, testbrand, etc.)
-3. Edit Client: Click "Advantum", should show edit form with current config values pre-filled
-4. Edit and Save: 
+3. Create Client:
+   - Fill in "Client ID" field (e.g., "TestClient") - must start with letter, 2-40 chars
+   - Optionally fill in "Display Name"
+   - Click "Create Client"
+   - Should redirect to edit page with "✓ Client created successfully!" message
+   - Verify Clients/TestClient/client-config.json exists with default config
+4. Edit Client: Click a client ID, should show edit form with current config values pre-filled
+5. Edit and Save:
    - Change widget.title to a new value (max 60 chars)
    - Change widget.greeting to a new value (max 240 chars)
    - Change colors.primary to a valid hex color (e.g., #FF0000)
    - Click "Save Changes"
-5. Verify: Should redirect with "✓ Changes saved successfully!" message
-6. Verify File: Check Clients/Advantum/client-config.json on server, should contain updated values
-7. Reload: Refresh the edit page, form should show the updated values (persistence confirmed)
-8. Test Validation: Try saving with invalid color or URL not starting with https://, should show validation error
-9. Test Protection: Logout, try accessing /admin/clients directly, should redirect to login
+6. Verify: Should redirect with "✓ Changes saved successfully!" message
+7. Verify File: Check Clients/<clientId>/client-config.json on server, should contain updated values
+8. Reload: Refresh the edit page, form should show the updated values (persistence confirmed)
+9. Embed Instructions: Check edit page shows embed instructions with correct clientId
+10. Delete Client:
+    - Scroll to "Delete Client" section
+    - Type the client ID exactly to confirm
+    - Click "Delete Client"
+    - Should redirect to /admin/clients with "✓ Client deleted successfully!" message
+    - Verify Clients/<clientId>/client-config.json no longer exists
+    - Verify "Advantum" cannot be deleted (protected client)
+11. Test Validation:
+    - Try creating client with invalid ID (starts with number, too short, special chars)
+    - Try saving with invalid color or URL not starting with https://, should show validation error
+12. Test Protection: Logout, try accessing /admin/clients directly, should redirect to login
+13. Widget Still Works: Verify /widget-config?client=<clientId> still returns correct config for existing clients
 */
 
