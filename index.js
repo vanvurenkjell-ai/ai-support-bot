@@ -2972,6 +2972,39 @@ function initializeClientRegistry() {
   }
 }
 
+// ROOT CAUSE: clientRegistry is in-memory cache populated at startup.
+// Admin saves write to disk but don't invalidate cache, so /widget-config serves stale data.
+// Fix: /widget-config now reads fresh from disk; admin saves invalidate cache entry.
+
+// Reload a single client config from disk and update cache
+function reloadClientConfig(clientId) {
+  try {
+    const base = resolveClientDir(clientId);
+    if (!base) return false;
+    
+    const configPath = path.join(base, "client-config.json");
+    if (!fs.existsSync(configPath)) return false;
+    
+    const configRaw = readFile(configPath);
+    const config = safeJsonParse(configRaw, {});
+    const normalizedConfig = normalizeClientConfig(config, clientId);
+    
+    clientRegistry.set(clientId, {
+      status: "ok",
+      config: normalizedConfig,
+    });
+    
+    return true;
+  } catch (e) {
+    logJson("error", "client_config_reload_error", {
+      event: "client_config_reload_error",
+      clientId: clientId,
+      error: e?.message || String(e),
+    });
+    return false;
+  }
+}
+
 function getClientOrNull(clientIdRaw) {
   const clientId = sanitizeClientId(clientIdRaw);
   const entry = clientRegistry.get(clientId);
@@ -4101,24 +4134,58 @@ app.get("/widget-config", widgetCors, requireWidgetAuth, (req, res) => {
   }
 
   const clientId = sanitizeClientId(clientIdRaw);
-  const clientEntry = getClientOrNull(clientId);
 
-  if (!clientEntry) {
-    res.status(404);
-    // SECURITY: Generic error message - don't reveal internal structure
-    return res.json({
-      requestId: req.requestId,
-      error: "invalid_client",
-      message: "Deze chat is niet juist geconfigureerd. Neem contact op met support.",
-    });
-  }
-
+  // ROOT CAUSE FIX: Read config fresh from disk (bypass clientRegistry cache)
+  // Admin saves write to disk but clientRegistry is never invalidated.
+  // Reading fresh ensures /widget-config always returns latest data after admin saves.
   try {
-    const widgetConfig = buildWidgetConfig(clientEntry.config, clientEntry.clientId);
-    res.setHeader("Cache-Control", "public, max-age=300");
+    const base = resolveClientDir(clientId);
+    if (!base) {
+      res.status(404);
+      return res.json({
+        requestId: req.requestId,
+        error: "invalid_client",
+        message: "Deze chat is niet juist geconfigureerd. Neem contact op met support.",
+      });
+    }
+    
+    const configPath = path.join(base, "client-config.json");
+    if (!fs.existsSync(configPath)) {
+      res.status(404);
+      return res.json({
+        requestId: req.requestId,
+        error: "invalid_client",
+        message: "Deze chat is niet juist geconfigureerd. Neem contact op met support.",
+      });
+    }
+    
+    // Read fresh from disk (not from cache)
+    const stats = fs.statSync(configPath);
+    const configMtime = stats.mtime.toISOString();
+    const configRaw = fs.readFileSync(configPath, "utf8");
+    const configParsed = safeJsonParse(configRaw, {});
+    const config = normalizeClientConfig(configParsed, clientId);
+    
+    const widgetConfig = buildWidgetConfig(config, clientId);
+    const entryScreenTitle = widgetConfig.entryScreen?.title || null;
+    
+    // Prevent HTTP caching - always serve fresh config
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
     // SECURITY: Add security headers
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("X-Frame-Options", "DENY");
+    
+    // Log config serving for observability
+    logJson("info", "widget_config_served", {
+      event: "widget_config_served",
+      requestId: req.requestId,
+      clientId: clientId,
+      entryScreenTitle: entryScreenTitle,
+      configSourcePath: configPath,
+      configMtime: configMtime,
+    });
 
     return res.json({ requestId: req.requestId, ...widgetConfig });
   } catch (e) {

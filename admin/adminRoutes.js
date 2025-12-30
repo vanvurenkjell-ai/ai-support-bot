@@ -666,8 +666,22 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res
       updatedConfig.support = { ...updatedConfig.support, ...validationResult.allowed.support };
     }
     
-    // Write updated config
-    fs.writeFileSync(pathResult.path, JSON.stringify(updatedConfig, null, 2) + "\n", "utf8");
+    // Write updated config to disk
+    const configJson = JSON.stringify(updatedConfig, null, 2) + "\n";
+    fs.writeFileSync(pathResult.path, configJson, "utf8");
+    const bytesWritten = Buffer.byteLength(configJson, "utf8");
+    const writtenEntryScreenTitle = updatedConfig.entryScreen?.title || null;
+    
+    // Note: /widget-config reads fresh from disk (bypasses clientRegistry cache), so no cache invalidation needed
+    
+    logAdminEvent("info", "admin_client_update_persisted", {
+      event: "admin_client_update_persisted",
+      requestId: requestId,
+      clientId: clientId,
+      writtenPath: pathResult.path,
+      writtenEntryScreenTitle: writtenEntryScreenTitle,
+      bytesWritten: bytesWritten,
+    });
     
     logAdminEvent("info", "admin_client_update_success", {
       event: "admin_client_update_success",
