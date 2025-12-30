@@ -4,6 +4,8 @@ const fs = require("fs");
 const path = require("path");
 const { sessionMiddleware, requireAdminAuth, verifyAdminCredentials, regenerateSession, ADMIN_EMAIL } = require("./auth");
 const { generateCsrfToken, setCsrfToken, getCsrfToken, requireCsrf } = require("./csrf");
+// Import unified client store adapter (chooses Supabase or filesystem automatically)
+const clientsStore = require("../lib/clientsStoreAdapter");
 
 // Simple logging helper (matches index.js pattern for structured logs)
 function logAdminEvent(level, event, fields) {
@@ -350,8 +352,8 @@ function createClient(clientId, displayName = null) {
   }
 }
 
-// Delete client wrapper with protection for "Advantum"
-function deleteClientSafe(clientId) {
+// Delete client wrapper with protection for "Advantum" (async for Supabase)
+async function deleteClientSafe(clientId) {
   const validation = validateClientId(clientId);
   if (!validation.valid) {
     return { success: false, error: `Invalid client ID: ${validation.reason}` };
@@ -362,7 +364,7 @@ function deleteClientSafe(clientId) {
     return { success: false, error: "Cannot delete protected client" };
   }
   
-  return deleteClient(validation.clientId);
+  return await deleteClient(validation.clientId);
 }
 
 // Helper: Render navigation HTML
@@ -467,8 +469,8 @@ router.get("/clients", requireAdminAuth, (req, res) => {
   ${successMessage}
   ${deletedMessage}
   <div style="margin-bottom: 20px; padding: 10px; background: #e7f3ff; border: 1px solid #b3d9ff; border-radius: 4px;">
-    <p><strong>Config storage path:</strong> <code>${escapeHtml(clientsRoot)}</code></p>
-    <p style="margin-top: 5px; font-size: 0.9em; color: #666;">Clients created here are stored on the server; they will not appear in GitHub automatically.</p>
+    <p><strong>Config storage:</strong> <code>${escapeHtml(clientsStore.storeType === "supabase" ? "Supabase" : clientsRoot)}</code></p>
+    <p style="margin-top: 5px; font-size: 0.9em; color: #666;">${clientsStore.storeType === "supabase" ? "Clients are stored in Supabase database." : "Clients created here are stored on the server; they will not appear in GitHub automatically."}</p>
   </div>
   <h3>Create New Client</h3>
   <form method="POST" action="/admin/clients" style="margin-bottom: 30px; padding: 15px; border: 1px solid #ccc; max-width: 500px;">
@@ -491,10 +493,11 @@ router.get("/clients", requireAdminAuth, (req, res) => {
 });
 
 // Create client (POST /admin/clients)
-router.post("/clients", requireAdminAuth, requireCsrf, (req, res) => {
+router.post("/clients", requireAdminAuth, requireCsrf, async (req, res) => {
   const requestId = req.requestId || "unknown";
   const ip = getClientIp(req);
   const { clientId, displayName } = req.body || {};
+  const updatedBy = req.session?.admin?.email || null;
   
   if (!clientId || typeof clientId !== "string") {
     logAdminEvent("warn", "admin_client_create_failed", {
@@ -520,7 +523,7 @@ router.post("/clients", requireAdminAuth, requireCsrf, (req, res) => {
     `);
   }
   
-  const result = createClient(clientId, displayName);
+  const result = await createClient(clientId, displayName, updatedBy);
   
   if (!result.success) {
     const statusCode = result.statusCode || 400;
@@ -554,6 +557,7 @@ router.post("/clients", requireAdminAuth, requireCsrf, (req, res) => {
     ip: ip,
     clientId: clientId,
     path: result.path,
+    storeType: clientsStore.storeType,
   });
   
   // Redirect to edit page
@@ -561,7 +565,7 @@ router.post("/clients", requireAdminAuth, requireCsrf, (req, res) => {
 });
 
 // Client config editor (GET /admin/clients/:clientId)
-router.get("/clients/:clientId", requireAdminAuth, (req, res) => {
+router.get("/clients/:clientId", requireAdminAuth, async (req, res) => {
   const requestId = req.requestId || "unknown";
   const clientId = req.params.clientId;
   const saved = req.query.saved === "1";
@@ -572,13 +576,24 @@ router.get("/clients/:clientId", requireAdminAuth, (req, res) => {
     return res.status(400).send("Invalid client ID");
   }
   
-  const config = readClientConfig(validation.clientId);
-  if (!config) {
-    return res.status(404).send("Client config not found");
+  let config, pathResult, configStats;
+  try {
+    config = await readClientConfig(validation.clientId);
+    if (!config) {
+      return res.status(404).send("Client config not found");
+    }
+    
+    pathResult = getClientConfigPath(validation.clientId);
+    configStats = await getClientConfigStats(validation.clientId);
+  } catch (error) {
+    logAdminEvent("error", "admin_client_edit_read_error", {
+      event: "admin_client_edit_read_error",
+      requestId: requestId,
+      clientId: validation.clientId,
+      error: error?.message || String(error),
+    });
+    return res.status(500).send("Error loading client config");
   }
-  
-  const pathResult = getClientConfigPath(validation.clientId);
-  const configStats = getClientConfigStats(validation.clientId);
   
   logAdminEvent("info", "admin_client_edit_view", {
     event: "admin_client_edit_view",
@@ -594,8 +609,8 @@ router.get("/clients/:clientId", requireAdminAuth, (req, res) => {
   
   const configPathInfo = configStats ? `
   <div style="margin-bottom: 20px; padding: 10px; background: #f5f5f5; border: 1px solid #ddd; border-radius: 4px;">
-    <p><strong>Config file path:</strong> <code>${escapeHtml(pathResult.path)}</code></p>
-    <p style="margin-top: 5px;"><strong>Last modified:</strong> ${escapeHtml(configStats.mtimeISO)}</p>
+    <p><strong>Config storage:</strong> <code>${escapeHtml(clientsStore.storeType === "supabase" ? "Supabase" : pathResult.path)}</code></p>
+    <p style="margin-top: 5px;"><strong>Last modified:</strong> ${escapeHtml(configStats.mtimeISO || "N/A")}</p>
   </div>
   ` : '';
   
@@ -774,13 +789,13 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res
   
   // Validate clientId and get path (use clientsStore)
   const pathResult = getClientConfigPath(clientId);
-  if (!pathResult.valid || !fs.existsSync(pathResult.path)) {
+  if (!pathResult.valid) {
     return res.status(404).send("Client config not found");
   }
   
   try {
-    // Read existing config (use clientsStore)
-    const existingConfig = readClientConfig(clientId);
+    // Read existing config (use clientsStore - async for Supabase)
+    const existingConfig = await readClientConfig(clientId);
     if (!existingConfig) {
       return res.status(404).send("Client config not found");
     }
@@ -824,21 +839,30 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res
       updatedConfig.support = { ...updatedConfig.support, ...validationResult.allowed.support };
     }
     
-    // Write updated config to disk
-    const configJson = JSON.stringify(updatedConfig, null, 2) + "\n";
-    fs.writeFileSync(pathResult.path, configJson, "utf8");
-    const bytesWritten = Buffer.byteLength(configJson, "utf8");
+    // Write updated config (atomic write - async for Supabase)
+    const updatedBy = req.session?.admin?.email || null;
+    const writeResult = await writeClientConfigAtomic(clientId, updatedConfig, updatedBy);
+    if (!writeResult.success) {
+      logAdminEvent("error", "admin_client_update_write_failed", {
+        event: "admin_client_update_write_failed",
+        requestId: requestId,
+        clientId: clientId,
+        error: writeResult.error,
+      });
+      return res.status(500).send("Error writing client config");
+    }
+    
     const writtenEntryScreenTitle = updatedConfig.entryScreen?.title || null;
     
-    // Note: /widget-config reads fresh from disk (bypasses clientRegistry cache), so no cache invalidation needed
+    // Note: /widget-config reads fresh from storage (bypasses clientRegistry cache), so no cache invalidation needed
     
     logAdminEvent("info", "admin_client_update_persisted", {
       event: "admin_client_update_persisted",
       requestId: requestId,
       clientId: clientId,
-      writtenPath: pathResult.path,
+      writtenPath: writeResult.path || pathResult.path,
       writtenEntryScreenTitle: writtenEntryScreenTitle,
-      bytesWritten: bytesWritten,
+      storeType: clientsStore.storeType,
     });
     
     logAdminEvent("info", "admin_client_update_success", {
@@ -864,7 +888,7 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res
 });
 
 // Delete client (POST /admin/clients/:clientId/delete)
-router.post("/clients/:clientId/delete", requireAdminAuth, requireCsrf, (req, res) => {
+router.post("/clients/:clientId/delete", requireAdminAuth, requireCsrf, async (req, res) => {
   const requestId = req.requestId || "unknown";
   const ip = getClientIp(req);
   const clientIdRaw = req.params.clientId;
@@ -968,6 +992,7 @@ router.post("/clients/:clientId/delete", requireAdminAuth, requireCsrf, (req, re
     requestId: requestId,
     ip: ip,
     clientId: clientId,
+    storeType: clientsStore.storeType,
   });
   
   // Redirect to clients list with success message

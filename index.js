@@ -2585,8 +2585,8 @@ function retrieveScopedKnowledge(chunks, intent, message, requestId, clientId, s
 // Provably safe client folder resolution with strict containment enforcement
 // ============================================================================
 
-// Use centralized clientsStore for all client config operations
-const clientsStore = require("./lib/clientsStore");
+// Use unified clientsStore adapter (chooses Supabase or filesystem automatically)
+const clientsStore = require("./lib/clientsStoreAdapter");
 const { getClientsRoot, ensureClientsRoot, listClientIds, readClientConfig, getClientConfigPath } = clientsStore;
 
 // ClientId validation pattern (strict allowlist)
@@ -2891,13 +2891,13 @@ function validateClientFolder(clientId) {
   };
 }
 
-function initializeClientRegistry() {
+async function initializeClientRegistry() {
   try {
-    // Ensure clients root directory exists (create if needed)
+    // Ensure clients root directory exists (create if needed - no-op for Supabase)
     ensureClientsRoot();
     
     const clientsRoot = getClientsRoot();
-    const clientIds = listClientIds();
+    const clientIds = await listClientIds();
 
     for (const clientId of clientIds) {
       const validation = validateClientFolder(clientId);
@@ -2967,6 +2967,7 @@ function initializeClientRegistry() {
       totalClients: clientRegistry.size,
       validClients: validCount,
       clientsRoot: clientsRoot,
+      storeType: clientsStore.storeType,
     });
   } catch (e) {
     logJson("error", "client_registry_init_error", {
@@ -4124,7 +4125,7 @@ if (typeof requireWidgetAuth !== "function") {
 
 // Widget configuration endpoint (public by default, optional per-client auth)
 // TEMP DEBUG: Using widgetCors middleware (permissive) - remove after confirming allowlist config
-app.get("/widget-config", widgetCors, requireWidgetAuth, (req, res) => {
+app.get("/widget-config", widgetCors, requireWidgetAuth, async (req, res) => {
   const clientIdRaw = req.query.client;
   
   if (!clientIdRaw || !String(clientIdRaw).trim()) {
@@ -4138,8 +4139,8 @@ app.get("/widget-config", widgetCors, requireWidgetAuth, (req, res) => {
 
   const clientId = sanitizeClientId(clientIdRaw);
 
-  // ROOT CAUSE FIX: Read config fresh from disk using clientsStore (bypass clientRegistry cache)
-  // Admin saves write to disk but clientRegistry is never invalidated.
+  // ROOT CAUSE FIX: Read config fresh from Supabase/filesystem using clientsStore (bypass clientRegistry cache)
+  // Admin saves write to storage but clientRegistry is never invalidated.
   // Reading fresh ensures /widget-config always returns latest data after admin saves.
   try {
     const pathResult = getClientConfigPath(clientId);
@@ -4152,8 +4153,8 @@ app.get("/widget-config", widgetCors, requireWidgetAuth, (req, res) => {
       });
     }
     
-    // Read fresh from disk (not from cache)
-    const config = readClientConfig(clientId);
+    // Read fresh from storage (not from cache - async for Supabase)
+    const config = await readClientConfig(clientId);
     if (!config) {
       res.status(404);
       return res.json({
@@ -4163,8 +4164,9 @@ app.get("/widget-config", widgetCors, requireWidgetAuth, (req, res) => {
       });
     }
     
-    const stats = fs.statSync(pathResult.path);
-    const configMtime = stats.mtime.toISOString();
+    // Get stats for logging (async for Supabase)
+    const stats = await clientsStore.getClientConfigStats(clientId);
+    const configMtime = stats?.mtimeISO || new Date().toISOString();
     const normalizedConfig = normalizeClientConfig(config, clientId);
     
     const widgetConfig = buildWidgetConfig(normalizedConfig, clientId);
@@ -4186,6 +4188,7 @@ app.get("/widget-config", widgetCors, requireWidgetAuth, (req, res) => {
       entryScreenTitle: entryScreenTitle,
       configSourcePath: pathResult.path,
       configMtime: configMtime,
+      source: clientsStore.storeType,
     });
 
     return res.json({ requestId: req.requestId, ...widgetConfig });

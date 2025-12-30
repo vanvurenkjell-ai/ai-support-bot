@@ -4,7 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const { requireAdminAuth } = require("./auth");
 const { requireCsrf } = require("./csrf");
-const clientsStore = require("../lib/clientsStore");
+const clientsStore = require("../lib/clientsStoreAdapter");
 
 // Simple logging helper
 function logAdminEvent(level, event, fields) {
@@ -214,16 +214,17 @@ function validateConfigUpdate(input) {
 }
 
 // GET /admin/api/clients - List all clients
-router.get("/clients", requireAdminAuth, (req, res) => {
+router.get("/clients", requireAdminAuth, async (req, res) => {
   const requestId = req.requestId || "unknown";
   try {
-    const clients = getClientList();
+    const clients = await listClientIds();
     logAdminEvent("info", "admin_api_clients_list", {
       event: "admin_api_clients_list",
       requestId: requestId,
       count: clients.length,
+      storeType: clientsStore.storeType,
     });
-    return res.json({ clients });
+    return res.json(clients);
   } catch (error) {
     logAdminEvent("error", "admin_api_clients_list_error", {
       event: "admin_api_clients_list_error",
@@ -235,7 +236,7 @@ router.get("/clients", requireAdminAuth, (req, res) => {
 });
 
 // GET /admin/api/clients/:clientId - Get client config
-router.get("/clients/:clientId", requireAdminAuth, (req, res) => {
+router.get("/clients/:clientId", requireAdminAuth, async (req, res) => {
   const requestId = req.requestId || "unknown";
   const validation = validateClientId(req.params.clientId);
   
@@ -261,11 +262,7 @@ router.get("/clients/:clientId", requireAdminAuth, (req, res) => {
   }
   
   try {
-    if (!fs.existsSync(pathResult.path)) {
-      return res.status(404).json({ error: "Client config not found" });
-    }
-    
-    const config = readClientConfig(validation.clientId);
+    const config = await readClientConfig(validation.clientId);
     if (!config) {
       return res.status(404).json({ error: "Client config not found" });
     }
@@ -274,6 +271,7 @@ router.get("/clients/:clientId", requireAdminAuth, (req, res) => {
       event: "admin_api_client_get",
       requestId: requestId,
       clientId: validation.clientId,
+      storeType: clientsStore.storeType,
     });
     
     return res.json({ clientId: validation.clientId, config });
@@ -293,7 +291,7 @@ router.get("/clients/:clientId", requireAdminAuth, (req, res) => {
 });
 
 // POST /admin/api/clients/:clientId - Update client config
-router.post("/clients/:clientId", requireAdminAuth, requireCsrf, (req, res) => {
+router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res) => {
   const requestId = req.requestId || "unknown";
   const validation = validateClientId(req.params.clientId);
   
@@ -319,12 +317,8 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, (req, res) => {
   }
   
   try {
-    if (!fs.existsSync(pathResult.path)) {
-      return res.status(404).json({ error: "Client config not found" });
-    }
-    
-    // Read existing config
-    const existingConfig = readClientConfig(validation.clientId);
+    // Read existing config (async for Supabase)
+    const existingConfig = await readClientConfig(validation.clientId);
     if (!existingConfig) {
       return res.status(404).json({ error: "Client config not found" });
     }
@@ -375,8 +369,9 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, (req, res) => {
       updatedConfig.support = { ...updatedConfig.support, ...validationResult.allowed.support };
     }
     
-    // Write updated config (atomic write)
-    const writeResult = writeClientConfigAtomic(validation.clientId, updatedConfig);
+    // Write updated config (atomic write - async for Supabase)
+    const updatedBy = req.session?.admin?.email || null;
+    const writeResult = await writeClientConfigAtomic(validation.clientId, updatedConfig, updatedBy);
     if (!writeResult.success) {
       logAdminEvent("error", "admin_api_client_update_write_failed", {
         event: "admin_api_client_update_write_failed",
@@ -392,6 +387,7 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, (req, res) => {
       requestId: requestId,
       clientId: validation.clientId,
       updatedFields: Object.keys(validationResult.allowed),
+      storeType: clientsStore.storeType,
     });
     
     return res.json({ success: true, clientId: validation.clientId, config: updatedConfig });
