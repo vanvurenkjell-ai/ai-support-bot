@@ -3278,16 +3278,16 @@ function buildKnowledgeGapEscalationReply(clientConfig, clientId) {
   
   if (String(lang).toLowerCase().startsWith("en")) {
     if (hasSupportConfig) {
-      return "I'd like to help you properly, but I don't have the right information in my knowledge base to resolve this reliably.\n\nVia the buttons below, you can contact our support directly.\n\nImportant: I automatically add a short summary of your question and the situation to your email or contact form, so you don't have to explain everything again.";
+      return "I'd like to help you properly, but I don't have the right information to resolve this reliably. Via the buttons below, you can contact our support directly, so we can help you as best as possible.";
     } else {
-      return "I'd like to help you properly, but I don't have the right information in my knowledge base to resolve this reliably. Please contact our support team for assistance.";
+      return "I'd like to help you properly, but I don't have the right information to resolve this reliably. Please contact our support team for assistance.";
     }
   }
   
   if (hasSupportConfig) {
-    return "Ik wil je graag goed helpen, maar ik heb niet de juiste informatie in mijn kennisbank om dit betrouwbaar op te lossen.\n\nVia de knoppen hieronder kun je direct contact opnemen met onze support.\n\nBelangrijk: ik voeg automatisch een korte samenvatting van je vraag en de situatie toe aan je e-mail of contactformulier, zodat je dit niet opnieuw hoeft uit te leggen.";
+    return "Ik wil je graag goed helpen, maar ik heb niet de juiste informatie om dit betrouwbaar op te lossen. Via de knoppen hieronder kun je direct contact opnemen met onze support, zodat we je zo goed mogelijk verder kunnen helpen.";
   } else {
-    return "Ik wil je graag goed helpen, maar ik heb niet de juiste informatie in mijn kennisbank om dit betrouwbaar op te lossen. Neem contact op met onze support voor hulp.";
+    return "Ik wil je graag goed helpen, maar ik heb niet de juiste informatie om dit betrouwbaar op te lossen. Neem contact op met onze support voor hulp.";
   }
 }
 
@@ -3563,14 +3563,14 @@ function buildEscalationReply(clientConfig, clientId) {
 
   if (String(lang).toLowerCase().startsWith("en")) {
     if (hasSupportConfig) {
-      return "I'm sorry this has been frustrating. I can't help you well enough here.\n\nVia the buttons below, you can contact our support directly.\n\nImportant: I automatically add a short summary of your question and the situation to your email or contact form, so you don't have to explain everything again.";
+      return "I'm sorry this has been frustrating. Via the buttons below, you can contact our support directly, so we can help you as best as possible.";
     } else {
       return "I'm sorry this has been frustrating. I can't help you well enough here. Please contact our support team for assistance.";
-    } `I’m sorry this has been frustrating. For urgent help, please contact ${brandName} support.`;
+    }
   }
 
   if (hasSupportConfig) {
-    return "Het spijt me dat dit frustrerend is. Ik kan je hier niet goed genoeg mee helpen.\n\nVia de knoppen hieronder kun je direct contact opnemen met onze support.\n\nBelangrijk: ik voeg automatisch een korte samenvatting van je vraag en de situatie toe aan je e-mail of contactformulier, zodat je dit niet opnieuw hoeft uit te leggen.";
+    return "Het spijt me dat dit zo frustrerend is. Via de knoppen hieronder kun je direct contact opnemen met onze support, zodat we je zo goed mogelijk verder kunnen helpen.";
   } else {
     return "Het spijt me dat dit frustrerend is. Ik kan je hier niet goed genoeg mee helpen. Neem contact op met onze support voor hulp.";
   }
