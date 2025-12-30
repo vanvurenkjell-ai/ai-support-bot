@@ -85,6 +85,9 @@ function adminSecurityHeaders(req, res, next) {
 // Apply security headers to all admin routes
 router.use(adminSecurityHeaders);
 
+// Parse URL-encoded form data (for login/logout forms)
+router.use(express.urlencoded({ extended: false }));
+
 // Helper function to escape HTML (XSS protection)
 function escapeHtml(text) {
   if (!text) return "";
