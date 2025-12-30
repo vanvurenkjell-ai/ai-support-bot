@@ -5287,12 +5287,16 @@ CRITICAL RULES:
 // Session-based admin authentication portal
 // ============================================================================
 const adminRouter = require("./admin/adminRoutes");
+const adminApiRouter = require("./admin/adminApiRoutes");
 const { sessionMiddleware } = require("./admin/auth");
 
 // Apply session middleware for /admin routes
 app.use("/admin", sessionMiddleware);
 
-// Mount admin routes
+// Mount admin API routes (JSON API)
+app.use("/admin/api", adminApiRouter);
+
+// Mount admin UI routes (HTML pages)
 app.use("/admin", adminRouter);
 
 app.use((req, res) => {
