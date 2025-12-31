@@ -2589,66 +2589,37 @@ function retrieveScopedKnowledge(chunks, intent, message, requestId, clientId, s
 const clientsStore = require("./lib/clientsStoreAdapter");
 const { getClientsRoot, ensureClientsRoot, listClientIds, readClientConfig, getClientConfigPath } = clientsStore;
 
-// ClientId validation pattern (strict allowlist)
-const CLIENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,50}$/;
-const CLIENT_ID_MAX_LENGTH = 50;
-
-// Resolve client directory path safely (prevents path traversal)
+// Resolve client directory path safely (prevents path traversal) - filesystem only
+// When Supabase is active, this should not be called for validation (use clientsStore.validateClientId instead)
 function resolveClientDir(clientId, requestId = null) {
-  // Step 1: Validate clientId is present and is a string
-  if (!clientId || typeof clientId !== "string") {
+  // Use adapter's validateClientId for consistent validation
+  const idValidation = clientsStore.validateClientId(clientId);
+  if (!idValidation.valid) {
     if (requestId && typeof logJson === "function") {
       logJson("warn", "client_path_traversal_blocked", {
         event: "client_path_traversal_blocked",
         requestId: requestId,
         clientId: String(clientId || ""),
-        reason: "clientid_missing_or_invalid_type",
+        reason: idValidation.reason || "invalid_client_id_format",
         timestamp: typeof nowIso === "function" ? nowIso() : new Date().toISOString(),
       });
     }
     return null;
   }
 
-  const clientIdRaw = String(clientId).trim();
+  const validatedClientId = idValidation.clientId;
 
-  // Step 2: Reject empty or too long
-  if (clientIdRaw.length === 0) {
-    if (requestId && typeof logJson === "function") {
-      logJson("warn", "client_path_traversal_blocked", {
-        event: "client_path_traversal_blocked",
-        requestId: requestId,
-        clientId: clientIdRaw,
-        reason: "clientid_empty",
-        timestamp: typeof nowIso === "function" ? nowIso() : new Date().toISOString(),
-      });
-    }
-    return null;
-  }
-
-  if (clientIdRaw.length > CLIENT_ID_MAX_LENGTH) {
-    if (requestId && typeof logJson === "function") {
-      logJson("warn", "client_path_traversal_blocked", {
-        event: "client_path_traversal_blocked",
-        requestId: requestId,
-        clientId: clientIdRaw,
-        reason: "clientid_too_long",
-        timestamp: typeof nowIso === "function" ? nowIso() : new Date().toISOString(),
-      });
-    }
-    return null;
-  }
-
-  // Step 3: Decode URL-encoded traversal attempts safely
-  let decodedClientId = clientIdRaw;
+  // Step 2: Decode URL-encoded traversal attempts safely
+  let decodedClientId = validatedClientId;
   try {
-    decodedClientId = decodeURIComponent(clientIdRaw);
+    decodedClientId = decodeURIComponent(validatedClientId);
   } catch (e) {
     // Invalid encoding - reject
     if (requestId && typeof logJson === "function") {
       logJson("warn", "client_path_traversal_blocked", {
         event: "client_path_traversal_blocked",
         requestId: requestId,
-        clientId: clientIdRaw,
+        clientId: validatedClientId,
         reason: "url_encoding_invalid",
         timestamp: typeof nowIso === "function" ? nowIso() : new Date().toISOString(),
       });
@@ -2656,7 +2627,7 @@ function resolveClientDir(clientId, requestId = null) {
     return null;
   }
 
-  // Step 4: Check for traversal patterns after decoding
+  // Step 3: Check for traversal patterns after decoding
   if (
     decodedClientId.includes("..") ||
     decodedClientId.includes("/") ||
@@ -2670,7 +2641,7 @@ function resolveClientDir(clientId, requestId = null) {
       logJson("warn", "client_path_traversal_blocked", {
         event: "client_path_traversal_blocked",
         requestId: requestId,
-        clientId: clientIdRaw,
+        clientId: validatedClientId,
         reason: "traversal_detected",
         timestamp: typeof nowIso === "function" ? nowIso() : new Date().toISOString(),
       });
@@ -2678,28 +2649,15 @@ function resolveClientDir(clientId, requestId = null) {
     return null;
   }
 
-  // Step 5: Validate against strict allowlist pattern
-  if (!CLIENT_ID_PATTERN.test(decodedClientId)) {
-    if (requestId && typeof logJson === "function") {
-      logJson("warn", "client_path_traversal_blocked", {
-        event: "client_path_traversal_blocked",
-        requestId: requestId,
-        clientId: clientIdRaw,
-        reason: "invalid_chars",
-        timestamp: typeof nowIso === "function" ? nowIso() : new Date().toISOString(),
-      });
-    }
-    return null;
-  }
-
-  // Step 6: Use clientsStore to get safe path (includes validation and containment check)
+  // Step 4: Use clientsStore to get safe path (includes validation and containment check)
+  // For filesystem mode, this returns the directory path
   const pathResult = getClientConfigPath(decodedClientId);
-  if (!pathResult.valid) {
+  if (!pathResult.valid || !pathResult.dir) {
     if (requestId && typeof logJson === "function") {
       logJson("warn", "client_path_traversal_blocked", {
         event: "client_path_traversal_blocked",
         requestId: requestId,
-        clientId: clientIdRaw,
+        clientId: validatedClientId,
         reason: pathResult.reason || "containment_failed",
         timestamp: typeof nowIso === "function" ? nowIso() : new Date().toISOString(),
       });
@@ -2707,7 +2665,7 @@ function resolveClientDir(clientId, requestId = null) {
     return null;
   }
   
-  // Return the client directory path (not config file path)
+  // Return the client directory path (filesystem mode only)
   return pathResult.dir;
   
   // Legacy containment check (now handled by clientsStore.getClientConfigPath)
@@ -2740,6 +2698,89 @@ const REQUIRED_CLIENT_FILES = [
   "Customer support rules.md",
   "client-config.json",
 ];
+
+// Unified client validation: respects storeType (Supabase vs filesystem)
+async function validateClient(clientId) {
+  // First, validate client ID format (consistent across all stores)
+  const idValidation = clientsStore.validateClientId(clientId);
+  if (!idValidation.valid) {
+    return { valid: false, missingFiles: [], errors: [`Invalid client ID format: ${idValidation.reason}`] };
+  }
+
+  // If Supabase is active, validate against Supabase (no filesystem checks)
+  if (clientsStore.storeType === "supabase") {
+    try {
+      const config = await readClientConfig(clientId);
+      if (!config) {
+        return { valid: false, missingFiles: [], errors: [`Client not found in Supabase: ${clientId}`] };
+      }
+
+      // Basic config schema validation (whitelist fields, max lengths enforced by admin routes)
+      if (typeof config !== "object" || config === null) {
+        return { valid: false, missingFiles: [], errors: ["Client config is invalid (not an object)"] };
+      }
+
+      // Client exists in Supabase and has valid config structure
+      return { valid: true, missingFiles: [], errors: [] };
+    } catch (error) {
+      if (typeof logJson === "function") {
+        logJson("error", "client_validation_supabase_error", {
+          clientId: clientId,
+          error: error?.message || String(error),
+          storeType: clientsStore.storeType,
+        });
+      }
+      return { valid: false, missingFiles: [], errors: [`Failed to validate client: ${error?.message || String(error)}`] };
+    }
+  }
+
+  // Filesystem validation (existing behavior)
+  const base = resolveClientDir(clientId);
+  if (!base) {
+    return { valid: false, missingFiles: ["folder"], errors: [`Invalid client ID: ${clientId}`] };
+  }
+
+  const missingFiles = [];
+  const errors = [];
+
+  if (!fs.existsSync(base)) {
+    return { valid: false, missingFiles: ["folder"], errors: [`Client folder not found: ${clientId}`] };
+  }
+
+  if (!fs.statSync(base).isDirectory()) {
+    return { valid: false, missingFiles: [], errors: [`Path exists but is not a directory: ${clientId}`] };
+  }
+
+  for (const file of REQUIRED_CLIENT_FILES) {
+    const filePath = path.join(base, file);
+    if (!fs.existsSync(filePath)) {
+      missingFiles.push(file);
+    }
+  }
+
+  if (missingFiles.length > 0) {
+    errors.push(`Missing required files: ${missingFiles.join(", ")}`);
+  }
+
+  const clientConfigPath = path.join(base, "client-config.json");
+  if (fs.existsSync(clientConfigPath)) {
+    try {
+      const configRaw = readFile(clientConfigPath);
+      const config = safeJsonParse(configRaw, null);
+      if (!config || typeof config !== "object") {
+        errors.push("client-config.json is not valid JSON");
+      }
+    } catch (e) {
+      errors.push(`client-config.json parse error: ${e && e.message ? e.message : String(e)}`);
+    }
+  }
+
+  return {
+    valid: missingFiles.length === 0 && errors.length === 0,
+    missingFiles,
+    errors,
+  };
+}
 
 const OPTIONAL_CLIENT_FILES = [
   "FAQ.md",
@@ -2899,44 +2940,42 @@ async function initializeClientRegistry() {
     const clientsRoot = getClientsRoot();
     const clientIds = await listClientIds();
 
+    logJson("info", "client_registry_init_start", {
+      storeType: clientsStore.storeType,
+      clientsRoot: clientsRoot,
+      clientIdsFound: clientIds.length,
+    });
+
     for (const clientId of clientIds) {
-      const validation = validateClientFolder(clientId);
+      // Use unified validation that respects storeType
+      const validation = await validateClient(clientId);
 
       if (!validation.valid) {
         if (typeof logJson === "function") {
           logJson("warn", "client_validation_failed", {
             clientId: clientId,
-            missingFiles: validation.missingFiles,
-            errors: validation.errors,
+            missingFiles: validation.missingFiles || [],
+            errors: validation.errors || [],
+            storeType: clientsStore.storeType,
           });
         }
         clientRegistry.set(clientId, {
           status: "invalid",
-          missingFiles: validation.missingFiles,
-          validationErrors: validation.errors,
+          missingFiles: validation.missingFiles || [],
+          validationErrors: validation.errors || [],
         });
         continue;
       }
 
       try {
-        const base = resolveClientDir(clientId);
-        if (!base) {
-          if (typeof logJson === "function") {
-            logJson("warn", "client_path_resolution_failed", {
-              clientId: clientId,
-              reason: "path_resolution_failed",
-            });
-          }
-          continue;
-        }
-
-        // Use clientsStore to read config
-        const config = readClientConfig(clientId);
+        // Use clientsStore to read config (works for both Supabase and filesystem)
+        const config = await readClientConfig(clientId);
         if (!config) {
           if (typeof logJson === "function") {
             logJson("warn", "client_config_read_failed", {
               clientId: clientId,
-              reason: "config_file_not_found_or_invalid",
+              reason: "config_not_found_or_invalid",
+              storeType: clientsStore.storeType,
             });
           }
           continue;
@@ -2953,6 +2992,7 @@ async function initializeClientRegistry() {
           logJson("warn", "client_config_normalize_failed", {
             clientId: clientId,
             error: e && e.message ? e.message : String(e),
+            storeType: clientsStore.storeType,
           });
         }
         clientRegistry.set(clientId, {
@@ -2980,17 +3020,15 @@ async function initializeClientRegistry() {
 // Admin saves write to disk but don't invalidate cache, so /widget-config serves stale data.
 // Fix: /widget-config now reads fresh from disk; admin saves invalidate cache entry.
 
-// Reload a single client config from disk and update cache
-function reloadClientConfig(clientId) {
+// Reload a single client config from storage and update cache (works for both Supabase and filesystem)
+async function reloadClientConfig(clientId) {
   try {
-    const base = resolveClientDir(clientId);
-    if (!base) return false;
+    // Use clientsStore to read config (works for both Supabase and filesystem)
+    const config = await readClientConfig(clientId);
+    if (!config) {
+      return false;
+    }
     
-    const configPath = path.join(base, "client-config.json");
-    if (!fs.existsSync(configPath)) return false;
-    
-    const configRaw = readFile(configPath);
-    const config = safeJsonParse(configRaw, {});
     const normalizedConfig = normalizeClientConfig(config, clientId);
     
     clientRegistry.set(clientId, {
@@ -3000,11 +3038,14 @@ function reloadClientConfig(clientId) {
     
     return true;
   } catch (e) {
-    logJson("error", "client_config_reload_error", {
-      event: "client_config_reload_error",
-      clientId: clientId,
-      error: e?.message || String(e),
-    });
+    if (typeof logJson === "function") {
+      logJson("error", "client_config_reload_error", {
+        event: "client_config_reload_error",
+        clientId: clientId,
+        error: e?.message || String(e),
+        storeType: clientsStore.storeType,
+      });
+    }
     return false;
   }
 }
@@ -3017,8 +3058,30 @@ function getClientOrNull(clientIdRaw) {
   return { clientId, config: entry.config };
 }
 
-function loadClient(clientIdRaw, requestId = null) {
+async function loadClient(clientIdRaw, requestId = null) {
   const clientId = sanitizeClientId(clientIdRaw);
+
+  // When Supabase is active, return minimal data (no markdown files available)
+  // The config will be loaded separately from Supabase via clientRegistry
+  if (clientsStore.storeType === "supabase") {
+    // Validate client exists in Supabase
+    const config = await readClientConfig(clientId);
+    if (!config) {
+      throw new Error(`Client not found in Supabase: ${clientId}`);
+    }
+
+    // Return empty/default values for markdown files (not available in Supabase mode)
+    // These will need to be migrated to Supabase config or stored separately if needed
+    return {
+      clientId,
+      brandVoice: "", // Not available in Supabase mode
+      supportRules: "", // Not available in Supabase mode
+      chunks: [], // Not available in Supabase mode
+      clientConfig: config,
+    };
+  }
+
+  // Filesystem mode (existing behavior)
   const base = resolveClientDir(clientId, requestId);
 
   if (!base) {
@@ -4295,12 +4358,13 @@ app.post("/chat", widgetCors, requireWidgetAuth, async (req, res) => {
 
     let data;
     try {
-      data = loadClient(clientId, req.requestId);
+      data = await loadClient(clientId, req.requestId);
     } catch (e) {
       logJson("error", "load_client_failed", {
         requestId: req.requestId,
         clientId: clientId,
         error: e && e.message ? e.message : String(e),
+        storeType: clientsStore.storeType,
       });
       res.status(404);
         // SECURITY: Generic error message - don't reveal internal structure
