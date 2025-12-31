@@ -6,6 +6,8 @@ const { sessionMiddleware, requireAdminAuth, verifyAdminCredentials, regenerateS
 const { generateCsrfToken, setCsrfToken, getCsrfToken, requireCsrf } = require("./csrf");
 // Import unified client store adapter (chooses Supabase or filesystem automatically)
 const clientsStore = require("../lib/clientsStoreAdapter");
+// Import authorization helpers
+const { resolveUserFromSupabase, loadUserClientIds, isSuperAdmin, canAccessClient, getAuthorizedClientIds } = require("./adminAuthz");
 
 // Simple logging helper (matches index.js pattern for structured logs)
 function logAdminEvent(level, event, fields) {
@@ -139,7 +141,10 @@ function renderLoginPage(csrfToken, errorMessage = null) {
 // Login page (GET /admin/login)
 router.get("/login", (req, res) => {
   // If already authenticated, redirect to admin dashboard
-  if (req.session?.admin && req.session.admin.email === ADMIN_EMAIL) {
+  // Support both legacy and new authz
+  const isLegacyAuth = req.session?.admin && req.session.admin.email === ADMIN_EMAIL;
+  const hasNewAuthz = req.session?.admin && req.session.admin.authz && req.session.admin.authz.role;
+  if (isLegacyAuth || hasNewAuthz) {
     return res.redirect("/admin");
   }
 
@@ -172,68 +177,115 @@ router.post("/login", rateLimitLogin, requireCsrf, async (req, res) => {
     return res.status(400).send(renderLoginPage(csrfToken, "Email and password are required"));
   }
 
-  // Verify credentials
-  if (!verifyAdminCredentials(email, password)) {
-    // Log failed login attempt (no password) - normalize email for logging (no secrets)
-    const emailNormalized = email ? String(email).toLowerCase().trim() : null;
-    logAdminEvent("warn", "admin_login_failed", {
-      event: "admin_login_failed",
-      requestId: requestId,
-      ip: ip,
-      emailAttempt: emailNormalized,
-      sessionId: req.sessionID || null,
-      reason: "invalid_credentials",
-    });
-    return res.status(401).send(renderLoginPage(csrfToken, "Invalid email or password"));
-  }
-
-  try {
-    // Regenerate session to prevent session fixation
-    await regenerateSession(req);
-
-    // Set authenticated session with structured data
-    req.session.admin = {
-      email: ADMIN_EMAIL,
-      loggedInAt: Date.now(),
-    };
-
-    // Generate new CSRF token for subsequent requests
-    const newCsrfToken = generateCsrfToken();
-    setCsrfToken(req, newCsrfToken);
-
-    // Explicitly save session before redirecting
-    req.session.save((err) => {
-      if (err) {
-        logAdminEvent("error", "admin_login_error", {
-          requestId: requestId,
-          ip: ip,
-          error: err?.message || String(err),
-        });
-        return res.status(500).send(renderLoginPage(csrfToken, "Login failed. Please try again."));
-      }
-
-      // Log successful login with session diagnostic info
-      const hasSetCookie = !!res.getHeader("Set-Cookie");
-      logAdminEvent("info", "admin_login_success", {
-        event: "admin_login_success",
+  // Verify credentials and resolve user from Supabase (with legacy fallback)
+  const resolvedUser = await resolveUserFromSupabase(email, password);
+  
+  if (!resolvedUser) {
+    // Also try legacy credential check for backward compatibility
+    if (!verifyAdminCredentials(email, password)) {
+      // Log failed login attempt (no password) - normalize email for logging (no secrets)
+      const emailNormalized = email ? String(email).toLowerCase().trim() : null;
+      logAdminEvent("warn", "admin_login_failed", {
+        event: "admin_login_failed",
         requestId: requestId,
         ip: ip,
-        email: ADMIN_EMAIL,
+        emailAttempt: emailNormalized,
         sessionId: req.sessionID || null,
-        hasSetCookie: hasSetCookie,
+        reason: "invalid_credentials",
       });
+      return res.status(401).send(renderLoginPage(csrfToken, "Invalid email or password"));
+    }
 
-      // Redirect to admin dashboard after session is saved
-      return res.redirect("/admin");
-    });
-  } catch (error) {
-    logAdminEvent("error", "admin_login_error", {
+    // Legacy super-admin (backward compatibility)
+    // Use legacy authz structure
+    try {
+      await regenerateSession(req);
+      req.session.admin = {
+        email: ADMIN_EMAIL,
+        loggedInAt: Date.now(),
+        authz: {
+          role: "super_admin",
+          clientIds: null, // null means "all clients"
+        },
+      };
+    } catch (error) {
+      logAdminEvent("error", "admin_login_error", {
+        requestId: requestId,
+        ip: ip,
+        error: error?.message || String(error),
+      });
+      return res.status(500).send(renderLoginPage(csrfToken, "Login failed. Please try again."));
+    }
+  } else {
+    // User resolved from Supabase - load client IDs for client_admin
+    let clientIds = null;
+    if (resolvedUser.user.role === "client_admin" && resolvedUser.user.id) {
+      clientIds = await loadUserClientIds(resolvedUser.user.id);
+    } else if (resolvedUser.user.role === "super_admin") {
+      clientIds = null; // null means "all clients"
+    }
+
+    try {
+      await regenerateSession(req);
+      req.session.admin = {
+        email: resolvedUser.user.email,
+        loggedInAt: Date.now(),
+        authz: {
+          role: resolvedUser.user.role,
+          clientIds: clientIds,
+          userId: resolvedUser.user.id,
+        },
+      };
+
+      logAdminEvent("info", "admin_authz_resolved", {
+        requestId: requestId,
+        email: resolvedUser.user.email,
+        role: resolvedUser.user.role,
+        clientIdsCount: clientIds ? clientIds.length : null,
+        clientIds: clientIds || null, // Log client IDs for debugging (not sensitive)
+      });
+    } catch (error) {
+      logAdminEvent("error", "admin_login_error", {
+        requestId: requestId,
+        ip: ip,
+        error: error?.message || String(error),
+      });
+      return res.status(500).send(renderLoginPage(csrfToken, "Login failed. Please try again."));
+    }
+  }
+
+  // Generate new CSRF token for subsequent requests
+  const newCsrfToken = generateCsrfToken();
+  setCsrfToken(req, newCsrfToken);
+
+  // Explicitly save session before redirecting
+  req.session.save((err) => {
+    if (err) {
+      logAdminEvent("error", "admin_login_error", {
+        requestId: requestId,
+        ip: ip,
+        error: err?.message || String(err),
+      });
+      return res.status(500).send(renderLoginPage(csrfToken, "Login failed. Please try again."));
+    }
+
+    // Log successful login with session diagnostic info
+    const hasSetCookie = !!res.getHeader("Set-Cookie");
+    const authz = req.session.admin.authz || { role: "super_admin", clientIds: null };
+    logAdminEvent("info", "admin_login_success", {
+      event: "admin_login_success",
       requestId: requestId,
       ip: ip,
-      error: error?.message || String(error),
+      email: req.session.admin.email,
+      role: authz.role,
+      clientIdsCount: authz.clientIds ? authz.clientIds.length : null,
+      sessionId: req.sessionID || null,
+      hasSetCookie: hasSetCookie,
     });
-    return res.status(500).send(renderLoginPage(csrfToken, "Login failed. Please try again."));
-  }
+
+    // Redirect to admin dashboard after session is saved
+    return res.redirect("/admin");
+  });
 });
 
 // Logout handler (POST /admin/logout)
@@ -437,8 +489,32 @@ router.get("/clients", requireAdminAuth, async (req, res) => {
   const csrfToken = generateCsrfToken();
   setCsrfToken(req, csrfToken);
 
-  // Fetch clients from Supabase/filesystem (async)
-  const clients = await listClientIds();
+  // Fetch all clients from Supabase/filesystem (async)
+  const allClients = await listClientIds();
+  
+  // Filter clients based on authorization
+  let clients = allClients;
+  const userEmail = req.session.admin.email;
+  
+  if (isSuperAdmin(req)) {
+    // Super admin sees all clients
+    clients = allClients;
+  } else {
+    // Client admin sees only their assigned clients
+    const authorizedClientIds = getAuthorizedClientIds(req) || [];
+    clients = allClients.filter(clientId => authorizedClientIds.includes(clientId));
+    
+    logAdminEvent("info", "admin_clients_list_filtered", {
+      event: "admin_clients_list_filtered",
+      requestId: requestId,
+      ip: ip,
+      userEmail: userEmail,
+      allClientsCount: allClients.length,
+      filteredClientsCount: clients.length,
+      authorizedClientIds: authorizedClientIds,
+    });
+  }
+
   const created = req.query.created === "1";
   const deleted = req.query.deleted === "1";
   const clientsRoot = getClientsRoot();
@@ -447,9 +523,11 @@ router.get("/clients", requireAdminAuth, async (req, res) => {
     event: "admin_clients_list_view",
     requestId: requestId,
     ip: ip,
+    userEmail: userEmail,
     storeType: clientsStore.storeType,
     clientsCount: clients.length,
     clientIds: clients,
+    isSuperAdmin: isSuperAdmin(req),
   });
   
   const successMessage = created ? '<p style="color: green; font-weight: bold;">✓ Client created successfully!</p>' : '';
@@ -477,6 +555,7 @@ router.get("/clients", requireAdminAuth, async (req, res) => {
     <p><strong>Config storage:</strong> <code>${escapeHtml(clientsStore.storeType === "supabase" ? "Supabase" : clientsRoot)}</code></p>
     <p style="margin-top: 5px; font-size: 0.9em; color: #666;">${clientsStore.storeType === "supabase" ? "Clients are stored in Supabase database." : "Clients created here are stored on the server; they will not appear in GitHub automatically."}</p>
   </div>
+  ${isSuperAdmin(req) ? `
   <h3>Create New Client</h3>
   <form method="POST" action="/admin/clients" style="margin-bottom: 30px; padding: 15px; border: 1px solid #ccc; max-width: 500px;">
     <input type="hidden" name="csrfToken" value="${csrfToken}">
@@ -489,6 +568,7 @@ router.get("/clients", requireAdminAuth, async (req, res) => {
     </div>
     <button type="submit" style="background: #28a745; color: white; border: none; padding: 8px 16px; cursor: pointer;">Create Client</button>
   </form>
+  ` : ''}
   <h3>Existing Clients</h3>
   ${clientsList}
 </body>
@@ -497,8 +577,36 @@ router.get("/clients", requireAdminAuth, async (req, res) => {
   res.send(html);
 });
 
-// Create client (POST /admin/clients)
+// Create client (POST /admin/clients) - super_admin only
 router.post("/clients", requireAdminAuth, requireCsrf, async (req, res) => {
+  // Authorization check: only super_admin can create clients
+  if (!isSuperAdmin(req)) {
+    const requestId = req.requestId || "unknown";
+    const ip = getClientIp(req);
+    logAdminEvent("warn", "admin_client_create_denied", {
+      event: "admin_client_create_denied",
+      requestId: requestId,
+      ip: ip,
+      userEmail: req.session.admin.email,
+      reason: "not_super_admin",
+    });
+    
+    const csrfToken = generateCsrfToken();
+    setCsrfToken(req, csrfToken);
+    return res.status(403).send(`
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Admin Portal - Access Denied</title></head>
+<body>
+  <h1>Admin Portal</h1>
+  ${renderNav("clients", csrfToken)}
+  <h2>Access Denied</h2>
+  <p style="color: red;">You do not have permission to create clients. Only super administrators can create new clients.</p>
+  <p><a href="/admin/clients">Back to clients</a></p>
+</body>
+</html>
+    `);
+  }
   const requestId = req.requestId || "unknown";
   const ip = getClientIp(req);
   const { clientId, displayName } = req.body || {};
@@ -725,6 +833,7 @@ router.get("/clients/:clientId", requireAdminAuth, async (req, res) => {
   
   <hr style="margin: 40px 0;">
   
+  ${isSuperAdmin(req) ? `
   <h3>Delete Client</h3>
   <div style="padding: 15px; background: #fff3cd; border: 1px solid #ffc107; margin-bottom: 20px;">
     <p><strong>Warning:</strong> This will permanently delete the client configuration. This action cannot be undone.</p>
@@ -739,6 +848,7 @@ router.get("/clients/:clientId", requireAdminAuth, async (req, res) => {
     <button type="submit" style="background: #dc3545; color: white; border: none; padding: 10px 20px; cursor: pointer; font-size: 16px;">Delete Client</button>
   </form>
   ` : ''}
+  ` : ''}
 </body>
 </html>
   `;
@@ -749,12 +859,40 @@ router.get("/clients/:clientId", requireAdminAuth, async (req, res) => {
 router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res) => {
   const requestId = req.requestId || "unknown";
   const clientIdRaw = req.params.clientId;
+  const userEmail = req.session.admin.email;
   
   const validation = validateClientId(clientIdRaw);
   if (!validation.valid) {
     return res.status(400).send("Invalid client ID");
   }
   const clientId = validation.clientId;
+  
+  // Authorization check: user must be able to access this client
+  if (!canAccessClient(req, clientId)) {
+    logAdminEvent("warn", "admin_client_update_denied", {
+      event: "admin_client_update_denied",
+      requestId: requestId,
+      userEmail: userEmail,
+      clientId: clientId,
+      reason: "not_authorized",
+    });
+    
+    const csrfToken = generateCsrfToken();
+    setCsrfToken(req, csrfToken);
+    return res.status(403).send(`
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Admin Portal - Access Denied</title></head>
+<body>
+  <h1>Admin Portal</h1>
+  ${renderNav("clients", csrfToken)}
+  <h2>Access Denied</h2>
+  <p style="color: red;">You do not have permission to update this client.</p>
+  <p><a href="/admin/clients">Back to clients</a></p>
+</body>
+</html>
+    `);
+  }
   
   // Transform form data to API format
   const updateData = {};

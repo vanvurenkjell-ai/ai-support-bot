@@ -69,8 +69,10 @@ function logAdminEvent(level, event, fields) {
 }
 
 // Authentication middleware: require admin session
+// Supports both legacy super-admin (via ADMIN_EMAIL) and new role-based authz
 function requireAdminAuth(req, res, next) {
-  if (!req.session || !req.session.admin || !req.session.admin.email || req.session.admin.email !== ADMIN_EMAIL) {
+  // Check if session exists and has admin data
+  if (!req.session || !req.session.admin || !req.session.admin.email) {
     // Log unauthorized access attempt
     const requestId = req.requestId || "unknown";
     const ip = req.ip || "unknown"; // req.ip is set by trust proxy setting in index.js
@@ -79,6 +81,7 @@ function requireAdminAuth(req, res, next) {
       path: req.path,
       method: req.method,
       ip: ip,
+      reason: "no_session_or_email",
     });
     
     // For API endpoints (like /admin/health), return 401 JSON
@@ -93,6 +96,35 @@ function requireAdminAuth(req, res, next) {
     // For HTML pages, redirect to login
     return res.redirect("/admin/login");
   }
+
+  // Backward compatibility: allow legacy super-admin (ADMIN_EMAIL match)
+  // OR require authorization context (req.session.admin.authz)
+  const isLegacySuperAdmin = req.session.admin.email === ADMIN_EMAIL;
+  const hasAuthz = req.session.admin.authz && req.session.admin.authz.role;
+
+  if (!isLegacySuperAdmin && !hasAuthz) {
+    // Session exists but no valid authorization - deny access
+    const requestId = req.requestId || "unknown";
+    const ip = req.ip || "unknown";
+    logAdminEvent("warn", "admin_unauthorized_access", {
+      requestId: requestId,
+      path: req.path,
+      method: req.method,
+      ip: ip,
+      email: req.session.admin.email,
+      reason: "missing_authz_context",
+    });
+
+    const isApiEndpoint = req.path === "/admin/health" || (req.path.startsWith("/admin/") && req.path !== "/admin" && req.path !== "/admin/login");
+    if (isApiEndpoint) {
+      return res.status(401).json({
+        error: "Unauthorized",
+        message: "Authentication required",
+      });
+    }
+    return res.redirect("/admin/login");
+  }
+
   next();
 }
 

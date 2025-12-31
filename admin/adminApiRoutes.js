@@ -217,7 +217,16 @@ function validateConfigUpdate(input) {
 router.get("/clients", requireAdminAuth, async (req, res) => {
   const requestId = req.requestId || "unknown";
   try {
-    const clients = await listClientIds();
+    const allClients = await listClientIds();
+    
+    // Filter clients based on authorization
+    let clients = allClients;
+    if (isSuperAdmin(req)) {
+      clients = allClients;
+    } else {
+      const authorizedClientIds = getAuthorizedClientIds(req) || [];
+      clients = allClients.filter(clientId => authorizedClientIds.includes(clientId));
+    }
     logAdminEvent("info", "admin_api_clients_list", {
       event: "admin_api_clients_list",
       requestId: requestId,
@@ -238,7 +247,25 @@ router.get("/clients", requireAdminAuth, async (req, res) => {
 // GET /admin/api/clients/:clientId - Get client config
 router.get("/clients/:clientId", requireAdminAuth, async (req, res) => {
   const requestId = req.requestId || "unknown";
-  const validation = validateClientId(req.params.clientId);
+  const clientId = req.params.clientId;
+  const userEmail = req.session.admin.email;
+  
+  // Authorization check: user must be able to access this client
+  if (!canAccessClient(req, clientId)) {
+    logAdminEvent("warn", "admin_api_client_access_denied", {
+      event: "admin_api_client_access_denied",
+      requestId: requestId,
+      userEmail: userEmail,
+      clientId: clientId,
+      reason: "not_authorized",
+    });
+    return res.status(403).json({
+      error: "Forbidden",
+      message: "You do not have permission to access this client",
+    });
+  }
+  
+  const validation = validateClientId(clientId);
   
   if (!validation.valid) {
     logAdminEvent("warn", "admin_api_client_invalid_id", {
@@ -293,7 +320,25 @@ router.get("/clients/:clientId", requireAdminAuth, async (req, res) => {
 // POST /admin/api/clients/:clientId - Update client config
 router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res) => {
   const requestId = req.requestId || "unknown";
-  const validation = validateClientId(req.params.clientId);
+  const clientId = req.params.clientId;
+  const userEmail = req.session.admin.email;
+  
+  // Authorization check: user must be able to access this client
+  if (!canAccessClient(req, clientId)) {
+    logAdminEvent("warn", "admin_api_client_update_denied", {
+      event: "admin_api_client_update_denied",
+      requestId: requestId,
+      userEmail: userEmail,
+      clientId: clientId,
+      reason: "not_authorized",
+    });
+    return res.status(403).json({
+      error: "Forbidden",
+      message: "You do not have permission to update this client",
+    });
+  }
+  
+  const validation = validateClientId(clientId);
   
   if (!validation.valid) {
     logAdminEvent("warn", "admin_api_client_update_invalid_id", {
