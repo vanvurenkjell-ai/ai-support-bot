@@ -8,6 +8,8 @@ const { generateCsrfToken, setCsrfToken, getCsrfToken, requireCsrf } = require("
 const clientsStore = require("../lib/clientsStoreAdapter");
 // Import authorization helpers
 const { resolveUserFromSupabase, loadUserClientIds, isSuperAdmin, canAccessClient, getAuthorizedClientIds } = require("./adminAuthz");
+// Import config validator
+const { validateAndSanitizeConfigUpdate, mergeConfigUpdate } = require("./configValidator");
 
 // Simple logging helper (matches index.js pattern for structured logs)
 function logAdminEvent(level, event, fields) {
@@ -912,10 +914,6 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res
     updateData.support = req.body.support;
   }
   
-  // Use the API validation logic by importing it
-  const adminApiRoutes = require("./adminApiRoutes");
-  const validateConfigUpdate = adminApiRoutes.validateConfigUpdate;
-  
   // Validate clientId and get path (use clientsStore)
   const pathResult = getClientConfigPath(clientId);
   if (!pathResult.valid) {
@@ -929,44 +927,75 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res
       return res.status(404).send("Client config not found");
     }
     
-    // Validate update (reuse API validation)
-    const validationResult = validateConfigUpdate(updateData);
-    if (validationResult.errors.length > 0) {
+    // Determine actor role for validation (same allowlist for all roles for safety)
+    const actorRole = isSuperAdmin(req) ? "super_admin" : "client_admin";
+    
+    // Validate and sanitize update using strict validator
+    const validationResult = validateAndSanitizeConfigUpdate(existingConfig, updateData, actorRole);
+    
+    if (validationResult.errors.length > 0 || !validationResult.sanitizedConfig) {
       logAdminEvent("warn", "admin_client_update_validation_failed", {
         event: "admin_client_update_validation_failed",
         requestId: requestId,
         clientId: clientId,
+        userEmail: userEmail,
+        actorRole: actorRole,
         errors: validationResult.errors,
+        disallowedFields: Object.keys(validationResult.fieldErrors || {}),
       });
-      return res.status(400).send(`Validation failed: ${validationResult.errors.join(", ")}`);
+      
+      // Re-render edit page with error messages
+      const csrfToken = generateCsrfToken();
+      setCsrfToken(req, csrfToken);
+      
+      // Helper to safely get nested value
+      const getValue = (obj, path, defaultValue = "") => {
+        const parts = path.split(".");
+        let current = obj;
+        for (const part of parts) {
+          if (current && typeof current === "object" && part in current) {
+            current = current[part];
+          } else {
+            return defaultValue;
+          }
+        }
+        return current != null ? String(current) : defaultValue;
+      };
+      
+      // Re-read config for form re-rendering
+      const config = existingConfig;
+      const configStats = await clientsStore.getClientConfigStats(clientId);
+      
+      const errorSummary = validationResult.errors.length > 0
+        ? `<div style="padding: 15px; background: #fff3cd; border: 1px solid #ffc107; margin-bottom: 20px;">
+            <p style="color: red; font-weight: bold;">Validation errors:</p>
+            <ul>
+              ${validationResult.errors.map(err => `<li>${escapeHtml(err)}</li>`).join("")}
+            </ul>
+          </div>`
+        : "";
+      
+      // Re-render form (similar to GET route) with error messages
+      // For brevity, redirect back to edit page with error param and show error message
+      // Or re-render the form here (full implementation would need the full form HTML)
+      return res.status(400).send(`
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Admin Portal - Validation Error</title></head>
+<body>
+  <h1>Admin Portal</h1>
+  ${renderNav("clients", csrfToken)}
+  <h2>Edit Client: ${escapeHtml(clientId)}</h2>
+  ${errorSummary}
+  <p><a href="/admin/clients/${encodeURIComponent(clientId)}">← Back to edit page</a></p>
+  <p>Please fix the validation errors and try again.</p>
+</body>
+</html>
+      `);
     }
     
-    // Merge allowed fields into existing config
-    const updatedConfig = JSON.parse(JSON.stringify(existingConfig));
-    if (validationResult.allowed.colors) {
-      updatedConfig.colors = { ...updatedConfig.colors, ...validationResult.allowed.colors };
-    }
-    if (validationResult.allowed.widget) {
-      updatedConfig.widget = { ...updatedConfig.widget, ...validationResult.allowed.widget };
-    }
-    if (validationResult.allowed.logoUrl !== undefined) {
-      updatedConfig.logoUrl = validationResult.allowed.logoUrl;
-    }
-    if (validationResult.allowed.entryScreen) {
-      updatedConfig.entryScreen = { ...updatedConfig.entryScreen, ...validationResult.allowed.entryScreen };
-      if (validationResult.allowed.entryScreen.primaryButton) {
-        updatedConfig.entryScreen.primaryButton = {
-          ...updatedConfig.entryScreen.primaryButton,
-          ...validationResult.allowed.entryScreen.primaryButton,
-        };
-      }
-      if (validationResult.allowed.entryScreen.secondaryButtons !== undefined) {
-        updatedConfig.entryScreen.secondaryButtons = validationResult.allowed.entryScreen.secondaryButtons;
-      }
-    }
-    if (validationResult.allowed.support) {
-      updatedConfig.support = { ...updatedConfig.support, ...validationResult.allowed.support };
-    }
+    // Merge sanitized update into existing config
+    const updatedConfig = mergeConfigUpdate(existingConfig, validationResult.sanitizedConfig);
     
     // Write updated config (atomic write - async for Supabase)
     const updatedBy = req.session?.admin?.email || null;
@@ -998,7 +1027,8 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res
       event: "admin_client_update_success",
       requestId: requestId,
       clientId: clientId,
-      updatedFields: Object.keys(validationResult.allowed),
+      userEmail: userEmail,
+      actorRole: actorRole,
     });
     
     // Redirect back to edit page with success message

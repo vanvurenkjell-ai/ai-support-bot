@@ -5,6 +5,8 @@ const path = require("path");
 const { requireAdminAuth } = require("./auth");
 const { requireCsrf } = require("./csrf");
 const clientsStore = require("../lib/clientsStoreAdapter");
+const { validateAndSanitizeConfigUpdate, mergeConfigUpdate } = require("./configValidator");
+const { isSuperAdmin, canAccessClient, getAuthorizedClientIds } = require("./adminAuthz");
 
 // Simple logging helper
 function logAdminEvent(level, event, fields) {
@@ -368,51 +370,32 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res
       return res.status(404).json({ error: "Client config not found" });
     }
     
-    // Validate and sanitize update
-    const validationResult = validateConfigUpdate(req.body);
-    if (validationResult.errors.length > 0) {
+    // Determine actor role for validation (same allowlist for all roles for safety)
+    const actorRole = isSuperAdmin(req) ? "super_admin" : "client_admin";
+    
+    // Validate and sanitize update using strict validator
+    const validationResult = validateAndSanitizeConfigUpdate(existingConfig, req.body, actorRole);
+    
+    if (validationResult.errors.length > 0 || !validationResult.sanitizedConfig) {
       logAdminEvent("warn", "admin_api_client_update_validation_failed", {
         event: "admin_api_client_update_validation_failed",
         requestId: requestId,
         clientId: validation.clientId,
+        userEmail: userEmail,
+        actorRole: actorRole,
         errors: validationResult.errors,
+        disallowedFields: Object.keys(validationResult.fieldErrors || {}),
       });
       return res.status(400).json({
+        ok: false,
         error: "Validation failed",
-        invalidFields: validationResult.errors,
+        errors: validationResult.errors,
+        fieldErrors: validationResult.fieldErrors || {},
       });
     }
     
-    // Merge allowed fields into existing config (deep merge for nested objects)
-    const updatedConfig = JSON.parse(JSON.stringify(existingConfig));
-    
-    if (validationResult.allowed.colors) {
-      updatedConfig.colors = { ...updatedConfig.colors, ...validationResult.allowed.colors };
-    }
-    if (validationResult.allowed.widget) {
-      updatedConfig.widget = { ...updatedConfig.widget, ...validationResult.allowed.widget };
-    }
-    if (validationResult.allowed.logoUrl !== undefined) {
-      updatedConfig.logoUrl = validationResult.allowed.logoUrl;
-    }
-    if (validationResult.allowed.entryScreen) {
-      updatedConfig.entryScreen = {
-        ...updatedConfig.entryScreen,
-        ...validationResult.allowed.entryScreen,
-      };
-      if (validationResult.allowed.entryScreen.primaryButton) {
-        updatedConfig.entryScreen.primaryButton = {
-          ...updatedConfig.entryScreen.primaryButton,
-          ...validationResult.allowed.entryScreen.primaryButton,
-        };
-      }
-      if (validationResult.allowed.entryScreen.secondaryButtons !== undefined) {
-        updatedConfig.entryScreen.secondaryButtons = validationResult.allowed.entryScreen.secondaryButtons;
-      }
-    }
-    if (validationResult.allowed.support) {
-      updatedConfig.support = { ...updatedConfig.support, ...validationResult.allowed.support };
-    }
+    // Merge sanitized update into existing config
+    const updatedConfig = mergeConfigUpdate(existingConfig, validationResult.sanitizedConfig);
     
     // Write updated config (atomic write - async for Supabase)
     const updatedBy = req.session?.admin?.email || null;
@@ -431,7 +414,9 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res
       event: "admin_api_client_update_success",
       requestId: requestId,
       clientId: validation.clientId,
-      updatedFields: Object.keys(validationResult.allowed),
+      userEmail: userEmail,
+      actorRole: actorRole,
+      updatedFields: Object.keys(validationResult.sanitizedConfig || {}),
       storeType: clientsStore.storeType,
     });
     
