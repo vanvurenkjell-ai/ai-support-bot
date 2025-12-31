@@ -1,4 +1,5 @@
 const { createClient } = require("@supabase/supabase-js");
+const bcrypt = require("bcrypt");
 
 // Initialize Supabase client (server-side only, uses service role key)
 function getSupabaseClient() {
@@ -32,6 +33,28 @@ function logAuthzEvent(level, event, fields) {
   }
 }
 
+// Verify password against pgcrypto-stored hash using bcrypt
+// Compatible with pgcrypto's crypt() function when using bcrypt algorithm
+async function verifyPassword(plaintextPassword, passwordHash) {
+  if (!plaintextPassword || !passwordHash) {
+    return false;
+  }
+
+  try {
+    // Use bcrypt.compare() which is compatible with pgcrypto crypt() bcrypt hashes
+    // This performs constant-time comparison to prevent timing attacks
+    const isValid = await bcrypt.compare(plaintextPassword, passwordHash);
+    return isValid;
+  } catch (error) {
+    // If verification fails (invalid hash format, etc.), fail closed
+    logAuthzEvent("error", "admin_authz_password_verify_error", {
+      error: error?.message || String(error),
+      note: "Password verification failed",
+    });
+    return false;
+  }
+}
+
 // Resolve user from Supabase by email and verify password
 // Returns: { user: { id, email, role }, clientIds: [...] } or null
 async function resolveUserFromSupabase(email, password) {
@@ -40,7 +63,7 @@ async function resolveUserFromSupabase(email, password) {
   const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "";
   const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
 
-  // Legacy super-admin check (backward compatibility)
+  // Legacy super-admin check (backward compatibility) - check FIRST before Supabase lookup
   if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
     logAuthzEvent("info", "admin_authz_legacy_superadmin", {
       email: email,
@@ -67,10 +90,10 @@ async function resolveUserFromSupabase(email, password) {
   }
 
   try {
-    // Look up user by email
+    // Look up user by email (include password_hash for verification)
     const { data: user, error: userError } = await supabase
       .from("users")
-      .select("id, email, role")
+      .select("id, email, role, password_hash")
       .eq("email", email.toLowerCase().trim())
       .single();
 
@@ -82,40 +105,43 @@ async function resolveUserFromSupabase(email, password) {
       return null;
     }
 
-    // For now, password is still validated via env var for legacy compatibility
-    // In a full implementation, you'd store password hashes in Supabase
-    // This is a transitional approach
-    if (user.role === "super_admin" && email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
-      logAuthzEvent("info", "admin_authz_supabase_superadmin", {
+    // Verify password against stored hash
+    if (!user.password_hash) {
+      logAuthzEvent("warn", "admin_authz_no_password_hash", {
         userId: user.id,
         email: user.email,
-        role: user.role,
-      });
-      return {
-        user: {
-          id: user.id,
-          email: user.email,
-          role: user.role,
-        },
-        clientIds: null, // null means "all clients" for super_admin
-      };
-    }
-
-    // For client_admin, we still need password validation
-    // For now, use a simple approach: client_admin users need a separate password mechanism
-    // This is a placeholder - in production, use proper password hashing in Supabase
-    if (user.role === "client_admin") {
-      // TODO: Implement proper password verification from Supabase
-      // For now, deny if not legacy super-admin
-      logAuthzEvent("warn", "admin_authz_client_admin_password_not_implemented", {
-        userId: user.id,
-        email: user.email,
-        note: "Client admin password verification not yet implemented",
+        note: "User found but password_hash is missing",
       });
       return null;
     }
 
-    return null;
+    const passwordValid = await verifyPassword(password, user.password_hash);
+    if (!passwordValid) {
+      logAuthzEvent("warn", "admin_authz_invalid_password", {
+        userId: user.id,
+        email: user.email,
+        role: user.role,
+        note: "Password verification failed",
+      });
+      return null;
+    }
+
+    // Password is valid - return user with role
+    logAuthzEvent("info", "admin_authz_password_verified", {
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+      note: "Password verified successfully",
+    });
+
+    return {
+      user: {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+      },
+      clientIds: null, // Will be loaded separately if needed
+    };
   } catch (error) {
     logAuthzEvent("error", "admin_authz_resolve_error", {
       email: email,
@@ -220,6 +246,7 @@ module.exports = {
   isSuperAdmin,
   canAccessClient,
   getAuthorizedClientIds,
+  verifyPassword,
   logAuthzEvent,
 };
 

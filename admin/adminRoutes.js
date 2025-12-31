@@ -178,80 +178,66 @@ router.post("/login", rateLimitLogin, requireCsrf, async (req, res) => {
   }
 
   // Verify credentials and resolve user from Supabase (with legacy fallback)
+  // This function handles:
+  // 1. Legacy super-admin (ADMIN_EMAIL env var) - returns resolved user immediately
+  // 2. Supabase users - verifies password_hash and returns resolved user
+  // 3. Invalid credentials - returns null
   const resolvedUser = await resolveUserFromSupabase(email, password);
   
   if (!resolvedUser) {
-    // Also try legacy credential check for backward compatibility
-    if (!verifyAdminCredentials(email, password)) {
-      // Log failed login attempt (no password) - normalize email for logging (no secrets)
-      const emailNormalized = email ? String(email).toLowerCase().trim() : null;
-      logAdminEvent("warn", "admin_login_failed", {
-        event: "admin_login_failed",
-        requestId: requestId,
-        ip: ip,
-        emailAttempt: emailNormalized,
-        sessionId: req.sessionID || null,
-        reason: "invalid_credentials",
-      });
-      return res.status(401).send(renderLoginPage(csrfToken, "Invalid email or password"));
-    }
+    // No user resolved - credentials are invalid
+    // Log failed login attempt (no password) - normalize email for logging (no secrets)
+    const emailNormalized = email ? String(email).toLowerCase().trim() : null;
+    logAdminEvent("warn", "admin_login_failed", {
+      event: "admin_login_failed",
+      requestId: requestId,
+      ip: ip,
+      emailAttempt: emailNormalized,
+      sessionId: req.sessionID || null,
+      reason: "invalid_credentials",
+    });
+    return res.status(401).send(renderLoginPage(csrfToken, "Invalid email or password"));
+  }
 
-    // Legacy super-admin (backward compatibility)
-    // Use legacy authz structure
-    try {
-      await regenerateSession(req);
-      req.session.admin = {
-        email: ADMIN_EMAIL,
-        loggedInAt: Date.now(),
-        authz: {
-          role: "super_admin",
-          clientIds: null, // null means "all clients"
-        },
-      };
-    } catch (error) {
-      logAdminEvent("error", "admin_login_error", {
-        requestId: requestId,
-        ip: ip,
-        error: error?.message || String(error),
-      });
-      return res.status(500).send(renderLoginPage(csrfToken, "Login failed. Please try again."));
-    }
-  } else {
-    // User resolved from Supabase - load client IDs for client_admin
+  // User resolved successfully - set up session with authorization context
+  try {
+    // Regenerate session to prevent session fixation
+    await regenerateSession(req);
+
+    // Load client IDs for client_admin (super_admin gets null = all clients)
     let clientIds = null;
     if (resolvedUser.user.role === "client_admin" && resolvedUser.user.id) {
       clientIds = await loadUserClientIds(resolvedUser.user.id);
     } else if (resolvedUser.user.role === "super_admin") {
-      clientIds = null; // null means "all clients"
+      clientIds = null; // null means "all clients" for super_admin
     }
 
-    try {
-      await regenerateSession(req);
-      req.session.admin = {
-        email: resolvedUser.user.email,
-        loggedInAt: Date.now(),
-        authz: {
-          role: resolvedUser.user.role,
-          clientIds: clientIds,
-          userId: resolvedUser.user.id,
-        },
-      };
-
-      logAdminEvent("info", "admin_authz_resolved", {
-        requestId: requestId,
-        email: resolvedUser.user.email,
+    // Store resolved authorization context in session
+    req.session.admin = {
+      email: resolvedUser.user.email,
+      loggedInAt: Date.now(),
+      authz: {
         role: resolvedUser.user.role,
-        clientIdsCount: clientIds ? clientIds.length : null,
-        clientIds: clientIds || null, // Log client IDs for debugging (not sensitive)
-      });
-    } catch (error) {
-      logAdminEvent("error", "admin_login_error", {
-        requestId: requestId,
-        ip: ip,
-        error: error?.message || String(error),
-      });
-      return res.status(500).send(renderLoginPage(csrfToken, "Login failed. Please try again."));
-    }
+        clientIds: clientIds,
+        userId: resolvedUser.user.id,
+      },
+    };
+
+    logAdminEvent("info", "admin_authz_resolved", {
+      requestId: requestId,
+      email: resolvedUser.user.email,
+      role: resolvedUser.user.role,
+      clientIdsCount: clientIds ? clientIds.length : null,
+      clientIds: clientIds || null, // Log client IDs for debugging (not sensitive)
+      userId: resolvedUser.user.id || null,
+    });
+  } catch (error) {
+    logAdminEvent("error", "admin_login_error", {
+      requestId: requestId,
+      ip: ip,
+      error: error?.message || String(error),
+    });
+    return res.status(500).send(renderLoginPage(csrfToken, "Login failed. Please try again."));
   }
 
   // Generate new CSRF token for subsequent requests
