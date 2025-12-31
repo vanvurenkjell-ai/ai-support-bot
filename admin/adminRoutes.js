@@ -430,22 +430,27 @@ router.get("/", requireAdminAuth, (req, res) => {
 });
 
 // Clients list (GET /admin/clients)
-router.get("/clients", requireAdminAuth, (req, res) => {
+router.get("/clients", requireAdminAuth, async (req, res) => {
   const requestId = req.requestId || "unknown";
   const ip = getClientIp(req);
+  
+  const csrfToken = generateCsrfToken();
+  setCsrfToken(req, csrfToken);
+
+  // Fetch clients from Supabase/filesystem (async)
+  const clients = await listClientIds();
+  const created = req.query.created === "1";
+  const deleted = req.query.deleted === "1";
+  const clientsRoot = getClientsRoot();
+  
   logAdminEvent("info", "admin_clients_list_view", {
     event: "admin_clients_list_view",
     requestId: requestId,
     ip: ip,
+    storeType: clientsStore.storeType,
+    clientsCount: clients.length,
+    clientIds: clients,
   });
-
-  const csrfToken = generateCsrfToken();
-  setCsrfToken(req, csrfToken);
-
-  const clients = listClientIds();
-  const created = req.query.created === "1";
-  const deleted = req.query.deleted === "1";
-  const clientsRoot = getClientsRoot();
   
   const successMessage = created ? '<p style="color: green; font-weight: bold;">✓ Client created successfully!</p>' : '';
   const deletedMessage = deleted ? '<p style="color: green; font-weight: bold;">✓ Client deleted successfully!</p>' : '';
