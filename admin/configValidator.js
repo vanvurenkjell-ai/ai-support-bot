@@ -138,6 +138,132 @@ function isAllowedKeyPath(path) {
   return false;
 }
 
+// System-managed fields that are submitted by the form but should NOT be editable by client_admins
+// These fields are automatically stripped from the update payload before validation,
+// then preserved from existingConfig during merge. This prevents validation errors when
+// the form includes these fields while still ensuring client_admins cannot change them.
+//
+// Why this is needed:
+// - The admin form includes system-managed fields like `entryScreen.primaryButton.action`
+// - These fields must remain unchanged (they're set by the system, not users)
+// - Without stripping them first, validation fails with "Disallowed field" errors
+// - Solution: Strip them before validation, preserve from existingConfig during merge
+const SYSTEM_MANAGED_PATHS = [
+  "entryScreen.primaryButton.action",
+  // Secondary button actions are handled in array processing (detected by path pattern)
+];
+
+// Remove system-managed fields from an object recursively
+function removeSystemManagedFields(obj, prefix = "", preservedPaths = []) {
+  if (obj === null || obj === undefined || typeof obj !== "object") {
+    return obj;
+  }
+
+  if (Array.isArray(obj)) {
+    // For arrays, recursively process each element
+    return obj.map((item, index) => {
+      if (item === null || typeof item !== "object") {
+        return item;
+      }
+      // For array elements, process them as objects without adding array index to path
+      // (since we're already inside the array context)
+      const cleanedItem = {};
+      for (const key in item) {
+        if (!item.hasOwnProperty(key)) continue;
+        const fullPath = prefix ? `${prefix}[${index}].${key}` : `[${index}].${key}`;
+
+        // Check if this path is system-managed
+        let isSystemManaged = SYSTEM_MANAGED_PATHS.includes(fullPath);
+        
+        // Also check for secondaryButtons array element action fields
+        if (key === "action" && (prefix.includes("secondaryButtons") || fullPath.includes("secondaryButtons"))) {
+          isSystemManaged = true;
+          preservedPaths.push(fullPath);
+          // Skip this field - it will be preserved from existing config
+          continue;
+        }
+
+        if (isSystemManaged) {
+          preservedPaths.push(fullPath);
+          continue;
+        }
+
+        // Process nested objects recursively
+        if (item[key] !== null && typeof item[key] === "object" && !Array.isArray(item[key])) {
+          const nested = removeSystemManagedFields(item[key], fullPath, preservedPaths);
+          if (nested !== null && typeof nested === "object" && Object.keys(nested).length > 0) {
+            cleanedItem[key] = nested;
+          }
+        } else {
+          cleanedItem[key] = item[key];
+        }
+      }
+      // Only return cleaned item if it has properties
+      return Object.keys(cleanedItem).length > 0 ? cleanedItem : null;
+    }).filter(item => item !== null);
+  }
+
+  const cleaned = {};
+  for (const key in obj) {
+    if (!obj.hasOwnProperty(key)) continue;
+    const fullPath = prefix ? `${prefix}.${key}` : key;
+
+    // Check if this path is system-managed
+    let isSystemManaged = SYSTEM_MANAGED_PATHS.includes(fullPath);
+    
+    // Also check for secondaryButtons[].action paths (special handling for arrays)
+    if (key === "action" && fullPath.includes("secondaryButtons")) {
+      isSystemManaged = true;
+    }
+
+    if (isSystemManaged) {
+      preservedPaths.push(fullPath);
+      // Skip this field - it will be preserved from existing config
+      continue;
+    }
+
+    // Recursively process nested objects and arrays
+    if (obj[key] !== null && typeof obj[key] === "object") {
+      const nested = removeSystemManagedFields(obj[key], fullPath, preservedPaths);
+      if (nested !== null && typeof nested === "object") {
+        if (Array.isArray(nested)) {
+          if (nested.length > 0) {
+            cleaned[key] = nested;
+          }
+        } else if (Object.keys(nested).length > 0) {
+          cleaned[key] = nested;
+        }
+      }
+    } else {
+      cleaned[key] = obj[key];
+    }
+  }
+
+  return cleaned;
+}
+
+// Preserve system-managed fields from existing config before validation
+// This ensures client_admins can't change these fields, but they don't cause validation errors
+function preserveSystemManagedFields(existingConfig, proposedUpdate, actorRole) {
+  // Only apply to client_admin - super_admin can edit everything
+  if (actorRole === "super_admin") {
+    return proposedUpdate;
+  }
+
+  const preservedPaths = [];
+  const cleanedUpdate = removeSystemManagedFields(proposedUpdate, "", preservedPaths);
+
+  if (preservedPaths.length > 0) {
+    logValidationEvent("info", "config_sanitize_preserved_system_fields", {
+      actorRole: actorRole,
+      preservedPaths: preservedPaths,
+      note: "System-managed fields removed from update payload; will be preserved from existing config",
+    });
+  }
+
+  return cleanedUpdate;
+}
+
 // Extract all key paths from an object (for allowlist checking)
 function extractKeyPaths(obj, prefix = "") {
   const paths = [];
@@ -167,8 +293,12 @@ function validateAndSanitizeConfigUpdate(existingConfig, proposedUpdate, actorRo
   const fieldErrors = {};
   const sanitizedConfig = {};
 
-  // Step 1: Check for disallowed top-level keys
-  const allProposedPaths = extractKeyPaths(proposedUpdate);
+  // Step 0: Strip system-managed fields from proposed update (for client_admin)
+  // These fields will be preserved from existingConfig during merge
+  const cleanedUpdate = preserveSystemManagedFields(existingConfig, proposedUpdate, actorRole);
+
+  // Step 1: Check for disallowed top-level keys (on cleaned update)
+  const allProposedPaths = extractKeyPaths(cleanedUpdate);
   const disallowedPaths = allProposedPaths.filter(path => !isAllowedKeyPath(path));
 
   if (disallowedPaths.length > 0) {
@@ -190,12 +320,12 @@ function validateAndSanitizeConfigUpdate(existingConfig, proposedUpdate, actorRo
 
   // Step 2: Validate and sanitize allowed fields
   try {
-    // Colors
-    if (proposedUpdate.colors) {
+    // Colors (use cleaned update)
+    if (cleanedUpdate.colors) {
       sanitizedConfig.colors = {};
       for (const colorKey of ALLOWED_COLOR_KEYS) {
-        if (proposedUpdate.colors[colorKey] !== undefined) {
-          const colorValue = proposedUpdate.colors[colorKey];
+        if (cleanedUpdate.colors[colorKey] !== undefined) {
+          const colorValue = cleanedUpdate.colors[colorKey];
           const normalized = normalizeHexColor(colorValue);
           if (normalized) {
             sanitizedConfig.colors[colorKey] = normalized;
@@ -208,12 +338,12 @@ function validateAndSanitizeConfigUpdate(existingConfig, proposedUpdate, actorRo
       }
     }
 
-    // Widget
-    if (proposedUpdate.widget) {
+    // Widget (use cleaned update)
+    if (cleanedUpdate.widget) {
       sanitizedConfig.widget = {};
       
-      if (proposedUpdate.widget.title !== undefined) {
-        const title = String(proposedUpdate.widget.title || "").trim();
+      if (cleanedUpdate.widget.title !== undefined) {
+        const title = String(cleanedUpdate.widget.title || "").trim();
         const maxLen = FIELD_LIMITS["widget.title"];
         if (title.length > maxLen) {
           errors.push(`widget.title exceeds maximum length of ${maxLen} characters`);
@@ -223,8 +353,8 @@ function validateAndSanitizeConfigUpdate(existingConfig, proposedUpdate, actorRo
         }
       }
       
-      if (proposedUpdate.widget.greeting !== undefined) {
-        const greeting = String(proposedUpdate.widget.greeting || "").trim();
+      if (cleanedUpdate.widget.greeting !== undefined) {
+        const greeting = String(cleanedUpdate.widget.greeting || "").trim();
         const maxLen = FIELD_LIMITS["widget.greeting"];
         if (greeting.length > maxLen) {
           errors.push(`widget.greeting exceeds maximum length of ${maxLen} characters`);
@@ -235,9 +365,9 @@ function validateAndSanitizeConfigUpdate(existingConfig, proposedUpdate, actorRo
       }
     }
 
-    // Logo URL
-    if (proposedUpdate.logoUrl !== undefined) {
-      const logoUrl = String(proposedUpdate.logoUrl || "").trim();
+    // Logo URL (use cleaned update)
+    if (cleanedUpdate.logoUrl !== undefined) {
+      const logoUrl = String(cleanedUpdate.logoUrl || "").trim();
       if (logoUrl.length === 0) {
         // Empty logoUrl is allowed (optional field)
         sanitizedConfig.logoUrl = null;
@@ -249,18 +379,18 @@ function validateAndSanitizeConfigUpdate(existingConfig, proposedUpdate, actorRo
       }
     }
 
-    // Entry Screen
-    if (proposedUpdate.entryScreen) {
+    // Entry Screen (use cleaned update)
+    if (cleanedUpdate.entryScreen) {
       sanitizedConfig.entryScreen = {};
 
-      if (proposedUpdate.entryScreen.enabled !== undefined) {
+      if (cleanedUpdate.entryScreen.enabled !== undefined) {
         // Parse boolean safely (handle checkbox values)
-        const enabled = proposedUpdate.entryScreen.enabled;
+        const enabled = cleanedUpdate.entryScreen.enabled;
         sanitizedConfig.entryScreen.enabled = enabled === true || enabled === "true" || enabled === "on" || enabled === 1 || enabled === "1";
       }
 
-      if (proposedUpdate.entryScreen.title !== undefined) {
-        const title = String(proposedUpdate.entryScreen.title || "").trim();
+      if (cleanedUpdate.entryScreen.title !== undefined) {
+        const title = String(cleanedUpdate.entryScreen.title || "").trim();
         const maxLen = FIELD_LIMITS["entryScreen.title"];
         if (title.length > maxLen) {
           errors.push(`entryScreen.title exceeds maximum length of ${maxLen} characters`);
@@ -270,8 +400,8 @@ function validateAndSanitizeConfigUpdate(existingConfig, proposedUpdate, actorRo
         }
       }
 
-      if (proposedUpdate.entryScreen.disclaimer !== undefined) {
-        const disclaimer = String(proposedUpdate.entryScreen.disclaimer || "").trim();
+      if (cleanedUpdate.entryScreen.disclaimer !== undefined) {
+        const disclaimer = String(cleanedUpdate.entryScreen.disclaimer || "").trim();
         const maxLen = FIELD_LIMITS["entryScreen.disclaimer"];
         if (disclaimer.length > maxLen) {
           errors.push(`entryScreen.disclaimer exceeds maximum length of ${maxLen} characters`);
@@ -281,12 +411,12 @@ function validateAndSanitizeConfigUpdate(existingConfig, proposedUpdate, actorRo
         }
       }
 
-      // Primary Button
-      if (proposedUpdate.entryScreen.primaryButton) {
+      // Primary Button (use cleaned update - action field already stripped)
+      if (cleanedUpdate.entryScreen.primaryButton) {
         sanitizedConfig.entryScreen.primaryButton = {};
         
-        if (proposedUpdate.entryScreen.primaryButton.label !== undefined) {
-          const label = String(proposedUpdate.entryScreen.primaryButton.label || "").trim();
+        if (cleanedUpdate.entryScreen.primaryButton.label !== undefined) {
+          const label = String(cleanedUpdate.entryScreen.primaryButton.label || "").trim();
           const maxLen = FIELD_LIMITS["entryScreen.primaryButton.label"];
           if (label.length > maxLen) {
             errors.push(`entryScreen.primaryButton.label exceeds maximum length of ${maxLen} characters`);
@@ -296,18 +426,18 @@ function validateAndSanitizeConfigUpdate(existingConfig, proposedUpdate, actorRo
           }
         }
         
-        // Always set action to "openChat" (not editable, but ensure it exists)
-        sanitizedConfig.entryScreen.primaryButton.action = "openChat";
+        // Note: action field is system-managed and preserved from existingConfig during merge
+        // We don't set it here to avoid overwriting the preserved value
       }
 
-      // Secondary Buttons
-      if (proposedUpdate.entryScreen.secondaryButtons !== undefined) {
-        if (Array.isArray(proposedUpdate.entryScreen.secondaryButtons)) {
+      // Secondary Buttons (use cleaned update - action fields already stripped)
+      if (cleanedUpdate.entryScreen.secondaryButtons !== undefined) {
+        if (Array.isArray(cleanedUpdate.entryScreen.secondaryButtons)) {
           const buttons = [];
           const maxButtons = 2;
           
-          for (let i = 0; i < Math.min(proposedUpdate.entryScreen.secondaryButtons.length, maxButtons); i++) {
-            const btn = proposedUpdate.entryScreen.secondaryButtons[i];
+          for (let i = 0; i < Math.min(cleanedUpdate.entryScreen.secondaryButtons.length, maxButtons); i++) {
+            const btn = cleanedUpdate.entryScreen.secondaryButtons[i];
             if (!btn || typeof btn !== "object") {
               errors.push(`entryScreen.secondaryButtons[${i}] must be an object`);
               fieldErrors[`entryScreen.secondaryButtons[${i}]`] = "Invalid button format";
@@ -337,6 +467,8 @@ function validateAndSanitizeConfigUpdate(existingConfig, proposedUpdate, actorRo
 
             buttons.push({
               label: label,
+              // Note: action field is system-managed and preserved from existingConfig during merge
+              // We set it here as fallback, but mergeConfigUpdate will use existing value if present
               action: "link",
               url: url,
             });
@@ -350,12 +482,12 @@ function validateAndSanitizeConfigUpdate(existingConfig, proposedUpdate, actorRo
       }
     }
 
-    // Support
-    if (proposedUpdate.support) {
+    // Support (use cleaned update)
+    if (cleanedUpdate.support) {
       sanitizedConfig.support = {};
 
-      if (proposedUpdate.support.email !== undefined) {
-        const email = String(proposedUpdate.support.email || "").trim();
+      if (cleanedUpdate.support.email !== undefined) {
+        const email = String(cleanedUpdate.support.email || "").trim();
         if (email.length === 0) {
           sanitizedConfig.support.email = null;
         } else if (isValidEmail(email, FIELD_LIMITS["support.email"])) {
@@ -366,8 +498,8 @@ function validateAndSanitizeConfigUpdate(existingConfig, proposedUpdate, actorRo
         }
       }
 
-      if (proposedUpdate.support.contactUrl !== undefined) {
-        const contactUrl = String(proposedUpdate.support.contactUrl || "").trim();
+      if (cleanedUpdate.support.contactUrl !== undefined) {
+        const contactUrl = String(cleanedUpdate.support.contactUrl || "").trim();
         if (contactUrl.length === 0) {
           sanitizedConfig.support.contactUrl = null;
         } else if (isValidUrl(contactUrl, FIELD_LIMITS["support.contactUrl"])) {
@@ -378,8 +510,8 @@ function validateAndSanitizeConfigUpdate(existingConfig, proposedUpdate, actorRo
         }
       }
 
-      if (proposedUpdate.support.contactUrlMessageParam !== undefined) {
-        const param = String(proposedUpdate.support.contactUrlMessageParam || "").trim();
+      if (cleanedUpdate.support.contactUrlMessageParam !== undefined) {
+        const param = String(cleanedUpdate.support.contactUrlMessageParam || "").trim();
         if (param.length === 0) {
           sanitizedConfig.support.contactUrlMessageParam = null;
         } else if (isValidUrlMessageParam(param)) {
@@ -412,6 +544,7 @@ function validateAndSanitizeConfigUpdate(existingConfig, proposedUpdate, actorRo
 
 // Merge sanitized update into existing config
 // This preserves existing fields not being updated and merges nested objects correctly
+// System-managed fields are preserved from existingConfig (never overwritten by sanitizedUpdate)
 function mergeConfigUpdate(existingConfig, sanitizedUpdate) {
   // Deep clone existing config
   const merged = JSON.parse(JSON.stringify(existingConfig || {}));
@@ -445,14 +578,33 @@ function mergeConfigUpdate(existingConfig, sanitizedUpdate) {
     }
     
     if (sanitizedUpdate.entryScreen.primaryButton) {
+      // Preserve system-managed fields (action) from existing config
+      const existingAction = merged.entryScreen.primaryButton?.action;
       merged.entryScreen.primaryButton = {
         ...(merged.entryScreen.primaryButton || {}),
         ...sanitizedUpdate.entryScreen.primaryButton,
       };
+      // Restore system-managed action field if it existed
+      if (existingAction) {
+        merged.entryScreen.primaryButton.action = existingAction;
+      } else {
+        // Fallback if not in existing config
+        merged.entryScreen.primaryButton.action = "openChat";
+      }
     }
     
     if (sanitizedUpdate.entryScreen.secondaryButtons !== undefined) {
-      merged.entryScreen.secondaryButtons = sanitizedUpdate.entryScreen.secondaryButtons;
+      // Preserve system-managed action fields from existing config
+      const existingButtons = merged.entryScreen.secondaryButtons || [];
+      merged.entryScreen.secondaryButtons = sanitizedUpdate.entryScreen.secondaryButtons.map((btn, index) => {
+        const existingBtn = existingButtons[index];
+        // Preserve action from existing button if present
+        if (existingBtn && existingBtn.action) {
+          return { ...btn, action: existingBtn.action };
+        }
+        // Fallback to "link" if not in existing config
+        return { ...btn, action: btn.action || "link" };
+      });
     }
   }
 
@@ -466,6 +618,7 @@ function mergeConfigUpdate(existingConfig, sanitizedUpdate) {
 module.exports = {
   validateAndSanitizeConfigUpdate,
   mergeConfigUpdate,
+  preserveSystemManagedFields,
   isValidHexColor,
   isValidUrl,
   isValidEmail,
