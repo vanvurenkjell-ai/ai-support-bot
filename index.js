@@ -2589,6 +2589,9 @@ function retrieveScopedKnowledge(chunks, intent, message, requestId, clientId, s
 const clientsStore = require("./lib/clientsStoreAdapter");
 const { getClientsRoot, ensureClientsRoot, listClientIds, readClientConfig, getClientConfigPath } = clientsStore;
 
+// Content loader for markdown files (read-only, optional, works with both Supabase and filesystem modes)
+const clientContentFs = require("./lib/clientContentFs");
+
 // Resolve client directory path safely (prevents path traversal) - filesystem only
 // When Supabase is active, this should not be called for validation (use clientsStore.validateClientId instead)
 function resolveClientDir(clientId, requestId = null) {
@@ -3061,67 +3064,68 @@ function getClientOrNull(clientIdRaw) {
 async function loadClient(clientIdRaw, requestId = null) {
   const clientId = sanitizeClientId(clientIdRaw);
 
-  // When Supabase is active, return minimal data (no markdown files available)
-  // The config will be loaded separately from Supabase via clientRegistry
+  // Load config from appropriate store (Supabase or filesystem)
+  let clientConfig;
   if (clientsStore.storeType === "supabase") {
-    // Validate client exists in Supabase
-    const config = await readClientConfig(clientId);
-    if (!config) {
+    // Config from Supabase
+    clientConfig = await readClientConfig(clientId);
+    if (!clientConfig) {
       throw new Error(`Client not found in Supabase: ${clientId}`);
     }
+  } else {
+    // Filesystem mode: config from file
+    const base = resolveClientDir(clientId, requestId);
+    if (!base) {
+      throw new Error(`Invalid client ID: ${clientId}`);
+    }
+    if (!fs.existsSync(base)) {
+      throw new Error(`Client folder not found: ${clientId}`);
+    }
+    const clientConfigRaw = readFile(`${base}/client-config.json`) || "{}";
+    clientConfig = safeJsonParse(clientConfigRaw, {});
+  }
 
-    // Return empty/default values for markdown files (not available in Supabase mode)
-    // These will need to be migrated to Supabase config or stored separately if needed
-    return {
-      clientId,
-      brandVoice: "", // Not available in Supabase mode
-      supportRules: "", // Not available in Supabase mode
-      chunks: [], // Not available in Supabase mode
-      clientConfig: config,
+  // Load markdown content from filesystem (optional, non-fatal, works with both modes)
+  // This allows Supabase-backed clients to still use markdown knowledge files from the repo
+  let markdownContent;
+  try {
+    markdownContent = clientContentFs.loadClientMarkdown(clientId);
+  } catch (error) {
+    // Non-fatal: log error but continue with empty content
+    if (typeof logJson === "function") {
+      logJson("error", "client_markdown_load_failed", {
+        event: "client_markdown_load_failed",
+        requestId: requestId || null,
+        clientId: clientId,
+        storeType: clientsStore.storeType,
+        error: error?.message || String(error),
+      });
+    }
+    markdownContent = {
+      brandVoice: "",
+      supportRules: "",
+      chunks: [],
     };
   }
 
-  // Filesystem mode (existing behavior)
-  const base = resolveClientDir(clientId, requestId);
-
-  if (!base) {
-    throw new Error(`Invalid client ID: ${clientId}`);
-  }
-
-  if (!fs.existsSync(base)) {
-    throw new Error(`Client folder not found: ${clientId}`);
-  }
-
-  const brandVoicePath = path.join(base, "Brand voice.md");
-  const supportRulesPath = path.join(base, "Customer support rules.md");
-  const brandVoice = readFile(brandVoicePath);
-  const supportRules = readFile(supportRulesPath);
-
-  const files = [
-    "FAQ.md",
-    "Policies.md",
-    "Products.md",
-    "Company overview.md",
-    "Legal.md",
-    "Product tutorials.md",
-    "Promotions & discounts.md",
-    "Shipping matrix.md",
-    "Troubleshooting.md",
-  ];
-
+  // Process chunks using chunkMarkdown (for proper heading extraction and chunking)
   const allChunks = [];
-  for (const file of files) {
-    const filePath = path.join(base, file);
-    const content = readFile(filePath);
-    if (!content || !content.trim()) continue;
-    const chunks = chunkMarkdown(file, content, 900);
-    for (const c of chunks) allChunks.push({ source: file, heading: c.heading || "", text: c.text });
+  for (const chunk of markdownContent.chunks) {
+    if (chunk.rawContent && chunk.rawContent.trim()) {
+      const processedChunks = chunkMarkdown(chunk.source, chunk.rawContent, 900);
+      for (const c of processedChunks) {
+        allChunks.push({ source: chunk.source, heading: c.heading || "", text: c.text });
+      }
+    }
   }
 
-  const clientConfigRaw = readFile(`${base}/client-config.json`) || "{}";
-  const clientConfig = safeJsonParse(clientConfigRaw, {});
-
-  return { clientId, brandVoice, supportRules, chunks: allChunks, clientConfig };
+  return {
+    clientId,
+    brandVoice: markdownContent.brandVoice || "",
+    supportRules: markdownContent.supportRules || "",
+    chunks: allChunks,
+    clientConfig,
+  };
 }
 
 function countHits(textNorm, keyword) {
