@@ -4210,52 +4210,65 @@ app.get("/widget-config", widgetCors, requireWidgetAuth, async (req, res) => {
   // ROOT CAUSE FIX: Read config fresh from Supabase/filesystem using clientsStore (bypass clientRegistry cache)
   // Admin saves write to storage but clientRegistry is never invalidated.
   // Reading fresh ensures /widget-config always returns latest data after admin saves.
+  // FAIL-SAFE: Always return a valid config (defaults if anything fails)
   try {
     const pathResult = getClientConfigPath(clientId);
     if (!pathResult.valid) {
-      res.status(404);
-      return res.json({
+      // Invalid clientId - return defaults but still respond 200 (widget should load)
+      logJson("warn", "widget_config_invalid_client_id", {
+        event: "widget_config_invalid_client_id",
         requestId: req.requestId,
-        error: "invalid_client",
-        message: "Deze chat is niet juist geconfigureerd. Neem contact op met support.",
+        clientId: clientId,
+        fallbackToDefaults: true,
       });
+      const defaultConfig = getDefaultConfig(clientId);
+      const normalizedConfig = normalizeClientConfig(defaultConfig, clientId);
+      const widgetConfig = buildWidgetConfig(normalizedConfig, clientId);
+      return res.json({ requestId: req.requestId, ...widgetConfig });
     }
     
     // Read fresh from storage (not from cache - async for Supabase)
-    // Note: readClientConfig now returns normalized config from schema system
-    let config = await readClientConfig(clientId);
-    
-    // If config not found, return 404
-    if (!config) {
-      res.status(404);
-      return res.json({
-        requestId: req.requestId,
-        error: "invalid_client",
-        message: "Deze chat is niet juist geconfigureerd. Neem contact op met support.",
-      });
-    }
-    
-    // Config is already normalized by readClientConfig, but validate as safety check
-    // If somehow invalid, fall back to defaults (fail safe for widget)
-    const validation = validateConfig(config, { clientId, logEvents: false });
-    if (!validation.ok) {
-      logJson("error", "config_invalid_in_storage", {
-        event: "config_invalid_in_storage",
+    // Note: readClientConfig now ALWAYS returns normalized config (defaults if not found/invalid)
+    let config = null;
+    try {
+      config = await readClientConfig(clientId);
+    } catch (readError) {
+      // If readClientConfig throws (shouldn't happen, but be defensive), use defaults
+      logJson("error", "widget_config_read_error", {
+        event: "widget_config_read_error",
         requestId: req.requestId,
         clientId: clientId,
-        errors: validation.errors.map(e => `${e.path}: ${e.message}`),
+        error: readError?.message || String(readError),
         fallbackToDefaults: true,
         storeType: clientsStore.storeType,
       });
-      // Fall back to safe defaults (fail safe - widget should still work)
       config = getDefaultConfig(clientId);
-    } else {
-      config = validation.value; // Use validated config
     }
     
-    // Get stats for logging (async for Supabase)
-    const stats = await clientsStore.getClientConfigStats(clientId);
-    const configMtime = stats?.mtimeISO || new Date().toISOString();
+    // Config is already normalized by readClientConfig, but ensure it's valid
+    // This is a safety check - readClientConfig should always return valid config
+    if (!config || typeof config !== "object") {
+      logJson("warn", "config_invalid_in_storage", {
+        event: "config_invalid_in_storage",
+        requestId: req.requestId,
+        clientId: clientId,
+        reason: "config_not_object",
+        fallbackToDefaults: true,
+        storeType: clientsStore.storeType,
+      });
+      config = getDefaultConfig(clientId);
+    }
+    
+    // Get stats for logging (async for Supabase) - don't fail if this errors
+    let configMtime = new Date().toISOString();
+    try {
+      const stats = await clientsStore.getClientConfigStats(clientId);
+      if (stats && stats.mtimeISO) {
+        configMtime = stats.mtimeISO;
+      }
+    } catch (statsError) {
+      // Ignore stats errors - not critical
+    }
     
     // Use schema-normalized config (already normalized, but apply legacy normalization for compatibility)
     const normalizedConfig = normalizeClientConfig(config, clientId);
@@ -4280,22 +4293,39 @@ app.get("/widget-config", widgetCors, requireWidgetAuth, async (req, res) => {
       configSourcePath: pathResult.path,
       configMtime: configMtime,
       source: clientsStore.storeType,
+      schemaVersion: config.schemaVersion || null,
     });
 
     return res.json({ requestId: req.requestId, ...widgetConfig });
   } catch (e) {
+    // Ultimate fallback - if anything fails, return defaults (widget must load)
     logJson("error", "widget_config_error", {
+      event: "widget_config_error",
       requestId: req.requestId,
       route: "/widget-config",
       method: "GET",
       clientId: clientId,
       error: e && e.message ? e.message : String(e),
       errorStack: e && e.stack ? String(e.stack).slice(0, 500) : null,
+      fallbackToDefaults: true,
     });
 
-    res.status(500);
-    // SECURITY: Generic error - don't leak internal details
-    return res.json({ requestId: req.requestId, error: "Server error" });
+    // Return defaults - widget should still load
+    try {
+      const defaultConfig = getDefaultConfig(clientId);
+      const normalizedConfig = normalizeClientConfig(defaultConfig, clientId);
+      const widgetConfig = buildWidgetConfig(normalizedConfig, clientId);
+      return res.json({ requestId: req.requestId, ...widgetConfig });
+    } catch (fallbackError) {
+      // Even defaults failed - return minimal response
+      res.status(200); // Still 200 - widget should attempt to load
+      return res.json({ 
+        requestId: req.requestId,
+        error: "Configuration unavailable",
+        colors: { primary: "#225ADF", accent: "#2563eb", background: "#ffffff" },
+        widget: { title: "AI Assistant", greeting: "Hello! How can I help you today?" },
+      });
+    }
   }
 });
 
