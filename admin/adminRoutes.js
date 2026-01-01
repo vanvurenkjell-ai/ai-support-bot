@@ -358,7 +358,7 @@ function createDefaultConfig(clientId, displayName = null) {
 }
 
 // Create new client (wrapper using clientsStore)
-function createClient(clientId, displayName = null) {
+async function createClient(clientId, displayName = null, actorContext = {}) {
   const validation = validateClientId(clientId);
   if (!validation.valid) {
     return { success: false, error: `Invalid client ID: ${validation.reason}` };
@@ -369,15 +369,28 @@ function createClient(clientId, displayName = null) {
     return { success: false, error: "Invalid client ID path" };
   }
   
-  // Check if client already exists (409 Conflict)
-  if (fs.existsSync(pathResult.path)) {
+  // Check if client already exists (409 Conflict) - only for filesystem mode
+  if (clientsStore.storeType === "filesystem" && fs.existsSync(pathResult.path)) {
     return { success: false, error: "Client already exists", statusCode: 409 };
   }
   
   try {
     // Create default config
     const defaultConfig = createDefaultConfig(validation.clientId, displayName);
-    const writeResult = writeClientConfigAtomic(validation.clientId, defaultConfig);
+    
+    // For client creation, pass actor context
+    const actorOptions = {
+      actorUserId: actorContext.userId || null,
+      actorEmail: actorContext.email || null,
+      actorRole: actorContext.role || null,
+      requestId: actorContext.requestId || null,
+    };
+    const writeResult = await writeClientConfigAtomic(
+      validation.clientId, 
+      defaultConfig, 
+      actorContext.email || null, 
+      actorOptions
+    );
     
     if (!writeResult.success) {
       return writeResult;
@@ -626,7 +639,15 @@ router.post("/clients", requireAdminAuth, requireCsrf, async (req, res) => {
     `);
   }
   
-  const result = await createClient(clientId, displayName, updatedBy);
+  // Pass actor context for audit logging
+  const actorContext = {
+    userId: req.session?.admin?.authz?.userId || null,
+    email: req.session?.admin?.email || null,
+    role: req.session?.admin?.authz?.role || (req.session?.admin?.email === ADMIN_EMAIL ? "super_admin" : null),
+    requestId: requestId,
+  };
+  
+  const result = await createClient(clientId, displayName, actorContext);
   
   if (!result.success) {
     const statusCode = result.statusCode || 400;
@@ -1000,8 +1021,15 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res
     const updatedConfig = mergeConfigUpdate(existingConfig, validationResult.sanitizedConfig);
     
     // Write updated config (atomic write - async for Supabase)
+    // Pass actor context for audit logging
     const updatedBy = req.session?.admin?.email || null;
-    const writeResult = await writeClientConfigAtomic(clientId, updatedConfig, updatedBy);
+    const actorOptions = {
+      actorUserId: req.session?.admin?.authz?.userId || null,
+      actorEmail: req.session?.admin?.email || null,
+      actorRole: req.session?.admin?.authz?.role || (req.session?.admin?.email === ADMIN_EMAIL ? "super_admin" : null),
+      requestId: requestId,
+    };
+    const writeResult = await writeClientConfigAtomic(clientId, updatedConfig, updatedBy, actorOptions);
     if (!writeResult.success) {
       logAdminEvent("error", "admin_client_update_write_failed", {
         event: "admin_client_update_write_failed",
