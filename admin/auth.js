@@ -70,6 +70,7 @@ function logAdminEvent(level, event, fields) {
 
 // Authentication middleware: require admin session
 // Supports both legacy super-admin (via ADMIN_EMAIL) and new role-based authz
+// Normalizes legacy admin sessions to have authz structure for consistency
 function requireAdminAuth(req, res, next) {
   // Check if session exists and has admin data
   if (!req.session || !req.session.admin || !req.session.admin.email) {
@@ -97,9 +98,22 @@ function requireAdminAuth(req, res, next) {
     return res.redirect("/admin/login");
   }
 
+  // Legacy admin normalization: ensure legacy admin sessions always have authz structure
+  // This makes legacy admin behave identically to role-based super_admin
+  const isLegacySuperAdmin = req.session.admin.email === ADMIN_EMAIL && ADMIN_EMAIL !== "";
+  if (isLegacySuperAdmin && (!req.session.admin.authz || !req.session.admin.authz.role)) {
+    // Normalize legacy admin session to have authz structure
+    req.session.admin.authz = {
+      role: "super_admin",
+      clientIds: null, // null means "all clients" for super_admin
+      userId: null, // Legacy admin has no UUID
+    };
+    // Mark as legacy for tracking
+    req.session.admin.isLegacyAdmin = true;
+  }
+
   // Backward compatibility: allow legacy super-admin (ADMIN_EMAIL match)
   // OR require authorization context (req.session.admin.authz)
-  const isLegacySuperAdmin = req.session.admin.email === ADMIN_EMAIL;
   const hasAuthz = req.session.admin.authz && req.session.admin.authz.role;
 
   if (!isLegacySuperAdmin && !hasAuthz) {

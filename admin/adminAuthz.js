@@ -188,18 +188,35 @@ async function loadUserClientIds(userId) {
 }
 
 // Check if user is super admin
+// Supports both legacy admin (ADMIN_EMAIL env var) and Supabase super_admin role
 function isSuperAdmin(req) {
   if (!req.session || !req.session.admin) {
     return false;
   }
+  
+  // Check legacy admin (ADMIN_EMAIL match)
+  const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "";
+  const isLegacyAdmin = req.session.admin.email === ADMIN_EMAIL && ADMIN_EMAIL !== "";
+  
+  // Check Supabase role-based auth
   const authz = req.session.admin.authz;
-  return authz && authz.role === "super_admin";
+  const isRoleBasedSuperAdmin = authz && authz.role === "super_admin";
+  
+  return isLegacyAdmin || isRoleBasedSuperAdmin;
 }
 
 // Check if user can access a specific client
+// Supports both legacy admin (ADMIN_EMAIL env var) and role-based auth
 function canAccessClient(req, clientId) {
   if (!req.session || !req.session.admin) {
     return false;
+  }
+
+  // Legacy admin (ADMIN_EMAIL) can access all clients
+  const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "";
+  const isLegacyAdmin = req.session.admin.email === ADMIN_EMAIL && ADMIN_EMAIL !== "";
+  if (isLegacyAdmin) {
+    return true;
   }
 
   const authz = req.session.admin.authz;
@@ -223,9 +240,17 @@ function canAccessClient(req, clientId) {
 }
 
 // Get user's authorized client IDs (returns null for super_admin, array for client_admin)
+// Supports both legacy admin (ADMIN_EMAIL env var) and role-based auth
 function getAuthorizedClientIds(req) {
   if (!req.session || !req.session.admin) {
     return null;
+  }
+
+  // Legacy admin (ADMIN_EMAIL) has access to all clients
+  const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "";
+  const isLegacyAdmin = req.session.admin.email === ADMIN_EMAIL && ADMIN_EMAIL !== "";
+  if (isLegacyAdmin) {
+    return null; // null means "all clients"
   }
 
   const authz = req.session.admin.authz;
