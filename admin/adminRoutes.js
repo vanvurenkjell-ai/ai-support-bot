@@ -13,7 +13,7 @@ const { validateAndSanitizeConfigUpdate, mergeConfigUpdate } = require("./config
 // Import schema system (new centralized validation)
 const { applyPatch, normalizeConfig, getDefaultConfig } = require("../lib/clientConfigSchema");
 // Import invitation management
-const { createInvitation } = require("../lib/clientInvitations");
+const { createInvitation, listInvitationsForClient } = require("../lib/clientInvitations");
 
 // Simple logging helper (matches index.js pattern for structured logs)
 function logAdminEvent(level, event, fields) {
@@ -732,6 +732,24 @@ router.get("/clients/:clientId", requireAdminAuth, async (req, res) => {
   
   const successMessage = saved ? '<p style="color: green; font-weight: bold;">✓ Changes saved successfully!</p>' : '';
   const createdMessage = created ? '<p style="color: green; font-weight: bold;">✓ Client created successfully!</p>' : '';
+  const inviteSuccessMessage = req.query.invite_success ? `<p style="color: green; font-weight: bold;">✓ Invitation sent to ${escapeHtml(req.query.invite_email || "")} (status: pending)</p>` : '';
+  const inviteErrorMessage = req.query.invite_error ? `<p style="color: red; font-weight: bold;">Error: ${escapeHtml(req.query.invite_error)}</p>` : '';
+  
+  // Fetch invitations for this client (if super_admin)
+  let invitations = [];
+  if (isSuperAdmin(req)) {
+    try {
+      invitations = await listInvitationsForClient(validation.clientId);
+    } catch (error) {
+      logAdminEvent("error", "admin_invitation_list_error", {
+        event: "admin_invitation_list_error",
+        requestId: requestId,
+        clientId: validation.clientId,
+        error: error?.message || String(error),
+      });
+      // Continue without invitations if fetch fails
+    }
+  }
   
   const configPathInfo = configStats ? `
   <div style="margin-bottom: 20px; padding: 10px; background: #f5f5f5; border: 1px solid #ddd; border-radius: 4px;">
@@ -789,6 +807,8 @@ router.get("/clients/:clientId", requireAdminAuth, async (req, res) => {
   <h2>Edit Client: ${escapeHtml(validation.clientId)}</h2>
   ${createdMessage}
   ${successMessage}
+  ${inviteSuccessMessage}
+  ${inviteErrorMessage}
   <p><a href="/admin/clients">← Back to clients</a></p>
   ${configPathInfo}
   <h3>Embed Instructions</h3>
@@ -847,6 +867,46 @@ router.get("/clients/:clientId", requireAdminAuth, async (req, res) => {
   <hr style="margin: 40px 0;">
   
   ${isSuperAdmin(req) ? `
+  <h3>Client Admin Access</h3>
+  <div style="margin-bottom: 30px; padding: 15px; border: 1px solid #ccc; max-width: 600px;">
+    <p>Invite a client administrator to manage this client's configuration. The invited user will receive access to edit this client's settings.</p>
+    <form method="POST" action="/admin/invitations" style="margin-top: 15px;">
+      <input type="hidden" name="csrfToken" value="${csrfToken}">
+      <input type="hidden" name="client_id" value="${escapeHtml(validation.clientId)}">
+      <div style="margin-bottom: 10px;">
+        <label>Email: <input type="email" name="email" required style="width: 300px;" placeholder="user@example.com"></label>
+      </div>
+      <button type="submit" style="background: #28a745; color: white; border: none; padding: 8px 16px; cursor: pointer;">Invite Client Admin</button>
+    </form>
+    ${invitations.length > 0 ? `
+    <div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid #ddd;">
+      <p><strong>Existing Invitations:</strong></p>
+      <table style="width: 100%; border-collapse: collapse; margin-top: 10px;">
+        <thead>
+          <tr style="border-bottom: 1px solid #ddd;">
+            <th style="text-align: left; padding: 5px;">Email</th>
+            <th style="text-align: left; padding: 5px;">Status</th>
+            <th style="text-align: left; padding: 5px;">Expires</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${invitations.map(inv => {
+            const expiresAt = inv.expires_at ? new Date(inv.expires_at).toLocaleDateString() : 'N/A';
+            return `
+          <tr style="border-bottom: 1px solid #eee;">
+            <td style="padding: 5px;">${escapeHtml(inv.email)}</td>
+            <td style="padding: 5px;">${escapeHtml(inv.status)}</td>
+            <td style="padding: 5px;">${escapeHtml(expiresAt)}</td>
+          </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
+    ` : ''}
+  </div>
+  
+  <hr style="margin: 40px 0;">
+  
   <h3>Delete Client</h3>
   <div style="padding: 15px; background: #fff3cd; border: 1px solid #ffc107; margin-bottom: 20px;">
     <p><strong>Warning:</strong> This will permanently delete the client configuration. This action cannot be undone.</p>
@@ -1224,6 +1284,7 @@ router.get("/debug-session", requireAdminAuth, (req, res) => {
 });
 
 // Create invitation (POST /admin/invitations) - super_admin only
+// Handles both JSON API requests and HTML form submissions
 router.post("/invitations", requireAdminAuth, requireCsrf, async (req, res) => {
   // Authorization check: only super_admin can create invitations
   if (!isSuperAdmin(req)) {
@@ -1236,6 +1297,13 @@ router.post("/invitations", requireAdminAuth, requireCsrf, async (req, res) => {
       userEmail: req.session?.admin?.email || "unknown",
       reason: "not_super_admin",
     });
+    
+    // Check if this is a form submission (redirect) or API call (JSON)
+    const isFormSubmission = req.headers["content-type"]?.includes("application/x-www-form-urlencoded");
+    if (isFormSubmission && req.body.client_id) {
+      return res.redirect(`/admin/clients/${encodeURIComponent(req.body.client_id)}?invite_error=${encodeURIComponent("Access denied. Only super administrators can create invitations.")}`);
+    }
+    
     return res.status(403).json({
       error: "Access denied",
       message: "Only super administrators can create invitations",
@@ -1245,6 +1313,7 @@ router.post("/invitations", requireAdminAuth, requireCsrf, async (req, res) => {
   const requestId = req.requestId || "unknown";
   const ip = getClientIp(req);
   const { email, client_id: clientId } = req.body || {};
+  const isFormSubmission = req.headers["content-type"]?.includes("application/x-www-form-urlencoded");
 
   // Validate required fields
   if (!email || typeof email !== "string") {
@@ -1254,6 +1323,11 @@ router.post("/invitations", requireAdminAuth, requireCsrf, async (req, res) => {
       ip: ip,
       reason: "missing_email",
     });
+    
+    if (isFormSubmission && clientId) {
+      return res.redirect(`/admin/clients/${encodeURIComponent(clientId)}?invite_error=${encodeURIComponent("Email is required")}`);
+    }
+    
     return res.status(400).json({
       error: "Validation error",
       message: "Email is required",
@@ -1267,6 +1341,11 @@ router.post("/invitations", requireAdminAuth, requireCsrf, async (req, res) => {
       ip: ip,
       reason: "missing_client_id",
     });
+    
+    if (isFormSubmission) {
+      return res.redirect("/admin/clients?invite_error=" + encodeURIComponent("Client ID is required"));
+    }
+    
     return res.status(400).json({
       error: "Validation error",
       message: "Client ID is required",
@@ -1283,6 +1362,11 @@ router.post("/invitations", requireAdminAuth, requireCsrf, async (req, res) => {
       reason: "missing_actor_user_id",
       note: "Super admin session missing user ID",
     });
+    
+    if (isFormSubmission) {
+      return res.redirect(`/admin/clients/${encodeURIComponent(clientId)}?invite_error=${encodeURIComponent("Unable to identify creator")}`);
+    }
+    
     return res.status(500).json({
       error: "Internal error",
       message: "Unable to identify creator",
@@ -1302,6 +1386,18 @@ router.post("/invitations", requireAdminAuth, requireCsrf, async (req, res) => {
       createdByUserId: actorUserId,
       reason: result.error,
     });
+    
+    // For form submissions, redirect with error message (safe, user-friendly)
+    if (isFormSubmission) {
+      const errorMessage = result.error === "Invalid email format" 
+        ? "Invalid email format"
+        : result.error === "A pending invitation already exists for this email and client"
+        ? "A pending invitation already exists for this email"
+        : "Failed to create invitation. Please try again.";
+      
+      return res.redirect(`/admin/clients/${encodeURIComponent(clientId)}?invite_error=${encodeURIComponent(errorMessage)}`);
+    }
+    
     return res.status(400).json({
       error: "Invitation creation failed",
       message: result.error,
@@ -1318,7 +1414,12 @@ router.post("/invitations", requireAdminAuth, requireCsrf, async (req, res) => {
     createdByUserId: actorUserId,
   });
 
-  // Return invitation details (without token)
+  // For form submissions, redirect back to client page with success message
+  if (isFormSubmission) {
+    return res.redirect(`/admin/clients/${encodeURIComponent(clientId)}?invite_success=1&invite_email=${encodeURIComponent(email)}`);
+  }
+
+  // Return invitation details (without token) for API calls
   return res.status(201).json({
     invitation: {
       id: result.invitation.id,
