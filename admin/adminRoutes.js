@@ -12,6 +12,8 @@ const { resolveUserFromSupabase, loadUserClientIds, isSuperAdmin, canAccessClien
 const { validateAndSanitizeConfigUpdate, mergeConfigUpdate } = require("./configValidator");
 // Import schema system (new centralized validation)
 const { applyPatch, normalizeConfig, getDefaultConfig } = require("../lib/clientConfigSchema");
+// Import invitation management
+const { createInvitation } = require("../lib/clientInvitations");
 
 // Simple logging helper (matches index.js pattern for structured logs)
 function logAdminEvent(level, event, fields) {
@@ -1218,6 +1220,115 @@ router.get("/debug-session", requireAdminAuth, (req, res) => {
     hasSession: hasSession,
     adminEmail: req.session?.admin?.email || null,
     sessionKeys: sessionKeys,
+  });
+});
+
+// Create invitation (POST /admin/invitations) - super_admin only
+router.post("/invitations", requireAdminAuth, requireCsrf, async (req, res) => {
+  // Authorization check: only super_admin can create invitations
+  if (!isSuperAdmin(req)) {
+    const requestId = req.requestId || "unknown";
+    const ip = getClientIp(req);
+    logAdminEvent("warn", "admin_invitation_create_denied", {
+      event: "admin_invitation_create_denied",
+      requestId: requestId,
+      ip: ip,
+      userEmail: req.session?.admin?.email || "unknown",
+      reason: "not_super_admin",
+    });
+    return res.status(403).json({
+      error: "Access denied",
+      message: "Only super administrators can create invitations",
+    });
+  }
+
+  const requestId = req.requestId || "unknown";
+  const ip = getClientIp(req);
+  const { email, client_id: clientId } = req.body || {};
+
+  // Validate required fields
+  if (!email || typeof email !== "string") {
+    logAdminEvent("warn", "admin_invitation_create_failed", {
+      event: "admin_invitation_create_failed",
+      requestId: requestId,
+      ip: ip,
+      reason: "missing_email",
+    });
+    return res.status(400).json({
+      error: "Validation error",
+      message: "Email is required",
+    });
+  }
+
+  if (!clientId || typeof clientId !== "string") {
+    logAdminEvent("warn", "admin_invitation_create_failed", {
+      event: "admin_invitation_create_failed",
+      requestId: requestId,
+      ip: ip,
+      reason: "missing_client_id",
+    });
+    return res.status(400).json({
+      error: "Validation error",
+      message: "Client ID is required",
+    });
+  }
+
+  // Get actor user ID from session
+  const actorUserId = req.session?.admin?.authz?.userId || null;
+  if (!actorUserId) {
+    logAdminEvent("error", "admin_invitation_create_failed", {
+      event: "admin_invitation_create_failed",
+      requestId: requestId,
+      ip: ip,
+      reason: "missing_actor_user_id",
+      note: "Super admin session missing user ID",
+    });
+    return res.status(500).json({
+      error: "Internal error",
+      message: "Unable to identify creator",
+    });
+  }
+
+  // Create invitation
+  const result = await createInvitation(email, clientId, actorUserId, requestId);
+
+  if (!result.success) {
+    logAdminEvent("warn", "admin_invitation_create_failed", {
+      event: "admin_invitation_create_failed",
+      requestId: requestId,
+      ip: ip,
+      email: email,
+      clientId: clientId,
+      createdByUserId: actorUserId,
+      reason: result.error,
+    });
+    return res.status(400).json({
+      error: "Invitation creation failed",
+      message: result.error,
+    });
+  }
+
+  logAdminEvent("info", "admin_invitation_create_success", {
+    event: "admin_invitation_create_success",
+    requestId: requestId,
+    ip: ip,
+    invitationId: result.invitation.id,
+    email: result.invitation.email,
+    clientId: result.invitation.client_id,
+    createdByUserId: actorUserId,
+  });
+
+  // Return invitation details (without token)
+  return res.status(201).json({
+    invitation: {
+      id: result.invitation.id,
+      email: result.invitation.email,
+      client_id: result.invitation.client_id,
+      role: result.invitation.role,
+      status: result.invitation.status,
+      expires_at: result.invitation.expires_at,
+      created_at: result.invitation.created_at,
+    },
   });
 });
 
