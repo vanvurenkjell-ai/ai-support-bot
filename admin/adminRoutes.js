@@ -219,17 +219,18 @@ router.post("/login", rateLimitLogin, requireCsrf, async (req, res) => {
     }
 
     // Store resolved authorization context in session
-    // Legacy admin normalization: ensure legacy admin always has authz.role = 'super_admin'
-    const isLegacyAdmin = resolvedUser.user.id === null && resolvedUser.user.role === "super_admin";
+    // Legacy admin normalization: legacy admin now has stable UUID (from getLegacyAdminUser)
+    // This ensures invitations, audits, etc. always have valid actor_user_id
+    const isLegacyAdmin = resolvedUser.user.is_legacy_admin === true && resolvedUser.user.role === "super_admin";
     req.session.admin = {
       email: resolvedUser.user.email,
       loggedInAt: Date.now(),
       authz: {
         role: resolvedUser.user.role, // Will be "super_admin" for legacy admin
         clientIds: clientIds,
-        userId: resolvedUser.user.id, // null for legacy admin
+        userId: resolvedUser.user.id, // Stable UUID for legacy admin (from getLegacyAdminUser)
       },
-      // Mark legacy admin for tracking (optional, but useful for debugging)
+      // Mark legacy admin for tracking (useful for debugging and logging)
       ...(isLegacyAdmin ? { isLegacyAdmin: true } : {}),
     };
 

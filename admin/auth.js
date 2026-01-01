@@ -1,5 +1,6 @@
 const session = require("express-session");
 const crypto = require("crypto");
+const { getLegacyAdminUser } = require("../lib/legacyAdminIdentity");
 
 // Admin credentials from environment
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "";
@@ -100,16 +101,38 @@ function requireAdminAuth(req, res, next) {
 
   // Legacy admin normalization: ensure legacy admin sessions always have authz structure
   // This makes legacy admin behave identically to role-based super_admin
+  // Legacy admin gets a stable, deterministic UUID for auditability (invitations, audits, etc.)
   const isLegacySuperAdmin = req.session.admin.email === ADMIN_EMAIL && ADMIN_EMAIL !== "";
-  if (isLegacySuperAdmin && (!req.session.admin.authz || !req.session.admin.authz.role)) {
-    // Normalize legacy admin session to have authz structure
-    req.session.admin.authz = {
-      role: "super_admin",
-      clientIds: null, // null means "all clients" for super_admin
-      userId: null, // Legacy admin has no UUID
-    };
-    // Mark as legacy for tracking
-    req.session.admin.isLegacyAdmin = true;
+  if (isLegacySuperAdmin) {
+    try {
+      // Ensure legacy admin always has complete authz structure with stable UUID
+      if (!req.session.admin.authz || !req.session.admin.authz.userId || !req.session.admin.authz.role) {
+        const legacyUser = getLegacyAdminUser();
+        req.session.admin.authz = {
+          role: "super_admin",
+          clientIds: null, // null means "all clients" for super_admin
+          userId: legacyUser.id, // Stable UUID for legacy admin
+        };
+        // Mark as legacy for tracking
+        req.session.admin.isLegacyAdmin = true;
+      }
+    } catch (error) {
+      // If we cannot resolve legacy admin identity, deny access (fail closed)
+      logAdminEvent("error", "admin_authz_legacy_normalization_error", {
+        email: req.session.admin.email,
+        error: error?.message || String(error),
+        note: "Failed to normalize legacy admin session - access denied",
+      });
+      
+      const isApiEndpoint = req.path === "/admin/health" || (req.path.startsWith("/admin/") && req.path !== "/admin" && req.path !== "/admin/login");
+      if (isApiEndpoint) {
+        return res.status(500).json({
+          error: "Internal error",
+          message: "Authentication configuration error",
+        });
+      }
+      return res.status(500).send("Authentication configuration error. Please contact administrator.");
+    }
   }
 
   // Backward compatibility: allow legacy super-admin (ADMIN_EMAIL match)

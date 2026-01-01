@@ -1,5 +1,6 @@
 const { createClient } = require("@supabase/supabase-js");
 const bcrypt = require("bcrypt");
+const { getLegacyAdminUser } = require("../lib/legacyAdminIdentity");
 
 // Initialize Supabase client (server-side only, uses service role key)
 function getSupabaseClient() {
@@ -65,18 +66,34 @@ async function resolveUserFromSupabase(email, password) {
 
   // Legacy super-admin check (backward compatibility) - check FIRST before Supabase lookup
   if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
-    logAuthzEvent("info", "admin_authz_legacy_superadmin", {
-      email: email,
-      note: "Using legacy env var authentication for super-admin",
-    });
-    return {
-      user: {
-        id: null, // Legacy user has no UUID
+    try {
+      // Get stable UUID for legacy admin (deterministic, same across deployments)
+      const legacyUser = getLegacyAdminUser();
+      
+      logAuthzEvent("info", "admin_authz_legacy_superadmin", {
         email: email,
-        role: "super_admin",
-      },
-      clientIds: null, // null means "all clients" for super_admin
-    };
+        userId: legacyUser.id,
+        note: "Using legacy env var authentication for super-admin with stable UUID",
+      });
+      
+      return {
+        user: {
+          id: legacyUser.id, // Stable UUID for legacy admin (deterministic from ADMIN_EMAIL)
+          email: legacyUser.email,
+          role: legacyUser.role,
+          is_legacy_admin: legacyUser.is_legacy_admin, // Mark as legacy admin
+        },
+        clientIds: null, // null means "all clients" for super_admin
+      };
+    } catch (error) {
+      logAuthzEvent("error", "admin_authz_legacy_identity_error", {
+        email: email,
+        error: error?.message || String(error),
+        note: "Failed to resolve legacy admin identity - authentication denied",
+      });
+      // Fail closed: if we cannot resolve legacy admin identity, deny access
+      return null;
+    }
   }
 
   const supabase = getSupabaseClient();
