@@ -7,6 +7,7 @@ const { requireCsrf } = require("./csrf");
 const clientsStore = require("../lib/clientsStoreAdapter");
 const { validateAndSanitizeConfigUpdate, mergeConfigUpdate } = require("./configValidator");
 const { isSuperAdmin, canAccessClient, getAuthorizedClientIds } = require("./adminAuthz");
+const { applyPatch, normalizeConfig, getDefaultConfig } = require("../lib/clientConfigSchema");
 
 // Simple logging helper
 function logAdminEvent(level, event, fields) {
@@ -370,32 +371,34 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res
       return res.status(404).json({ error: "Client config not found" });
     }
     
-    // Determine actor role for validation (same allowlist for all roles for safety)
+    // Determine actor role for validation
     const actorRole = isSuperAdmin(req) ? "super_admin" : "client_admin";
     
-    // Validate and sanitize update using strict validator
-    const validationResult = validateAndSanitizeConfigUpdate(existingConfig, req.body, actorRole);
+    // Use schema-based validation and patch application
+    const patchResult = applyPatch(existingConfig, req.body, actorRole);
     
-    if (validationResult.errors.length > 0 || !validationResult.sanitizedConfig) {
+    if (!patchResult.ok) {
       logAdminEvent("warn", "admin_api_client_update_validation_failed", {
         event: "admin_api_client_update_validation_failed",
         requestId: requestId,
         clientId: validation.clientId,
         userEmail: userEmail,
         actorRole: actorRole,
-        errors: validationResult.errors,
-        disallowedFields: Object.keys(validationResult.fieldErrors || {}),
+        errors: patchResult.errors.map(e => `${e.path}: ${e.message}`),
       });
       return res.status(400).json({
         ok: false,
         error: "Validation failed",
-        errors: validationResult.errors,
-        fieldErrors: validationResult.fieldErrors || {},
+        errors: patchResult.errors.map(e => e.path ? `${e.path}: ${e.message}` : e.message),
+        fieldErrors: patchResult.errors.reduce((acc, e) => {
+          if (e.path) acc[e.path] = e.message;
+          return acc;
+        }, {}),
       });
     }
     
-    // Merge sanitized update into existing config
-    const updatedConfig = mergeConfigUpdate(existingConfig, validationResult.sanitizedConfig);
+    // Use normalized and validated config from schema system
+    const updatedConfig = patchResult.value;
     
     // Write updated config (atomic write - async for Supabase)
     const updatedBy = req.session?.admin?.email || null;
@@ -416,7 +419,7 @@ router.post("/clients/:clientId", requireAdminAuth, requireCsrf, async (req, res
       clientId: validation.clientId,
       userEmail: userEmail,
       actorRole: actorRole,
-      updatedFields: Object.keys(validationResult.sanitizedConfig || {}),
+      schemaVersion: updatedConfig.schemaVersion,
       storeType: clientsStore.storeType,
     });
     

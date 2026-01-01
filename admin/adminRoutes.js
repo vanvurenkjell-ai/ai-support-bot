@@ -8,8 +8,10 @@ const { generateCsrfToken, setCsrfToken, getCsrfToken, requireCsrf } = require("
 const clientsStore = require("../lib/clientsStoreAdapter");
 // Import authorization helpers
 const { resolveUserFromSupabase, loadUserClientIds, isSuperAdmin, canAccessClient, getAuthorizedClientIds } = require("./adminAuthz");
-// Import config validator
+// Import config validator (legacy - still used for form data transformation)
 const { validateAndSanitizeConfigUpdate, mergeConfigUpdate } = require("./configValidator");
+// Import schema system (new centralized validation)
+const { applyPatch, normalizeConfig, getDefaultConfig } = require("../lib/clientConfigSchema");
 
 // Simple logging helper (matches index.js pattern for structured logs)
 function logAdminEvent(level, event, fields) {

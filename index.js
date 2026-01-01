@@ -2588,6 +2588,7 @@ function retrieveScopedKnowledge(chunks, intent, message, requestId, clientId, s
 // Use unified clientsStore adapter (chooses Supabase or filesystem automatically)
 const clientsStore = require("./lib/clientsStoreAdapter");
 const { getClientsRoot, ensureClientsRoot, listClientIds, readClientConfig, getClientConfigPath } = clientsStore;
+const { normalizeConfig, getDefaultConfig, validateConfig } = require("./lib/clientConfigSchema");
 
 // Content loader for markdown files (read-only, optional, works with both Supabase and filesystem modes)
 const clientContentFs = require("./lib/clientContentFs");
@@ -4221,7 +4222,10 @@ app.get("/widget-config", widgetCors, requireWidgetAuth, async (req, res) => {
     }
     
     // Read fresh from storage (not from cache - async for Supabase)
-    const config = await readClientConfig(clientId);
+    // Note: readClientConfig now returns normalized config from schema system
+    let config = await readClientConfig(clientId);
+    
+    // If config not found, return 404
     if (!config) {
       res.status(404);
       return res.json({
@@ -4231,9 +4235,29 @@ app.get("/widget-config", widgetCors, requireWidgetAuth, async (req, res) => {
       });
     }
     
+    // Config is already normalized by readClientConfig, but validate as safety check
+    // If somehow invalid, fall back to defaults (fail safe for widget)
+    const validation = validateConfig(config, { clientId, logEvents: false });
+    if (!validation.ok) {
+      logJson("error", "config_invalid_in_storage", {
+        event: "config_invalid_in_storage",
+        requestId: req.requestId,
+        clientId: clientId,
+        errors: validation.errors.map(e => `${e.path}: ${e.message}`),
+        fallbackToDefaults: true,
+        storeType: clientsStore.storeType,
+      });
+      // Fall back to safe defaults (fail safe - widget should still work)
+      config = getDefaultConfig(clientId);
+    } else {
+      config = validation.value; // Use validated config
+    }
+    
     // Get stats for logging (async for Supabase)
     const stats = await clientsStore.getClientConfigStats(clientId);
     const configMtime = stats?.mtimeISO || new Date().toISOString();
+    
+    // Use schema-normalized config (already normalized, but apply legacy normalization for compatibility)
     const normalizedConfig = normalizeClientConfig(config, clientId);
     
     const widgetConfig = buildWidgetConfig(normalizedConfig, clientId);
