@@ -14,6 +14,8 @@ const { validateAndSanitizeConfigUpdate, mergeConfigUpdate } = require("./config
 const { applyPatch, normalizeConfig, getDefaultConfig } = require("../lib/clientConfigSchema");
 // Import invitation management
 const { createInvitation, listInvitationsForClient } = require("../lib/clientInvitations");
+// Import invitation acceptance
+const { validateInvitationToken, acceptInvitation, validatePasswordStrength } = require("../lib/invitationAcceptance");
 
 // Simple logging helper (matches index.js pattern for structured logs)
 function logAdminEvent(level, event, fields) {
@@ -34,6 +36,11 @@ function logAdminEvent(level, event, fields) {
 const RL_LOGIN_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 const RL_LOGIN_MAX_ATTEMPTS = 5;
 const loginRateLimitStore = new Map();
+
+// Rate limiting for invitation acceptance: 10 attempts per 15 minutes per IP
+const RL_ACCEPTANCE_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const RL_ACCEPTANCE_MAX_ATTEMPTS = 10;
+const acceptanceRateLimitStore = new Map();
 
 function getClientIp(req) {
   return req.ip || "unknown";
@@ -74,12 +81,50 @@ function rateLimitLogin(req, res, next) {
   next();
 }
 
+// Rate limiting for invitation acceptance endpoint
+function rateLimitAcceptance(req, res, next) {
+  if (req.path !== "/admin/invitations/accept" || req.method !== "POST") {
+    return next();
+  }
+
+  const ip = getClientIp(req);
+  const now = Date.now();
+  const entry = acceptanceRateLimitStore.get(ip) || { windowStart: now, count: 0 };
+
+  // Reset window if expired
+  if (now - entry.windowStart > RL_ACCEPTANCE_WINDOW_MS) {
+    entry.windowStart = now;
+    entry.count = 0;
+  }
+
+  entry.count += 1;
+  acceptanceRateLimitStore.set(ip, entry);
+
+  if (entry.count > RL_ACCEPTANCE_MAX_ATTEMPTS) {
+    const requestId = req.requestId || "unknown";
+    logAdminEvent("warn", "invitation_acceptance_rate_limit", {
+      requestId: requestId,
+      ip: ip,
+      route: "/admin/invitations/accept",
+      count: entry.count,
+    });
+    return res.status(429).send(renderAcceptanceErrorPage("Too many attempts", "Please wait before trying again."));
+  }
+
+  next();
+}
+
 // Cleanup old rate limit entries
 setInterval(() => {
   const now = Date.now();
   for (const [ip, entry] of loginRateLimitStore.entries()) {
     if (now - entry.windowStart > RL_LOGIN_WINDOW_MS * 2) {
       loginRateLimitStore.delete(ip);
+    }
+  }
+  for (const [ip, entry] of acceptanceRateLimitStore.entries()) {
+    if (now - entry.windowStart > RL_ACCEPTANCE_WINDOW_MS * 2) {
+      acceptanceRateLimitStore.delete(ip);
     }
   }
 }, 60 * 1000); // Clean every minute
@@ -97,6 +142,9 @@ function adminSecurityHeaders(req, res, next) {
 // Apply security headers to all admin routes
 router.use(adminSecurityHeaders);
 
+// Rate limiting for acceptance endpoint (must be before routes, applies to public endpoint)
+router.use(rateLimitAcceptance);
+
 // Parse URL-encoded form data (for login/logout forms and client config forms)
 router.use(express.urlencoded({ extended: true }));
 
@@ -111,6 +159,95 @@ function escapeHtml(text) {
     "'": "&#039;",
   };
   return String(text).replace(/[&<>"']/g, (m) => map[m]);
+}
+
+// Helper function to render invitation acceptance form
+function renderAcceptanceForm(csrfToken, email, token, errorMessage = null) {
+  const errorHtml = errorMessage ? `<div style="color: red; background: #ffe6e6; padding: 10px; border-radius: 4px; margin-bottom: 15px;">${escapeHtml(errorMessage)}</div>` : "";
+  const escapedEmail = escapeHtml(email);
+  const escapedToken = escapeHtml(token);
+  
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Accept Invitation - ClientPulse</title>
+  <style>
+    body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; background: #f5f5f5; margin: 0; padding: 20px; }
+    .container { max-width: 500px; margin: 50px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    h1 { margin-top: 0; color: #333; }
+    .form-group { margin-bottom: 20px; }
+    label { display: block; margin-bottom: 5px; font-weight: bold; }
+    input[type="email"], input[type="password"] { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 16px; box-sizing: border-box; }
+    input[type="email"]:disabled { background: #f5f5f5; color: #666; }
+    .password-hint { font-size: 12px; color: #666; margin-top: 5px; }
+    button { width: 100%; padding: 12px; background: #007bff; color: white; border: none; border-radius: 4px; font-size: 16px; cursor: pointer; }
+    button:hover { background: #0056b3; }
+    .footer { margin-top: 20px; padding-top: 20px; border-top: 1px solid #ddd; font-size: 12px; color: #666; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Accept Invitation</h1>
+    <p>Welcome! Please set a password to complete your account setup.</p>
+    ${errorHtml}
+    <form method="POST" action="/admin/invitations/accept">
+      <input type="hidden" name="csrfToken" value="${csrfToken}">
+      <input type="hidden" name="token" value="${escapedToken}">
+      <div class="form-group">
+        <label for="email">Email:</label>
+        <input type="email" id="email" name="email" value="${escapedEmail}" disabled required>
+      </div>
+      <div class="form-group">
+        <label for="password">Password:</label>
+        <input type="password" id="password" name="password" required>
+        <div class="password-hint">Must be at least 8 characters and include both letters and numbers.</div>
+      </div>
+      <div class="form-group">
+        <label for="confirmPassword">Confirm Password:</label>
+        <input type="password" id="confirmPassword" name="confirmPassword" required>
+      </div>
+      <button type="submit">Create Account</button>
+    </form>
+    <div class="footer">
+      <p>This invitation will expire in 7 days.</p>
+    </div>
+  </div>
+</body>
+</html>
+  `;
+}
+
+// Helper function to render acceptance error page
+function renderAcceptanceErrorPage(title, message) {
+  const escapedTitle = escapeHtml(title);
+  const escapedMessage = escapeHtml(message);
+  
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapedTitle} - ClientPulse</title>
+  <style>
+    body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; background: #f5f5f5; margin: 0; padding: 20px; }
+    .container { max-width: 500px; margin: 50px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); text-align: center; }
+    h1 { margin-top: 0; color: #d32f2f; }
+    p { color: #666; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>${escapedTitle}</h1>
+    <p>${escapedMessage}</p>
+    <p><a href="/admin/login">Go to login page</a></p>
+  </div>
+</body>
+</html>
+  `;
 }
 
 // Helper function to render login page with optional error message
@@ -1378,8 +1515,13 @@ router.post("/invitations", requireAdminAuth, requireCsrf, async (req, res) => {
     });
   }
 
+  // Construct base URL for acceptance link
+  const protocol = req.protocol || "https";
+  const host = req.get("host") || req.headers.host || "localhost";
+  const baseUrl = `${protocol}://${host}`;
+
   // Create invitation
-  const result = await createInvitation(email, clientId, actorUserId, requestId);
+  const result = await createInvitation(email, clientId, actorUserId, requestId, baseUrl);
 
   if (!result.success) {
     logAdminEvent("warn", "admin_invitation_create_failed", {
@@ -1436,6 +1578,261 @@ router.post("/invitations", requireAdminAuth, requireCsrf, async (req, res) => {
       created_at: result.invitation.created_at,
     },
   });
+});
+
+// GET /admin/invitations/accept - Public invitation acceptance page (no auth required)
+router.get("/invitations/accept", async (req, res) => {
+  const requestId = req.requestId || "unknown";
+  const token = req.query.token;
+
+  if (!token || typeof token !== "string") {
+    logAdminEvent("warn", "invitation_acceptance_missing_token", {
+      requestId: requestId,
+      ip: getClientIp(req),
+    });
+    return res.status(400).send(renderAcceptanceErrorPage("Invalid Request", "Invalid or missing invitation token."));
+  }
+
+  // Validate token
+  const validation = await validateInvitationToken(token);
+  if (!validation.valid || !validation.invitation) {
+    logAdminEvent("warn", "invitation_acceptance_invalid_token_get", {
+      requestId: requestId,
+      ip: getClientIp(req),
+      error: validation.error || "invalid_token",
+    });
+    return res.status(400).send(renderAcceptanceErrorPage("Invalid Invitation", validation.error || "This invitation is invalid or has expired."));
+  }
+
+  // Generate CSRF token for form submission
+  const csrfToken = generateCsrfToken();
+  setCsrfToken(req, csrfToken);
+
+  // Render acceptance form
+  res.send(renderAcceptanceForm(csrfToken, validation.invitation.email, token));
+});
+
+// POST /admin/invitations/accept - Accept invitation and create account (public, CSRF protected)
+router.post("/invitations/accept", requireCsrf, async (req, res) => {
+  const requestId = req.requestId || "unknown";
+  const ip = getClientIp(req);
+  const { token, email, password, confirmPassword } = req.body || {};
+
+  // Validate required fields
+  if (!token || typeof token !== "string") {
+    logAdminEvent("warn", "invitation_acceptance_missing_token", {
+      requestId: requestId,
+      ip: ip,
+    });
+    return res.status(400).send(renderAcceptanceErrorPage("Invalid Request", "Invalid or missing invitation token."));
+  }
+
+  if (!password || typeof password !== "string") {
+    return res.status(400).send(renderAcceptanceErrorPage("Validation Error", "Password is required."));
+  }
+
+  if (password !== confirmPassword) {
+    return res.status(400).send(renderAcceptanceErrorPage("Validation Error", "Passwords do not match."));
+  }
+
+  // Accept invitation (creates user, links to client, marks invitation as accepted)
+  const result = await acceptInvitation(token, password, requestId);
+
+  if (!result.success) {
+    logAdminEvent("warn", "invitation_acceptance_failed", {
+      requestId: requestId,
+      ip: ip,
+      error: result.error || "unknown",
+    });
+
+    // Re-validate token to get email for error form display
+    const validation = await validateInvitationToken(token);
+    if (validation.valid && validation.invitation) {
+      const csrfToken = generateCsrfToken();
+      setCsrfToken(req, csrfToken);
+      return res.status(400).send(renderAcceptanceForm(csrfToken, validation.invitation.email, token, result.error || "Failed to create account. Please try again."));
+    }
+
+    return res.status(400).send(renderAcceptanceErrorPage("Acceptance Failed", result.error || "Failed to create account. Please contact support."));
+  }
+
+  // Account created successfully - set up authenticated session
+  try {
+    // Regenerate session to prevent session fixation
+    await regenerateSession(req);
+
+    // Load client IDs for the new user
+    const clientIds = result.clientId ? [result.clientId] : [];
+
+    // Set up session
+    req.session.admin = {
+      email: result.user.email,
+      loggedInAt: Date.now(),
+      authz: {
+        role: result.user.role,
+        clientIds: clientIds,
+        userId: result.user.id,
+      },
+    };
+
+    logAdminEvent("info", "invitation_acceptance_success_session", {
+      requestId: requestId,
+      userId: result.user.id,
+      email: result.user.email,
+      clientId: result.clientId,
+    });
+
+    // Redirect to client management page
+    res.redirect(`/admin/clients/${encodeURIComponent(result.clientId)}?welcome=1`);
+  } catch (error) {
+    logAdminEvent("error", "invitation_acceptance_session_error", {
+      requestId: requestId,
+      userId: result.user?.id,
+      error: error?.message || String(error),
+      note: "Account created but session setup failed - user will need to log in",
+    });
+    // Account was created, but session setup failed - redirect to login
+    res.redirect("/admin/login?account_created=1");
+  }
+});
+
+// DELETE /admin/users/:userId - Delete user (super_admin only)
+router.delete("/users/:userId", requireAdminAuth, requireCsrf, async (req, res) => {
+  const requestId = req.requestId || "unknown";
+  const ip = getClientIp(req);
+  const userId = req.params.userId;
+
+  // Authorization check: only super_admin can delete users
+  if (!isSuperAdmin(req)) {
+    logAdminEvent("warn", "admin_user_delete_denied", {
+      requestId: requestId,
+      ip: ip,
+      userId: userId,
+      userEmail: req.session?.admin?.email || "unknown",
+      reason: "not_super_admin",
+    });
+    return res.status(403).json({
+      error: "Access denied",
+      message: "Only super administrators can delete users",
+    });
+  }
+
+  // Prevent deleting legacy admin
+  const { getLegacyAdminUser } = require("../lib/legacyAdminIdentity");
+  try {
+    const legacyAdmin = getLegacyAdminUser();
+    if (userId === legacyAdmin.id) {
+      logAdminEvent("warn", "admin_user_delete_denied", {
+        requestId: requestId,
+        ip: ip,
+        userId: userId,
+        reason: "cannot_delete_legacy_admin",
+      });
+      return res.status(403).json({
+        error: "Cannot delete legacy admin",
+        message: "The legacy admin user cannot be deleted",
+      });
+    }
+  } catch (error) {
+    // If legacy admin check fails, continue (legacy admin might not be configured)
+  }
+
+  const supabase = require("@supabase/supabase-js").createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY,
+    { auth: { autoRefreshToken: false, persistSession: false } }
+  );
+
+  if (!supabase) {
+    return res.status(500).json({
+      error: "System error",
+      message: "Database not available",
+    });
+  }
+
+  try {
+    // Check if user exists
+    const { data: user, error: userError } = await supabase
+      .from("users")
+      .select("id, email, role")
+      .eq("id", userId)
+      .maybeSingle();
+
+    if (userError || !user) {
+      logAdminEvent("warn", "admin_user_delete_not_found", {
+        requestId: requestId,
+        ip: ip,
+        userId: userId,
+      });
+      return res.status(404).json({
+        error: "User not found",
+        message: "User does not exist",
+      });
+    }
+
+    // Delete client_users relationships first (foreign key constraint)
+    const { error: clientUsersError } = await supabase
+      .from("client_users")
+      .delete()
+      .eq("user_id", userId);
+
+    if (clientUsersError) {
+      logAdminEvent("error", "admin_user_delete_client_users_error", {
+        requestId: requestId,
+        ip: ip,
+        userId: userId,
+        error: clientUsersError?.message || String(clientUsersError),
+      });
+      return res.status(500).json({
+        error: "Delete failed",
+        message: "Failed to remove user from clients",
+      });
+    }
+
+    // Delete user
+    const { error: deleteError } = await supabase
+      .from("users")
+      .delete()
+      .eq("id", userId);
+
+    if (deleteError) {
+      logAdminEvent("error", "admin_user_delete_error", {
+        requestId: requestId,
+        ip: ip,
+        userId: userId,
+        error: deleteError?.message || String(deleteError),
+      });
+      return res.status(500).json({
+        error: "Delete failed",
+        message: "Failed to delete user",
+      });
+    }
+
+    logAdminEvent("info", "admin_user_deleted", {
+      requestId: requestId,
+      ip: ip,
+      deletedUserId: userId,
+      deletedUserEmail: user.email,
+      deletedBy: req.session?.admin?.email || "unknown",
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "User deleted successfully",
+    });
+  } catch (error) {
+    logAdminEvent("error", "admin_user_delete_error", {
+      requestId: requestId,
+      ip: ip,
+      userId: userId,
+      error: error?.message || String(error),
+      stack: error?.stack ? String(error.stack).slice(0, 500) : null,
+    });
+    return res.status(500).json({
+      error: "System error",
+      message: "An error occurred while deleting the user",
+    });
+  }
 });
 
 module.exports = router;
