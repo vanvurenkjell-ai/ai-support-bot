@@ -13,9 +13,13 @@ const { validateAndSanitizeConfigUpdate, mergeConfigUpdate } = require("./config
 // Import schema system (new centralized validation)
 const { applyPatch, normalizeConfig, getDefaultConfig } = require("../lib/clientConfigSchema");
 // Import invitation management
-const { createInvitation, listInvitationsForClient } = require("../lib/clientInvitations");
+const { createInvitation, listInvitationsForClient, getSupabaseClient } = require("../lib/clientInvitations");
 // Import invitation acceptance
 const { validateInvitationToken, acceptInvitation, validatePasswordStrength } = require("../lib/invitationAcceptance");
+// Import invitation audit
+const { logInvitationAudit } = require("../lib/invitationAudit");
+// Import email sender
+const { sendInvitationEmail } = require("../lib/emailSender");
 
 // Simple logging helper (matches index.js pattern for structured logs)
 function logAdminEvent(level, event, fields) {
@@ -37,10 +41,13 @@ const RL_LOGIN_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 const RL_LOGIN_MAX_ATTEMPTS = 5;
 const loginRateLimitStore = new Map();
 
-// Rate limiting for invitation acceptance: 10 attempts per 15 minutes per IP
-const RL_ACCEPTANCE_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
-const RL_ACCEPTANCE_MAX_ATTEMPTS = 10;
-const acceptanceRateLimitStore = new Map();
+// Rate limiting for invitation acceptance: 10 GET requests per 10 minutes, 5 POST requests per 10 minutes per IP
+const RL_ACCEPTANCE_GET_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+const RL_ACCEPTANCE_GET_MAX_ATTEMPTS = 10;
+const RL_ACCEPTANCE_POST_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+const RL_ACCEPTANCE_POST_MAX_ATTEMPTS = 5;
+const acceptanceRateLimitStoreGet = new Map();
+const acceptanceRateLimitStorePost = new Map();
 
 function getClientIp(req) {
   return req.ip || "unknown";
@@ -83,32 +90,61 @@ function rateLimitLogin(req, res, next) {
 
 // Rate limiting for invitation acceptance endpoint
 function rateLimitAcceptance(req, res, next) {
-  if (req.path !== "/admin/invitations/accept" || req.method !== "POST") {
+  if (req.path !== "/admin/invitations/accept") {
     return next();
   }
 
   const ip = getClientIp(req);
   const now = Date.now();
-  const entry = acceptanceRateLimitStore.get(ip) || { windowStart: now, count: 0 };
+  const isGet = req.method === "GET";
+  const isPost = req.method === "POST";
 
-  // Reset window if expired
-  if (now - entry.windowStart > RL_ACCEPTANCE_WINDOW_MS) {
-    entry.windowStart = now;
-    entry.count = 0;
-  }
+  if (isGet) {
+    const entry = acceptanceRateLimitStoreGet.get(ip) || { windowStart: now, count: 0 };
 
-  entry.count += 1;
-  acceptanceRateLimitStore.set(ip, entry);
+    // Reset window if expired
+    if (now - entry.windowStart > RL_ACCEPTANCE_GET_WINDOW_MS) {
+      entry.windowStart = now;
+      entry.count = 0;
+    }
 
-  if (entry.count > RL_ACCEPTANCE_MAX_ATTEMPTS) {
-    const requestId = req.requestId || "unknown";
-    logAdminEvent("warn", "invitation_acceptance_rate_limit", {
-      requestId: requestId,
-      ip: ip,
-      route: "/admin/invitations/accept",
-      count: entry.count,
-    });
-    return res.status(429).send(renderAcceptanceErrorPage("Too many attempts", "Please wait before trying again."));
+    entry.count += 1;
+    acceptanceRateLimitStoreGet.set(ip, entry);
+
+    if (entry.count > RL_ACCEPTANCE_GET_MAX_ATTEMPTS) {
+      const requestId = req.requestId || "unknown";
+      logAdminEvent("warn", "invitation_acceptance_rate_limit", {
+        requestId: requestId,
+        ip: ip,
+        route: "/admin/invitations/accept",
+        method: "GET",
+        count: entry.count,
+      });
+      return res.status(429).send(renderAcceptanceErrorPage("Too many requests", "Please wait before trying again."));
+    }
+  } else if (isPost) {
+    const entry = acceptanceRateLimitStorePost.get(ip) || { windowStart: now, count: 0 };
+
+    // Reset window if expired
+    if (now - entry.windowStart > RL_ACCEPTANCE_POST_WINDOW_MS) {
+      entry.windowStart = now;
+      entry.count = 0;
+    }
+
+    entry.count += 1;
+    acceptanceRateLimitStorePost.set(ip, entry);
+
+    if (entry.count > RL_ACCEPTANCE_POST_MAX_ATTEMPTS) {
+      const requestId = req.requestId || "unknown";
+      logAdminEvent("warn", "invitation_acceptance_rate_limit", {
+        requestId: requestId,
+        ip: ip,
+        route: "/admin/invitations/accept",
+        method: "POST",
+        count: entry.count,
+      });
+      return res.status(429).send(renderAcceptanceErrorPage("Too many attempts", "Please wait before trying again."));
+    }
   }
 
   next();
@@ -122,9 +158,14 @@ setInterval(() => {
       loginRateLimitStore.delete(ip);
     }
   }
-  for (const [ip, entry] of acceptanceRateLimitStore.entries()) {
-    if (now - entry.windowStart > RL_ACCEPTANCE_WINDOW_MS * 2) {
-      acceptanceRateLimitStore.delete(ip);
+  for (const [ip, entry] of acceptanceRateLimitStoreGet.entries()) {
+    if (now - entry.windowStart > RL_ACCEPTANCE_GET_WINDOW_MS * 2) {
+      acceptanceRateLimitStoreGet.delete(ip);
+    }
+  }
+  for (const [ip, entry] of acceptanceRateLimitStorePost.entries()) {
+    if (now - entry.windowStart > RL_ACCEPTANCE_POST_WINDOW_MS * 2) {
+      acceptanceRateLimitStorePost.delete(ip);
     }
   }
 }, 60 * 1000); // Clean every minute
@@ -1029,16 +1070,35 @@ router.get("/clients/:clientId", requireAdminAuth, async (req, res) => {
             <th style="text-align: left; padding: 5px;">Email</th>
             <th style="text-align: left; padding: 5px;">Status</th>
             <th style="text-align: left; padding: 5px;">Expires</th>
+            ${isSuperAdmin(req) ? '<th style="text-align: left; padding: 5px;">Actions</th>' : ''}
           </tr>
         </thead>
         <tbody>
           ${invitations.map(inv => {
             const expiresAt = inv.expires_at ? new Date(inv.expires_at).toLocaleDateString() : 'N/A';
+            const canResend = isSuperAdmin(req) && inv.status === 'pending' && (!inv.expires_at || new Date(inv.expires_at) > new Date());
+            const canRevoke = isSuperAdmin(req) && inv.status === 'pending';
             return `
           <tr style="border-bottom: 1px solid #eee;">
             <td style="padding: 5px;">${escapeHtml(inv.email)}</td>
             <td style="padding: 5px;">${escapeHtml(inv.status)}</td>
             <td style="padding: 5px;">${escapeHtml(expiresAt)}</td>
+            ${isSuperAdmin(req) ? `
+            <td style="padding: 5px;">
+              ${canResend ? `
+              <form method="POST" action="/admin/invitations/${escapeHtml(inv.id)}/resend" style="display: inline-block; margin-right: 5px;">
+                <input type="hidden" name="csrfToken" value="${csrfToken}">
+                <button type="submit" style="background: #007bff; color: white; border: none; padding: 4px 8px; cursor: pointer; font-size: 12px;">Resend</button>
+              </form>
+              ` : ''}
+              ${canRevoke ? `
+              <form method="POST" action="/admin/invitations/${escapeHtml(inv.id)}/revoke" style="display: inline-block;" onsubmit="return confirm('Are you sure you want to revoke this invitation?');">
+                <input type="hidden" name="csrfToken" value="${csrfToken}">
+                <button type="submit" style="background: #dc3545; color: white; border: none; padding: 4px 8px; cursor: pointer; font-size: 12px;">Revoke</button>
+              </form>
+              ` : ''}
+            </td>
+            ` : ''}
           </tr>`;
           }).join('')}
         </tbody>
@@ -1831,6 +1891,338 @@ router.delete("/users/:userId", requireAdminAuth, requireCsrf, async (req, res) 
     return res.status(500).json({
       error: "System error",
       message: "An error occurred while deleting the user",
+    });
+  }
+});
+
+// POST /admin/invitations/:id/resend - Resend invitation email (super_admin only)
+router.post("/invitations/:id/resend", requireAdminAuth, requireCsrf, async (req, res) => {
+  const requestId = req.requestId || "unknown";
+  const ip = getClientIp(req);
+  const invitationId = req.params.id;
+
+  // Authorization check: only super_admin can resend invitations
+  if (!isSuperAdmin(req)) {
+    logAdminEvent("warn", "admin_invitation_resend_denied", {
+      requestId: requestId,
+      ip: ip,
+      invitationId: invitationId,
+      userEmail: req.session?.admin?.email || "unknown",
+      reason: "not_super_admin",
+    });
+    return res.status(403).json({
+      error: "Access denied",
+      message: "Only super administrators can resend invitations",
+    });
+  }
+
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    return res.status(500).json({
+      error: "System error",
+      message: "Database not available",
+    });
+  }
+
+  try {
+    // Lookup invitation
+    const { data: invitation, error: lookupError } = await supabase
+      .from("client_invitations")
+      .select("id, email, client_id, role, status, expires_at, created_by_user_id")
+      .eq("id", invitationId)
+      .maybeSingle();
+
+    if (lookupError || !invitation) {
+      logAdminEvent("warn", "admin_invitation_resend_not_found", {
+        requestId: requestId,
+        ip: ip,
+        invitationId: invitationId,
+      });
+      return res.status(404).json({
+        error: "Invitation not found",
+        message: "Invitation does not exist",
+      });
+    }
+
+    // Only allow resend if status is pending and not expired
+    const now = new Date();
+    const expiresAt = new Date(invitation.expires_at);
+    const isExpired = expiresAt <= now;
+
+    if (invitation.status !== "pending") {
+      return res.status(400).json({
+        error: "Cannot resend",
+        message: `Cannot resend invitation with status: ${invitation.status}`,
+      });
+    }
+
+    if (isExpired) {
+      return res.status(400).json({
+        error: "Cannot resend",
+        message: "Invitation has expired",
+      });
+    }
+
+    // Generate a new token for the resend (we need raw token for email)
+    // Note: We keep the same token_hash in DB, but generate a new raw token for email
+    // Actually, we can't regenerate a matching token - we'd need to store the raw token somewhere
+    // OR: we need to regenerate both token and hash, but then old link won't work
+    // Better approach: Keep existing token_hash, but we can't send email with old token
+    // For now, generate new token and hash, update the hash in DB, send email with new token
+    // This invalidates the old link, which is acceptable for resend operation
+    const { generateInvitationToken } = require("../lib/clientInvitations");
+    const { token, tokenHash } = await generateInvitationToken();
+
+    // Update token_hash in database (this invalidates old link)
+    const { error: updateError } = await supabase
+      .from("client_invitations")
+      .update({ token_hash: tokenHash })
+      .eq("id", invitationId)
+      .eq("status", "pending"); // Only update if still pending
+
+    if (updateError) {
+      logAdminEvent("error", "admin_invitation_resend_update_error", {
+        requestId: requestId,
+        ip: ip,
+        invitationId: invitationId,
+        error: updateError?.message || String(updateError),
+      });
+      return res.status(500).json({
+        error: "Resend failed",
+        message: "Failed to update invitation",
+      });
+    }
+
+    // Construct base URL for acceptance link
+    const protocol = req.protocol || "https";
+    const host = req.get("host") || req.headers.host || "localhost";
+    const baseUrl = `${protocol}://${host}`;
+
+    // Send email (fail-safe: email failure does not rollback token update)
+    const emailResult = await sendInvitationEmail({
+      to: invitation.email,
+      client_id: invitation.client_id,
+      invite_id: invitation.id,
+      token: token, // New token for resend
+      baseUrl: baseUrl,
+      requestId: requestId,
+    });
+
+    // Log audit entry (fail-safe)
+    const actorUserId = req.session?.admin?.authz?.userId || null;
+    const actorEmail = req.session?.admin?.email || null;
+    const actorRole = req.session?.admin?.authz?.role || null;
+
+    await logInvitationAudit({
+      invitationId: invitation.id,
+      clientId: invitation.client_id,
+      actorUserId: actorUserId,
+      actorEmail: actorEmail,
+      actorRole: actorRole,
+      action: "resent",
+      beforeStatus: "pending",
+      afterStatus: "pending",
+      meta: {
+        requestId: requestId,
+        emailSent: emailResult.success,
+        emailError: emailResult.error || null,
+        ip: ip,
+      },
+    });
+
+    if (!emailResult.success) {
+      // Email failed but invitation token was updated
+      logAdminEvent("warn", "admin_invitation_resend_email_failed", {
+        requestId: requestId,
+        ip: ip,
+        invitationId: invitation.id,
+        email: invitation.email,
+        emailError: emailResult.error || "unknown",
+        note: "Invitation token updated but email sending failed",
+      });
+      return res.status(200).json({
+        success: true,
+        message: "Invitation token updated, but email failed to send",
+        emailSent: false,
+        emailError: emailResult.error,
+      });
+    }
+
+    logAdminEvent("info", "admin_invitation_resend_success", {
+      requestId: requestId,
+      ip: ip,
+      invitationId: invitation.id,
+      email: invitation.email,
+      clientId: invitation.client_id,
+      resentBy: actorEmail || "unknown",
+    });
+
+    // Check if this is a form submission (redirect) or API call (JSON)
+    const isFormSubmission = req.headers["content-type"]?.includes("application/x-www-form-urlencoded");
+    if (isFormSubmission) {
+      return res.redirect(`/admin/clients/${encodeURIComponent(invitation.client_id)}?invite_resent=1&invite_email=${encodeURIComponent(invitation.email)}`);
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Invitation email resent successfully",
+      emailSent: true,
+    });
+  } catch (error) {
+    logAdminEvent("error", "admin_invitation_resend_error", {
+      requestId: requestId,
+      ip: ip,
+      invitationId: invitationId,
+      error: error?.message || String(error),
+      stack: error?.stack ? String(error.stack).slice(0, 500) : null,
+    });
+    return res.status(500).json({
+      error: "System error",
+      message: "An error occurred while resending the invitation",
+    });
+  }
+});
+
+// POST /admin/invitations/:id/revoke - Revoke invitation (super_admin only)
+router.post("/invitations/:id/revoke", requireAdminAuth, requireCsrf, async (req, res) => {
+  const requestId = req.requestId || "unknown";
+  const ip = getClientIp(req);
+  const invitationId = req.params.id;
+
+  // Authorization check: only super_admin can revoke invitations
+  if (!isSuperAdmin(req)) {
+    logAdminEvent("warn", "admin_invitation_revoke_denied", {
+      requestId: requestId,
+      ip: ip,
+      invitationId: invitationId,
+      userEmail: req.session?.admin?.email || "unknown",
+      reason: "not_super_admin",
+    });
+    return res.status(403).json({
+      error: "Access denied",
+      message: "Only super administrators can revoke invitations",
+    });
+  }
+
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    return res.status(500).json({
+      error: "System error",
+      message: "Database not available",
+    });
+  }
+
+  try {
+    // Lookup invitation
+    const { data: invitation, error: lookupError } = await supabase
+      .from("client_invitations")
+      .select("id, email, client_id, role, status")
+      .eq("id", invitationId)
+      .maybeSingle();
+
+    if (lookupError || !invitation) {
+      logAdminEvent("warn", "admin_invitation_revoke_not_found", {
+        requestId: requestId,
+        ip: ip,
+        invitationId: invitationId,
+      });
+      return res.status(404).json({
+        error: "Invitation not found",
+        message: "Invitation does not exist",
+      });
+    }
+
+    // If already accepted, do not allow revoke
+    if (invitation.status === "accepted") {
+      return res.status(400).json({
+        error: "Cannot revoke",
+        message: "Cannot revoke an accepted invitation",
+      });
+    }
+
+    // If already revoked or expired, idempotent response (200)
+    if (invitation.status === "revoked" || invitation.status === "expired") {
+      return res.status(200).json({
+        success: true,
+        message: `Invitation is already ${invitation.status}`,
+        status: invitation.status,
+      });
+    }
+
+    // Update status to revoked
+    const beforeStatus = invitation.status;
+    const { error: updateError } = await supabase
+      .from("client_invitations")
+      .update({ status: "revoked" })
+      .eq("id", invitationId)
+      .neq("status", "accepted") // Do not update if already accepted
+      .neq("status", "revoked"); // Idempotent: do not update if already revoked
+
+    if (updateError) {
+      logAdminEvent("error", "admin_invitation_revoke_update_error", {
+        requestId: requestId,
+        ip: ip,
+        invitationId: invitationId,
+        error: updateError?.message || String(updateError),
+      });
+      return res.status(500).json({
+        error: "Revoke failed",
+        message: "Failed to update invitation status",
+      });
+    }
+
+    // Log audit entry (fail-safe)
+    const actorUserId = req.session?.admin?.authz?.userId || null;
+    const actorEmail = req.session?.admin?.email || null;
+    const actorRole = req.session?.admin?.authz?.role || null;
+
+    await logInvitationAudit({
+      invitationId: invitation.id,
+      clientId: invitation.client_id,
+      actorUserId: actorUserId,
+      actorEmail: actorEmail,
+      actorRole: actorRole,
+      action: "revoked",
+      beforeStatus: beforeStatus,
+      afterStatus: "revoked",
+      meta: {
+        requestId: requestId,
+        ip: ip,
+      },
+    });
+
+    logAdminEvent("info", "admin_invitation_revoke_success", {
+      requestId: requestId,
+      ip: ip,
+      invitationId: invitation.id,
+      email: invitation.email,
+      clientId: invitation.client_id,
+      beforeStatus: beforeStatus,
+      revokedBy: actorEmail || "unknown",
+    });
+
+    // Check if this is a form submission (redirect) or API call (JSON)
+    const isFormSubmission = req.headers["content-type"]?.includes("application/x-www-form-urlencoded");
+    if (isFormSubmission) {
+      return res.redirect(`/admin/clients/${encodeURIComponent(invitation.client_id)}?invite_revoked=1&invite_email=${encodeURIComponent(invitation.email)}`);
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Invitation revoked successfully",
+      status: "revoked",
+    });
+  } catch (error) {
+    logAdminEvent("error", "admin_invitation_revoke_error", {
+      requestId: requestId,
+      ip: ip,
+      invitationId: invitationId,
+      error: error?.message || String(error),
+      stack: error?.stack ? String(error.stack).slice(0, 500) : null,
+    });
+    return res.status(500).json({
+      error: "System error",
+      message: "An error occurred while revoking the invitation",
     });
   }
 });
