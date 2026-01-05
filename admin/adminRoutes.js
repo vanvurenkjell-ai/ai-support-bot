@@ -2913,7 +2913,6 @@ router.get("/analytics/health", requireAdminAuth, requireCsrf, async (req, res) 
     const testQueryText = `['advantum-prod-log']
 | where event == "request_end"
 | where route == "/chat"
-| where _time >= datetime("${startDate.toISOString()}") and _time <= datetime("${endDate.toISOString()}")
 | summarize totalChats = count()`;
 
     const { runQuery } = require("../lib/axiomClient");
