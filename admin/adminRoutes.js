@@ -20,6 +20,8 @@ const { validateInvitationToken, acceptInvitation, validatePasswordStrength } = 
 const { logInvitationAudit } = require("../lib/invitationAudit");
 // Import email sender
 const { sendInvitationEmail } = require("../lib/emailSender");
+// Import analytics service
+const { executeQuery, getDefaultDateRange, validateDateRange, QUERY_DEFINITIONS } = require("../lib/clientAnalytics");
 
 // Simple logging helper (matches index.js pattern for structured logs)
 function logAdminEvent(level, event, fields) {
@@ -48,6 +50,11 @@ const RL_ACCEPTANCE_POST_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 const RL_ACCEPTANCE_POST_MAX_ATTEMPTS = 5;
 const acceptanceRateLimitStoreGet = new Map();
 const acceptanceRateLimitStorePost = new Map();
+
+// Rate limiting for analytics endpoints: 20 requests per 5 minutes per IP
+const RL_ANALYTICS_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+const RL_ANALYTICS_MAX_ATTEMPTS = 20;
+const analyticsRateLimitStore = new Map();
 
 function getClientIp(req) {
   return req.ip || "unknown";
@@ -150,6 +157,49 @@ function rateLimitAcceptance(req, res, next) {
   next();
 }
 
+// Rate limiting for analytics endpoints
+function rateLimitAnalytics(req, res, next) {
+  if (req.path !== "/admin/analytics" || req.method !== "GET") {
+    return next();
+  }
+
+  const ip = getClientIp(req);
+  const now = Date.now();
+  const entry = analyticsRateLimitStore.get(ip) || { windowStart: now, count: 0 };
+
+  // Reset window if expired
+  if (now - entry.windowStart > RL_ANALYTICS_WINDOW_MS) {
+    entry.windowStart = now;
+    entry.count = 0;
+  }
+
+  entry.count += 1;
+  analyticsRateLimitStore.set(ip, entry);
+
+  if (entry.count > RL_ANALYTICS_MAX_ATTEMPTS) {
+    const requestId = req.requestId || "unknown";
+    logAdminEvent("warn", "admin_analytics_rate_limit", {
+      requestId: requestId,
+      ip: ip,
+      route: "/admin/analytics",
+      count: entry.count,
+    });
+    return res.status(429).send(`
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Rate Limit</title></head>
+<body>
+  <h1>Too Many Requests</h1>
+  <p>Please wait before accessing analytics again.</p>
+  <p><a href="/admin">Back to dashboard</a></p>
+</body>
+</html>
+    `);
+  }
+
+  next();
+}
+
 // Cleanup old rate limit entries
 setInterval(() => {
   const now = Date.now();
@@ -166,6 +216,11 @@ setInterval(() => {
   for (const [ip, entry] of acceptanceRateLimitStorePost.entries()) {
     if (now - entry.windowStart > RL_ACCEPTANCE_POST_WINDOW_MS * 2) {
       acceptanceRateLimitStorePost.delete(ip);
+    }
+  }
+  for (const [ip, entry] of analyticsRateLimitStore.entries()) {
+    if (now - entry.windowStart > RL_ANALYTICS_WINDOW_MS * 2) {
+      analyticsRateLimitStore.delete(ip);
     }
   }
 }, 60 * 1000); // Clean every minute
@@ -185,6 +240,7 @@ router.use(adminSecurityHeaders);
 
 // Rate limiting for acceptance endpoint (must be before routes, applies to public endpoint)
 router.use(rateLimitAcceptance);
+router.use(rateLimitAnalytics);
 
 // Parse URL-encoded form data (for login/logout forms and client config forms)
 router.use(express.urlencoded({ extended: true }));
@@ -610,8 +666,9 @@ async function deleteClientSafe(clientId) {
 // Helper: Render navigation HTML
 function renderNav(currentPage = "dashboard", csrfToken) {
   const navItems = [
-    { path: "/admin", label: "Dashboard", active: currentPage === "dashboard" },
     { path: "/admin/clients", label: "Clients", active: currentPage === "clients" },
+    { path: "/admin/analytics", label: "Analytics", active: currentPage === "analytics" },
+    { path: "/admin", label: "Dashboard", active: currentPage === "dashboard" },
   ];
   return `
     <nav style="margin-bottom: 20px; border-bottom: 1px solid #ccc; padding-bottom: 10px;">
@@ -2380,6 +2437,454 @@ router.post("/invitations/:id/revoke", requireAdminAuth, requireCsrf, async (req
       message: "An error occurred while revoking the invitation",
     });
   }
+});
+
+// Analytics page (GET /admin/analytics)
+router.get("/analytics", requireAdminAuth, async (req, res) => {
+  const requestId = req.requestId || "unknown";
+  const ip = getClientIp(req);
+  const userEmail = req.session?.admin?.email || null;
+  const userRole = req.session?.admin?.authz?.role || null;
+  const isSuperAdminUser = isSuperAdmin(req);
+
+  // Determine client selection (server-side, never user-controlled)
+  const authorizedClientIds = getAuthorizedClientIds(req) || [];
+  let selectedClientId = req.query.clientId || null;
+
+  // For client_admin: must use one of their authorized clients
+  if (!isSuperAdminUser) {
+    if (authorizedClientIds.length === 0) {
+      logAdminEvent("warn", "admin_analytics_no_clients", {
+        requestId: requestId,
+        ip: ip,
+        userEmail: userEmail,
+        reason: "no_authorized_clients",
+      });
+      const csrfToken = generateCsrfToken();
+      setCsrfToken(req, csrfToken);
+      return res.status(403).send(`
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Access Denied</title></head>
+<body>
+  <h1>Access Denied</h1>
+  <p>You do not have access to any clients.</p>
+  <p><a href="/admin">Back to dashboard</a></p>
+</body>
+</html>
+      `);
+    }
+
+    // Auto-select if only one client
+    if (authorizedClientIds.length === 1) {
+      selectedClientId = authorizedClientIds[0];
+    } else {
+      // Multiple clients: validate selection
+      if (selectedClientId && !authorizedClientIds.includes(selectedClientId)) {
+        logAdminEvent("warn", "admin_analytics_unauthorized_client", {
+          requestId: requestId,
+          ip: ip,
+          userEmail: userEmail,
+          attemptedClientId: selectedClientId,
+          authorizedClientIds: authorizedClientIds,
+        });
+        selectedClientId = null; // Reset to first authorized
+      }
+      if (!selectedClientId) {
+        selectedClientId = authorizedClientIds[0]; // Default to first
+      }
+    }
+  } else {
+    // Super admin: can select any client (for now, default to first if not specified)
+    // In future, could add client selector UI
+    if (!selectedClientId && authorizedClientIds.length > 0) {
+      selectedClientId = authorizedClientIds[0];
+    }
+  }
+
+  if (!selectedClientId) {
+    logAdminEvent("warn", "admin_analytics_no_client_selected", {
+      requestId: requestId,
+      ip: ip,
+      userEmail: userEmail,
+    });
+    const csrfToken = generateCsrfToken();
+    setCsrfToken(req, csrfToken);
+    return res.status(400).send(`
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Error</title></head>
+<body>
+  <h1>Error</h1>
+  <p>No client selected.</p>
+  <p><a href="/admin">Back to dashboard</a></p>
+</body>
+</html>
+    `);
+  }
+
+  // Validate client access (fail-closed)
+  if (!canAccessClient(req, selectedClientId)) {
+    logAdminEvent("warn", "admin_analytics_access_denied", {
+      requestId: requestId,
+      ip: ip,
+      userEmail: userEmail,
+      clientId: selectedClientId,
+      reason: "not_authorized",
+    });
+    const csrfToken = generateCsrfToken();
+    setCsrfToken(req, csrfToken);
+    return res.status(403).send(`
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Access Denied</title></head>
+<body>
+  <h1>Access Denied</h1>
+  <p>You do not have permission to view analytics for this client.</p>
+  <p><a href="/admin">Back to dashboard</a></p>
+</body>
+</html>
+    `);
+  }
+
+  // Parse date ranges from query params (with defaults)
+  const kpiRangeDays = parseInt(req.query.kpiRange) || 30;
+  const trendsRangeDays = parseInt(req.query.trendsRange) || 30;
+  const reasonsRangeDays = parseInt(req.query.reasonsRange) || 90;
+  const intentsRangeDays = parseInt(req.query.intentsRange) || 90;
+
+  // Build date ranges
+  const now = new Date();
+  const kpiEndDate = new Date(now);
+  const kpiStartDate = new Date(now);
+  kpiStartDate.setDate(kpiStartDate.getDate() - kpiRangeDays);
+
+  const trendsEndDate = new Date(now);
+  const trendsStartDate = new Date(now);
+  trendsStartDate.setDate(trendsStartDate.getDate() - trendsRangeDays);
+
+  const reasonsEndDate = new Date(now);
+  const reasonsStartDate = new Date(now);
+  reasonsStartDate.setDate(reasonsStartDate.getDate() - reasonsRangeDays);
+
+  const intentsEndDate = new Date(now);
+  const intentsStartDate = new Date(now);
+  intentsStartDate.setDate(intentsStartDate.getDate() - intentsRangeDays);
+
+  // Validate date ranges
+  const kpiValidation = validateDateRange(kpiStartDate, kpiEndDate);
+  const trendsValidation = validateDateRange(trendsStartDate, trendsEndDate);
+  const reasonsValidation = validateDateRange(reasonsStartDate, reasonsEndDate);
+  const intentsValidation = validateDateRange(intentsStartDate, intentsEndDate);
+
+  if (!kpiValidation.valid || !trendsValidation.valid || !reasonsValidation.valid || !intentsValidation.valid) {
+    logAdminEvent("warn", "admin_analytics_invalid_date_range", {
+      requestId: requestId,
+      ip: ip,
+      userEmail: userEmail,
+      clientId: selectedClientId,
+      errors: {
+        kpi: kpiValidation.error,
+        trends: trendsValidation.error,
+        reasons: reasonsValidation.error,
+        intents: intentsValidation.error,
+      },
+    });
+    const csrfToken = generateCsrfToken();
+    setCsrfToken(req, csrfToken);
+    return res.status(400).send(`
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Invalid Date Range</title></head>
+<body>
+  <h1>Invalid Date Range</h1>
+  <p>One or more date ranges are invalid. Date ranges must be between 7 and 90 days.</p>
+  <p><a href="/admin/analytics">Try again</a></p>
+</body>
+</html>
+    `);
+  }
+
+  // Execute queries (fail-safe: empty results on error)
+  let kpiData = {};
+  let trendsData = {};
+  let escalationData = {};
+  let intentData = {};
+
+  try {
+    // Headline KPIs (using kpi date range)
+    const [totalChats, botHandledPct, totalEscalations, moneySaved, avgResponseTimeData] = await Promise.all([
+      executeQuery("total_chats_v1", selectedClientId, kpiStartDate, kpiEndDate).catch(() => ({ totalChats: 0 })),
+      executeQuery("bot_handled_pct_v1", selectedClientId, kpiStartDate, kpiEndDate).catch(() => ({ botHandledPct: 0 })),
+      executeQuery("total_escalations_v1", selectedClientId, kpiStartDate, kpiEndDate).catch(() => ({ totalEscalations: 0 })),
+      executeQuery("money_saved_total_v1", selectedClientId, kpiStartDate, kpiEndDate).catch(() => ({ estimatedSavedEUR: 0, estimatedSavedEURDisplay: "€0.00" })),
+      executeQuery("avg_response_time_by_day_v1", selectedClientId, kpiStartDate, kpiEndDate).catch(() => ({ series: [], weightedAvg: 0 })),
+    ]);
+
+    kpiData = {
+      totalChats: totalChats.totalChats || 0,
+      botHandledPct: botHandledPct.botHandledPct || 0,
+      totalEscalations: totalEscalations.totalEscalations || 0,
+      moneySaved: moneySaved.estimatedSavedEURDisplay || "€0.00",
+      avgResponseTime: avgResponseTimeData.weightedAvg || 0,
+    };
+
+    // Volume & Trends (using trends date range)
+    const [chatsPerDay, botHandlingOverTime, escalationsPerDay, moneySavedPerDay, avgResponseTimeSeries] = await Promise.all([
+      executeQuery("chats_per_day_v1", selectedClientId, trendsStartDate, trendsEndDate).catch(() => ({ series: [] })),
+      executeQuery("bot_handling_over_time_v1", selectedClientId, trendsStartDate, trendsEndDate).catch(() => ({ series: [] })),
+      executeQuery("escalations_per_day_v1", selectedClientId, trendsStartDate, trendsEndDate).catch(() => ({ series: [] })),
+      executeQuery("money_saved_per_day_v1", selectedClientId, trendsStartDate, trendsEndDate).catch(() => ({ series: [] })),
+      executeQuery("avg_response_time_by_day_v1", selectedClientId, trendsStartDate, trendsEndDate).catch(() => ({ series: [] })),
+    ]);
+
+    trendsData = {
+      chatsPerDay: chatsPerDay.series || [],
+      botHandlingOverTime: botHandlingOverTime.series || [],
+      escalationsPerDay: escalationsPerDay.series || [],
+      moneySavedPerDay: moneySavedPerDay.series || [],
+      avgResponseTimeSeries: avgResponseTimeSeries.series || [],
+    };
+
+    // Escalation Insights (using reasons date range for breakdown, kpi range for rate)
+    const [escalationRate, escalationReasons] = await Promise.all([
+      executeQuery("escalation_rate_pct_v1", selectedClientId, kpiStartDate, kpiEndDate).catch(() => ({ escalationPercentage: 0 })),
+      executeQuery("escalation_reasons_breakdown_v1", selectedClientId, reasonsStartDate, reasonsEndDate).catch(() => ({ breakdown: [] })),
+    ]);
+
+    escalationData = {
+      escalationRate: escalationRate.escalationPercentage || 0,
+      reasonsBreakdown: escalationReasons.breakdown || [],
+    };
+
+    // Intent & Usage (using intents date range)
+    const topIntents = await executeQuery("top_intents_v1", selectedClientId, intentsStartDate, intentsEndDate).catch(() => ({ intents: [] }));
+    intentData = {
+      topIntents: topIntents.intents || [],
+    };
+
+    logAdminEvent("info", "admin_analytics_view", {
+      requestId: requestId,
+      ip: ip,
+      userEmail: userEmail,
+      clientId: selectedClientId,
+      kpiRangeDays: kpiRangeDays,
+      trendsRangeDays: trendsRangeDays,
+      reasonsRangeDays: reasonsRangeDays,
+      intentsRangeDays: intentsRangeDays,
+    });
+  } catch (error) {
+    logAdminEvent("error", "admin_analytics_query_error", {
+      requestId: requestId,
+      ip: ip,
+      userEmail: userEmail,
+      clientId: selectedClientId,
+      error: error?.message || String(error),
+      stack: error?.stack ? String(error.stack).slice(0, 500) : null,
+    });
+    // Continue with empty data (fail-safe)
+  }
+
+  const csrfToken = generateCsrfToken();
+  setCsrfToken(req, csrfToken);
+
+  // Render analytics page
+  const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Analytics - ${escapeHtml(selectedClientId)}</title>
+  <style>
+    body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; margin: 20px; background: #f5f5f5; }
+    .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    h1 { margin-top: 0; }
+    h2 { border-bottom: 2px solid #007bff; padding-bottom: 5px; margin-top: 30px; }
+    h3 { margin-top: 20px; color: #555; }
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }
+    .kpi-card { background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; padding: 15px; text-align: center; }
+    .kpi-value { font-size: 2em; font-weight: bold; color: #007bff; margin: 10px 0; }
+    .kpi-label { color: #666; font-size: 0.9em; }
+    .date-range-selector { margin: 20px 0; padding: 15px; background: #f8f9fa; border-radius: 4px; }
+    .date-range-selector label { margin-right: 10px; }
+    .date-range-selector select { padding: 5px; margin-right: 15px; }
+    .date-range-selector button { padding: 5px 15px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+    table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+    table th, table td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+    table th { background: #f8f9fa; font-weight: bold; }
+    .empty-state { padding: 40px; text-align: center; color: #666; }
+    .client-selector { margin: 20px 0; }
+    .client-selector select { padding: 5px 10px; font-size: 1em; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Analytics</h1>
+    <p style="color: #666; font-size: 0.9em;">Logged in as <strong>${escapeHtml(userEmail)}</strong></p>
+    ${renderNav("analytics", csrfToken)}
+    
+    ${authorizedClientIds.length > 1 ? `
+    <div class="client-selector">
+      <label>Client: 
+        <select onchange="window.location.href='/admin/analytics?clientId=' + this.value">
+          ${authorizedClientIds.map(id => `
+            <option value="${escapeHtml(id)}" ${id === selectedClientId ? "selected" : ""}>${escapeHtml(id)}</option>
+          `).join("")}
+        </select>
+      </label>
+    </div>
+    ` : `<p><strong>Client:</strong> ${escapeHtml(selectedClientId)}</p>`}
+
+    <div class="date-range-selector">
+      <form method="GET" action="/admin/analytics" style="display: inline;">
+        ${authorizedClientIds.length > 1 ? `<input type="hidden" name="clientId" value="${escapeHtml(selectedClientId)}">` : ""}
+        <label>KPIs & Trends Range:</label>
+        <select name="kpiRange">
+          <option value="7" ${kpiRangeDays === 7 ? "selected" : ""}>Last 7 days</option>
+          <option value="30" ${kpiRangeDays === 30 ? "selected" : ""}>Last 30 days</option>
+          <option value="60" ${kpiRangeDays === 60 ? "selected" : ""}>Last 60 days</option>
+          <option value="90" ${kpiRangeDays === 90 ? "selected" : ""}>Last 90 days</option>
+        </select>
+        <input type="hidden" name="trendsRange" value="${kpiRangeDays}">
+        <label>Reasons & Intents Range:</label>
+        <select name="reasonsRange">
+          <option value="30" ${reasonsRangeDays === 30 ? "selected" : ""}>Last 30 days</option>
+          <option value="60" ${reasonsRangeDays === 60 ? "selected" : ""}>Last 60 days</option>
+          <option value="90" ${reasonsRangeDays === 90 ? "selected" : ""}>Last 90 days</option>
+        </select>
+        <input type="hidden" name="intentsRange" value="${reasonsRangeDays}">
+        <button type="submit">Update</button>
+      </form>
+    </div>
+
+    <h2>Headline KPIs (Last ${kpiRangeDays} days)</h2>
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-label">Total Conversations</div>
+        <div class="kpi-value">${kpiData.totalChats || 0}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Bot Handling Rate</div>
+        <div class="kpi-value">${(kpiData.botHandledPct || 0).toFixed(1)}%</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Total Escalations</div>
+        <div class="kpi-value">${kpiData.totalEscalations || 0}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Estimated Money Saved</div>
+        <div class="kpi-value">${kpiData.moneySaved || "€0.00"}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Average Response Time</div>
+        <div class="kpi-value">${kpiData.avgResponseTime || 0}ms</div>
+      </div>
+    </div>
+
+    <h2>Volume & Trends (Last ${trendsRangeDays} days)</h2>
+    ${trendsData.chatsPerDay && trendsData.chatsPerDay.length > 0 ? `
+    <h3>Chats per Day</h3>
+    <table>
+      <thead><tr><th>Date</th><th>Chats</th></tr></thead>
+      <tbody>
+        ${trendsData.chatsPerDay.map(item => `
+          <tr><td>${item.date ? new Date(item.date).toLocaleDateString() : "N/A"}</td><td>${item.chats || 0}</td></tr>
+        `).join("")}
+      </tbody>
+    </table>
+    ` : `<div class="empty-state">No data for selected period.</div>`}
+
+    ${trendsData.botHandlingOverTime && trendsData.botHandlingOverTime.length > 0 ? `
+    <h3>Bot Handling Rate Over Time</h3>
+    <table>
+      <thead><tr><th>Date</th><th>Bot Handling Rate</th><th>Bot Handled</th><th>Escalated</th><th>Total</th></tr></thead>
+      <tbody>
+        ${trendsData.botHandlingOverTime.map(item => `
+          <tr>
+            <td>${item.date ? new Date(item.date).toLocaleDateString() : "N/A"}</td>
+            <td>${(item.botHandlingRatePct || 0).toFixed(1)}%</td>
+            <td>${item.botHandledChats || 0}</td>
+            <td>${item.escalatedChats || 0}</td>
+            <td>${item.totalChats || 0}</td>
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>
+    ` : `<div class="empty-state">No data for selected period.</div>`}
+
+    ${trendsData.escalationsPerDay && trendsData.escalationsPerDay.length > 0 ? `
+    <h3>Escalations per Day</h3>
+    <table>
+      <thead><tr><th>Date</th><th>Escalations</th></tr></thead>
+      <tbody>
+        ${trendsData.escalationsPerDay.map(item => `
+          <tr><td>${item.date ? new Date(item.date).toLocaleDateString() : "N/A"}</td><td>${item.escalations || 0}</td></tr>
+        `).join("")}
+      </tbody>
+    </table>
+    ` : `<div class="empty-state">No data for selected period.</div>`}
+
+    ${trendsData.moneySavedPerDay && trendsData.moneySavedPerDay.length > 0 ? `
+    <h3>Money Saved per Day</h3>
+    <table>
+      <thead><tr><th>Date</th><th>Money Saved</th></tr></thead>
+      <tbody>
+        ${trendsData.moneySavedPerDay.map(item => `
+          <tr><td>${item.date ? new Date(item.date).toLocaleDateString() : "N/A"}</td><td>${item.estimatedSavedEUR || "€0.00"}</td></tr>
+        `).join("")}
+      </tbody>
+    </table>
+    ` : `<div class="empty-state">No data for selected period.</div>`}
+
+    ${trendsData.avgResponseTimeSeries && trendsData.avgResponseTimeSeries.length > 0 ? `
+    <h3>Average Response Time per Day</h3>
+    <table>
+      <thead><tr><th>Date</th><th>Avg Response Time (ms)</th></tr></thead>
+      <tbody>
+        ${trendsData.avgResponseTimeSeries.map(item => `
+          <tr><td>${item.date ? new Date(item.date).toLocaleDateString() : "N/A"}</td><td>${item.avgLatencyMs || 0}</td></tr>
+        `).join("")}
+      </tbody>
+    </table>
+    ` : `<div class="empty-state">No data for selected period.</div>`}
+
+    <h2>Escalation Insights</h2>
+    <div class="kpi-card" style="max-width: 300px;">
+      <div class="kpi-label">Escalation Rate (Last ${kpiRangeDays} days)</div>
+      <div class="kpi-value">${(escalationData.escalationRate || 0).toFixed(1)}%</div>
+    </div>
+
+    ${escalationData.reasonsBreakdown && escalationData.reasonsBreakdown.length > 0 ? `
+    <h3>Escalation Reasons Breakdown (Last ${reasonsRangeDays} days)</h3>
+    <table>
+      <thead><tr><th>Reason</th><th>Escalations</th></tr></thead>
+      <tbody>
+        ${escalationData.reasonsBreakdown.map(item => `
+          <tr><td>${escapeHtml(item.reason || "Unknown")}</td><td>${item.escalations || 0}</td></tr>
+        `).join("")}
+      </tbody>
+    </table>
+    ` : `<div class="empty-state">No escalation data for selected period.</div>`}
+
+    <h2>Intent & Usage</h2>
+    ${intentData.topIntents && intentData.topIntents.length > 0 ? `
+    <h3>Top Customer Intents (Last ${intentsRangeDays} days)</h3>
+    <table>
+      <thead><tr><th>Intent</th><th>Chats</th></tr></thead>
+      <tbody>
+        ${intentData.topIntents.map(item => `
+          <tr><td>${escapeHtml(item.intent || "Unknown")}</td><td>${item.chats || 0}</td></tr>
+        `).join("")}
+      </tbody>
+    </table>
+    ` : `<div class="empty-state">No intent data for selected period.</div>`}
+  </div>
+</body>
+</html>
+  `;
+
+  res.send(html);
 });
 
 module.exports = router;
