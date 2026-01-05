@@ -622,7 +622,7 @@ function renderNav(currentPage = "dashboard", csrfToken) {
       `).join("")}
       <form method="POST" action="/admin/logout" style="display: inline; margin-left: 15px;">
         <input type="hidden" name="csrfToken" value="${csrfToken}">
-        <button type="submit" style="background: #dc3545; color: white; border: none; padding: 5px 10px; cursor: pointer;">Logout</button>
+        <button type="submit" style="background: transparent; color: #666; border: 1px solid #ccc; padding: 5px 10px; cursor: pointer; font-size: 0.9em;">Logout</button>
       </form>
     </nav>
   `;
@@ -649,6 +649,25 @@ router.get("/", requireAdminAuth, (req, res) => {
   setCsrfToken(req, csrfToken);
 
   const adminEmail = req.session?.admin?.email || ADMIN_EMAIL;
+  const userRole = req.session?.admin?.authz?.role || null;
+  const isClientAdmin = userRole === "client_admin";
+  
+  // For client_admin, get their first (and typically only) client
+  let primaryClientLink = "";
+  if (isClientAdmin) {
+    const authorizedClientIds = getAuthorizedClientIds(req) || [];
+    if (authorizedClientIds.length > 0) {
+      const primaryClientId = authorizedClientIds[0];
+      primaryClientLink = `
+  <div style="margin: 40px 0; padding: 30px; background: #f8f9fa; border: 2px solid #007bff; border-radius: 8px; text-align: center;">
+    <h2 style="margin-top: 0;">Manage Widget & Behavior</h2>
+    <p style="font-size: 1.1em; margin-bottom: 20px;">Configure your widget settings and customer experience.</p>
+    <a href="/admin/clients/${encodeURIComponent(primaryClientId)}" style="display: inline-block; background: #007bff; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; font-size: 16px; font-weight: bold;">Manage Widget & Behavior</a>
+  </div>
+      `;
+    }
+  }
+  
   const html = `
 <!DOCTYPE html>
 <html lang="en">
@@ -659,10 +678,11 @@ router.get("/", requireAdminAuth, (req, res) => {
 </head>
 <body>
   <h1>Admin Portal</h1>
-  <p>Logged in as <strong>${escapeHtml(adminEmail)}</strong></p>
+  <p style="color: #666; font-size: 0.9em;">Logged in as <strong>${escapeHtml(adminEmail)}</strong></p>
   ${renderNav("dashboard", csrfToken)}
   <h2>Dashboard</h2>
-  <p>Welcome to the admin portal. Use the navigation above to manage clients.</p>
+  ${primaryClientLink}
+  ${!isClientAdmin ? '<p>Welcome to the admin portal. Use the navigation above to manage clients.</p>' : ''}
 </body>
 </html>
   `;
@@ -721,8 +741,20 @@ router.get("/clients", requireAdminAuth, async (req, res) => {
   const successMessage = created ? '<p style="color: green; font-weight: bold;">✓ Client created successfully!</p>' : '';
   const deletedMessage = deleted ? '<p style="color: green; font-weight: bold;">✓ Client deleted successfully!</p>' : '';
   
+  const isClientAdminView = !isSuperAdmin(req);
+  
+  // For client_admin, make client items more prominent; for super_admin, keep list format
   const clientsList = clients.length > 0
-    ? `<ul>${clients.map(clientId => `<li><a href="/admin/clients/${encodeURIComponent(clientId)}">${escapeHtml(clientId)}</a></li>`).join("")}</ul>`
+    ? (isClientAdminView 
+        ? `<div style="display: grid; gap: 15px; margin-top: 20px;">
+            ${clients.map(clientId => `
+              <div style="padding: 20px; background: white; border: 2px solid #007bff; border-radius: 8px; text-align: center;">
+                <a href="/admin/clients/${encodeURIComponent(clientId)}" style="font-size: 1.5em; font-weight: bold; color: #007bff; text-decoration: none;">${escapeHtml(clientId)}</a>
+                <p style="margin-top: 10px; color: #666;">Manage widget settings and behavior</p>
+              </div>
+            `).join("")}
+          </div>`
+        : `<ul>${clients.map(clientId => `<li><a href="/admin/clients/${encodeURIComponent(clientId)}">${escapeHtml(clientId)}</a></li>`).join("")}</ul>`)
     : `<p>No clients found.</p>`;
 
   const html = `
@@ -735,14 +767,17 @@ router.get("/clients", requireAdminAuth, async (req, res) => {
 </head>
 <body>
   <h1>Admin Portal</h1>
+  <p style="color: #666; font-size: 0.9em;">Logged in as <strong>${escapeHtml(userEmail)}</strong></p>
   ${renderNav("clients", csrfToken)}
   <h2>Clients</h2>
   ${successMessage}
   ${deletedMessage}
+  ${isSuperAdmin(req) ? `
   <div style="margin-bottom: 20px; padding: 10px; background: #e7f3ff; border: 1px solid #b3d9ff; border-radius: 4px;">
     <p><strong>Config storage:</strong> <code>${escapeHtml(clientsStore.storeType === "supabase" ? "Supabase" : clientsRoot)}</code></p>
     <p style="margin-top: 5px; font-size: 0.9em; color: #666;">${clientsStore.storeType === "supabase" ? "Clients are stored in Supabase database." : "Clients created here are stored on the server; they will not appear in GitHub automatically."}</p>
   </div>
+  ` : ''}
   ${isSuperAdmin(req) ? `
   <h3>Create New Client</h3>
   <form method="POST" action="/admin/clients" style="margin-bottom: 30px; padding: 15px; border: 1px solid #ccc; max-width: 500px;">
@@ -757,7 +792,7 @@ router.get("/clients", requireAdminAuth, async (req, res) => {
     <button type="submit" style="background: #28a745; color: white; border: none; padding: 8px 16px; cursor: pointer;">Create Client</button>
   </form>
   ` : ''}
-  <h3>Existing Clients</h3>
+  ${isSuperAdmin(req) ? '<h3>Existing Clients</h3>' : ''}
   ${clientsList}
 </body>
 </html>
@@ -879,6 +914,7 @@ router.get("/clients/:clientId", requireAdminAuth, async (req, res) => {
   const clientId = req.params.clientId;
   const saved = req.query.saved === "1";
   const created = req.query.created === "1";
+  const welcome = req.query.welcome === "1";
   
   const validation = validateClientId(clientId);
   if (!validation.valid) {
@@ -915,6 +951,7 @@ router.get("/clients/:clientId", requireAdminAuth, async (req, res) => {
   
   const successMessage = saved ? '<p style="color: green; font-weight: bold;">✓ Changes saved successfully!</p>' : '';
   const createdMessage = created ? '<p style="color: green; font-weight: bold;">✓ Client created successfully!</p>' : '';
+  const welcomeMessage = welcome ? '<p style="color: green; font-weight: bold; padding: 15px; background: #d4edda; border: 1px solid #c3e6cb; border-radius: 4px; margin-bottom: 20px;">✓ Welcome! Your account has been set up. You can now manage your widget settings below.</p>' : '';
   const inviteSuccessMessage = req.query.invite_success ? `<p style="color: green; font-weight: bold;">✓ Invitation sent to ${escapeHtml(req.query.invite_email || "")} (status: pending)</p>` : '';
   const inviteErrorMessage = req.query.invite_error ? `<p style="color: red; font-weight: bold;">Error: ${escapeHtml(req.query.invite_error)}</p>` : '';
   
@@ -976,6 +1013,161 @@ router.get("/clients/:clientId", requireAdminAuth, async (req, res) => {
   // ... rest of widget code (paste AI-support-bot.liquid content here, replacing "Advantum" with clientId variable)
 </script>`;
   
+  const userRole = req.session?.admin?.authz?.role || null;
+  const isClientAdminView = userRole === "client_admin";
+  
+  // Section A: At-a-glance / Primary Actions (always visible, most prominent)
+  const sectionA = `
+    <div style="background: #f8f9fa; border: 2px solid #007bff; border-radius: 8px; padding: 25px; margin-bottom: 30px;">
+      <h2 style="margin-top: 0; color: #007bff;">At-a-Glance</h2>
+      <p style="color: #666; margin-bottom: 20px;"><strong>What does my customer see?</strong></p>
+      
+      <div style="margin-bottom: 20px;">
+        <label style="display: block; font-weight: bold; margin-bottom: 5px;">Widget Title:</label>
+        <input type="text" name="widget[title]" value="${escapeHtml(getValue(config, "widget.title", ""))}" style="width: 100%; max-width: 500px; padding: 8px; font-size: 16px;" maxlength="60" required>
+      </div>
+      
+      <div style="margin-bottom: 25px;">
+        <label style="display: block; font-weight: bold; margin-bottom: 5px;">Greeting / Initial Message:</label>
+        <textarea name="widget[greeting]" style="width: 100%; max-width: 500px; padding: 8px; font-size: 14px; height: 80px;" maxlength="240" required>${escapeHtml(getValue(config, "widget.greeting", ""))}</textarea>
+      </div>
+      
+      <button type="submit" style="background: #28a745; color: white; border: none; padding: 12px 30px; cursor: pointer; font-size: 18px; font-weight: bold; border-radius: 4px;">Save Changes</button>
+    </div>
+  `;
+  
+  // Section B: Widget Appearance & Behavior (supporting, grouped)
+  const sectionB = `
+    <div style="background: white; border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 30px;">
+      <h2 style="margin-top: 0;">Widget Appearance & Behavior</h2>
+      
+      <div style="margin-bottom: 25px;">
+        <label style="display: block; font-weight: bold; margin-bottom: 5px;">Logo URL:</label>
+        <input type="text" name="logoUrl" value="${escapeHtml(getValue(config, "logoUrl", ""))}" style="width: 100%; max-width: 600px; padding: 8px;" maxlength="300">
+      </div>
+      
+      <fieldset style="border: 1px solid #ddd; padding: 15px; border-radius: 4px; margin-bottom: 25px;">
+        <legend style="font-weight: bold; padding: 0 10px;">Colors</legend>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px;">
+          <div>
+            <label style="display: block; margin-bottom: 5px;">Primary:</label>
+            <input type="text" name="colors[primary]" value="${escapeHtml(getValue(config, "colors.primary", ""))}" style="width: 100%; padding: 6px;">
+          </div>
+          <div>
+            <label style="display: block; margin-bottom: 5px;">Accent:</label>
+            <input type="text" name="colors[accent]" value="${escapeHtml(getValue(config, "colors.accent", ""))}" style="width: 100%; padding: 6px;">
+          </div>
+          <div>
+            <label style="display: block; margin-bottom: 5px;">Background:</label>
+            <input type="text" name="colors[background]" value="${escapeHtml(getValue(config, "colors.background", ""))}" style="width: 100%; padding: 6px;">
+          </div>
+          <div>
+            <label style="display: block; margin-bottom: 5px;">User Bubble:</label>
+            <input type="text" name="colors[userBubble]" value="${escapeHtml(getValue(config, "colors.userBubble", ""))}" style="width: 100%; padding: 6px;">
+          </div>
+          <div>
+            <label style="display: block; margin-bottom: 5px;">Bot Bubble:</label>
+            <input type="text" name="colors[botBubble]" value="${escapeHtml(getValue(config, "colors.botBubble", ""))}" style="width: 100%; padding: 6px;">
+          </div>
+        </div>
+      </fieldset>
+      
+      <details style="margin-top: 20px;">
+        <summary style="cursor: pointer; font-weight: bold; padding: 10px; background: #f8f9fa; border: 1px solid #ddd; border-radius: 4px; user-select: none;">Entry Screen Settings</summary>
+        <div style="padding: 20px 10px; border-top: 1px solid #ddd;">
+          <div style="margin-bottom: 15px;">
+            <label><input type="checkbox" name="entryScreen[enabled]" ${getValue(config, "entryScreen.enabled", false) ? "checked" : ""} style="margin-right: 5px;"> Enabled</label>
+          </div>
+          <div style="margin-bottom: 15px;">
+            <label style="display: block; margin-bottom: 5px;">Title:</label>
+            <input type="text" name="entryScreen[title]" value="${escapeHtml(getValue(config, "entryScreen.title", ""))}" style="width: 100%; max-width: 500px; padding: 6px;" maxlength="60">
+          </div>
+          <div style="margin-bottom: 15px;">
+            <label style="display: block; margin-bottom: 5px;">Disclaimer:</label>
+            <textarea name="entryScreen[disclaimer]" style="width: 100%; max-width: 500px; padding: 6px; height: 70px;" maxlength="240">${escapeHtml(getValue(config, "entryScreen.disclaimer", ""))}</textarea>
+          </div>
+          <div style="margin-bottom: 15px;">
+            <label style="display: block; margin-bottom: 5px;">Primary Button Label:</label>
+            <input type="text" name="entryScreen[primaryButton][label]" value="${escapeHtml(getValue(config, "entryScreen.primaryButton.label", ""))}" style="width: 100%; max-width: 400px; padding: 6px;" maxlength="30">
+          </div>
+          <div style="margin-bottom: 15px;">
+            <label style="display: block; margin-bottom: 5px;">Secondary Button 1 Label:</label>
+            <input type="text" name="entryScreen[secondaryButtons][0][label]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.0.label", ""))}" style="width: 100%; max-width: 400px; padding: 6px;" maxlength="30">
+          </div>
+          <div style="margin-bottom: 15px;">
+            <label style="display: block; margin-bottom: 5px;">Secondary Button 1 URL:</label>
+            <input type="text" name="entryScreen[secondaryButtons][0][url]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.0.url", ""))}" style="width: 100%; max-width: 500px; padding: 6px;" maxlength="200">
+          </div>
+          <div style="margin-bottom: 15px;">
+            <label style="display: block; margin-bottom: 5px;">Secondary Button 2 Label:</label>
+            <input type="text" name="entryScreen[secondaryButtons][1][label]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.1.label", ""))}" style="width: 100%; max-width: 400px; padding: 6px;" maxlength="30">
+          </div>
+          <div style="margin-bottom: 15px;">
+            <label style="display: block; margin-bottom: 5px;">Secondary Button 2 URL:</label>
+            <input type="text" name="entryScreen[secondaryButtons][1][url]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.1.url", ""))}" style="width: 100%; max-width: 500px; padding: 6px;" maxlength="200">
+          </div>
+        </div>
+      </details>
+    </div>
+  `;
+  
+  // Section C: Support & Contact Settings (supporting)
+  const sectionC = `
+    <div style="background: white; border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 30px;">
+      <h2 style="margin-top: 0;">Support & Contact Settings</h2>
+      
+      <div style="margin-bottom: 20px;">
+        <label style="display: block; font-weight: bold; margin-bottom: 5px;">Support Email:</label>
+        <input type="email" name="support[email]" value="${escapeHtml(getValue(config, "support.email", ""))}" style="width: 100%; max-width: 400px; padding: 8px;" maxlength="120">
+      </div>
+      
+      <div style="margin-bottom: 20px;">
+        <label style="display: block; font-weight: bold; margin-bottom: 5px;">Contact URL:</label>
+        <input type="text" name="support[contactUrl]" value="${escapeHtml(getValue(config, "support.contactUrl", ""))}" style="width: 100%; max-width: 600px; padding: 8px;" maxlength="200">
+      </div>
+      
+      <div style="margin-bottom: 20px;">
+        <label style="display: block; font-weight: bold; margin-bottom: 5px;">Contact URL Message Parameter:</label>
+        <input type="text" name="support[contactUrlMessageParam]" value="${escapeHtml(getValue(config, "support.contactUrlMessageParam", ""))}" style="width: 100%; max-width: 300px; padding: 8px;" maxlength="30">
+      </div>
+    </div>
+  `;
+  
+  // Section D: Advanced / Setup (rare, collapsed by default for client_admin)
+  const sectionD = isClientAdminView ? `
+    <details style="background: white; border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 30px;">
+      <summary style="cursor: pointer; font-weight: bold; padding: 10px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; user-select: none;">Advanced Setup — Usually Done Once</summary>
+      <div style="padding: 20px 10px; border-top: 1px solid #ddd;">
+        <div style="margin-bottom: 25px; padding: 15px; background: #f5f5f5; border: 1px solid #ddd; border-radius: 4px;">
+          <h3 style="margin-top: 0;">Embed Instructions</h3>
+          <p><strong>For Shopify (.liquid):</strong></p>
+          <p>Copy the <code>AI-support-bot.liquid</code> file content and replace the hardcoded clientId value with your client ID (${escapeHtml(validation.clientId)}).</p>
+          <p>Then paste it in your theme's layout file (theme.liquid) before the closing <code>&lt;/body&gt;</code> tag, or add it as a section/snippet in the theme customizer.</p>
+          <p><strong>Important:</strong> Make sure to set <code>var clientId = "${escapeHtml(validation.clientId)}";</code> in the script.</p>
+        </div>
+        <div style="padding: 15px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px;">
+          <p><strong>Client ID:</strong> <code>${escapeHtml(validation.clientId)}</code></p>
+          <p style="font-size: 0.9em; color: #666; margin-bottom: 0;">Use this client ID when configuring the widget embed code.</p>
+        </div>
+      </div>
+    </details>
+  ` : `
+    <div style="background: white; border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 30px;">
+      <h2 style="margin-top: 0;">Advanced Setup</h2>
+      <div style="margin-bottom: 25px; padding: 15px; background: #f5f5f5; border: 1px solid #ddd; border-radius: 4px;">
+        <h3 style="margin-top: 0;">Embed Instructions</h3>
+        <p><strong>For Shopify (.liquid):</strong></p>
+        <p>Copy the <code>AI-support-bot.liquid</code> file content and replace the hardcoded clientId value with your client ID (${escapeHtml(validation.clientId)}).</p>
+        <p>Then paste it in your theme's layout file (theme.liquid) before the closing <code>&lt;/body&gt;</code> tag, or add it as a section/snippet in the theme customizer.</p>
+        <p><strong>Important:</strong> Make sure to set <code>var clientId = "${escapeHtml(validation.clientId)}";</code> in the script.</p>
+      </div>
+      <div style="padding: 15px; background: #f5f5f5; border: 1px solid #ddd; border-radius: 4px;">
+        <p><strong>Client ID:</strong> <code>${escapeHtml(validation.clientId)}</code></p>
+        <p style="font-size: 0.9em; color: #666; margin-bottom: 0;">Use this client ID when configuring the widget embed code.</p>
+      </div>
+    </div>
+  `;
+  
   const html = `
 <!DOCTYPE html>
 <html lang="en">
@@ -986,65 +1178,28 @@ router.get("/clients/:clientId", requireAdminAuth, async (req, res) => {
 </head>
 <body>
   <h1>Admin Portal</h1>
+  <p style="color: #666; font-size: 0.9em;">Logged in as <strong>${escapeHtml(req.session?.admin?.email || "")}</strong></p>
   ${renderNav("clients", csrfToken)}
-  <h2>Edit Client: ${escapeHtml(validation.clientId)}</h2>
+  <h2>${isClientAdminView ? "Manage Widget & Behavior" : "Edit Client: " + escapeHtml(validation.clientId)}</h2>
+  ${welcomeMessage}
   ${createdMessage}
   ${successMessage}
   ${inviteSuccessMessage}
   ${inviteErrorMessage}
-  <p><a href="/admin/clients">← Back to clients</a></p>
-  ${configPathInfo}
-  <h3>Embed Instructions</h3>
-  <div style="margin-bottom: 30px; padding: 15px; background: #f5f5f5; border: 1px solid #ddd;">
-    <p><strong>For Shopify (.liquid):</strong></p>
-    <p>Copy the <code>AI-support-bot.liquid</code> file content and replace the hardcoded clientId value with your client ID (${escapeHtml(validation.clientId)}).</p>
-    <p>Then paste it in your theme's layout file (theme.liquid) before the closing <code>&lt;/body&gt;</code> tag, or add it as a section/snippet in the theme customizer.</p>
-    <p><strong>Important:</strong> Make sure to set <code>var clientId = "${escapeHtml(validation.clientId)}";</code> in the script.</p>
-  </div>
+  <p style="margin-bottom: 20px;"><a href="/admin/clients" style="color: #666; text-decoration: none;">← Back to clients</a></p>
+  ${isSuperAdmin(req) && configPathInfo ? configPathInfo : ''}
   
-  <form method="POST" action="/admin/clients/${encodeURIComponent(validation.clientId)}" style="max-width: 800px;">
+  <form method="POST" action="/admin/clients/${encodeURIComponent(validation.clientId)}" style="max-width: 900px;">
     <input type="hidden" name="csrfToken" value="${csrfToken}">
     
-    <h3>Colors</h3>
-    <div style="margin-bottom: 15px;">
-      <label>Primary: <input type="text" name="colors[primary]" value="${escapeHtml(getValue(config, "colors.primary", ""))}" style="width: 200px;"></label><br>
-      <label>Accent: <input type="text" name="colors[accent]" value="${escapeHtml(getValue(config, "colors.accent", ""))}" style="width: 200px;"></label><br>
-      <label>Background: <input type="text" name="colors[background]" value="${escapeHtml(getValue(config, "colors.background", ""))}" style="width: 200px;"></label><br>
-      <label>User Bubble: <input type="text" name="colors[userBubble]" value="${escapeHtml(getValue(config, "colors.userBubble", ""))}" style="width: 200px;"></label><br>
-      <label>Bot Bubble: <input type="text" name="colors[botBubble]" value="${escapeHtml(getValue(config, "colors.botBubble", ""))}" style="width: 200px;"></label><br>
-    </div>
+    ${sectionA}
+    ${sectionB}
+    ${sectionC}
+    ${sectionD}
     
-    <h3>Widget</h3>
-    <div style="margin-bottom: 15px;">
-      <label>Title: <input type="text" name="widget[title]" value="${escapeHtml(getValue(config, "widget.title", ""))}" style="width: 400px;" maxlength="60"></label><br>
-      <label>Greeting: <textarea name="widget[greeting]" style="width: 400px; height: 60px;" maxlength="240">${escapeHtml(getValue(config, "widget.greeting", ""))}</textarea></label><br>
+    <div style="margin-top: 30px; padding-top: 20px; border-top: 2px solid #ddd;">
+      <button type="submit" style="background: #28a745; color: white; border: none; padding: 12px 30px; cursor: pointer; font-size: 18px; font-weight: bold; border-radius: 4px;">Save Changes</button>
     </div>
-    
-    <h3>Logo URL</h3>
-    <div style="margin-bottom: 15px;">
-      <label>Logo URL: <input type="text" name="logoUrl" value="${escapeHtml(getValue(config, "logoUrl", ""))}" style="width: 500px;" maxlength="300"></label><br>
-    </div>
-    
-    <h3>Entry Screen</h3>
-    <div style="margin-bottom: 15px;">
-      <label><input type="checkbox" name="entryScreen[enabled]" ${getValue(config, "entryScreen.enabled", false) ? "checked" : ""}> Enabled</label><br>
-      <label>Title: <input type="text" name="entryScreen[title]" value="${escapeHtml(getValue(config, "entryScreen.title", ""))}" style="width: 400px;" maxlength="60"></label><br>
-      <label>Disclaimer: <textarea name="entryScreen[disclaimer]" style="width: 400px; height: 60px;" maxlength="240">${escapeHtml(getValue(config, "entryScreen.disclaimer", ""))}</textarea></label><br>
-      <label>Primary Button Label: <input type="text" name="entryScreen[primaryButton][label]" value="${escapeHtml(getValue(config, "entryScreen.primaryButton.label", ""))}" style="width: 300px;" maxlength="30"></label><br>
-      <label>Secondary Button 1 Label: <input type="text" name="entryScreen[secondaryButtons][0][label]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.0.label", ""))}" style="width: 300px;" maxlength="30"></label><br>
-      <label>Secondary Button 1 URL: <input type="text" name="entryScreen[secondaryButtons][0][url]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.0.url", ""))}" style="width: 400px;" maxlength="200"></label><br>
-      <label>Secondary Button 2 Label: <input type="text" name="entryScreen[secondaryButtons][1][label]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.1.label", ""))}" style="width: 300px;" maxlength="30"></label><br>
-      <label>Secondary Button 2 URL: <input type="text" name="entryScreen[secondaryButtons][1][url]" value="${escapeHtml(getValue(config, "entryScreen.secondaryButtons.1.url", ""))}" style="width: 400px;" maxlength="200"></label><br>
-    </div>
-    
-    <h3>Support</h3>
-    <div style="margin-bottom: 15px;">
-      <label>Email: <input type="email" name="support[email]" value="${escapeHtml(getValue(config, "support.email", ""))}" style="width: 300px;" maxlength="120"></label><br>
-      <label>Contact URL: <input type="text" name="support[contactUrl]" value="${escapeHtml(getValue(config, "support.contactUrl", ""))}" style="width: 500px;" maxlength="200"></label><br>
-      <label>Contact URL Message Param: <input type="text" name="support[contactUrlMessageParam]" value="${escapeHtml(getValue(config, "support.contactUrlMessageParam", ""))}" style="width: 200px;" maxlength="30"></label><br>
-    </div>
-    
-    <button type="submit" style="background: #28a745; color: white; border: none; padding: 10px 20px; cursor: pointer; font-size: 16px;">Save Changes</button>
   </form>
   
   <hr style="margin: 40px 0;">
