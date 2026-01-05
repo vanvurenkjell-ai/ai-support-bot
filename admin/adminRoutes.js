@@ -2887,6 +2887,86 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
   res.send(html);
 });
 
+// Analytics health check (GET /admin/analytics/health) - super_admin only, for debugging Axiom connectivity
+router.get("/analytics/health", requireAdminAuth, requireCsrf, async (req, res) => {
+  const requestId = req.requestId || "unknown";
+  const ip = getClientIp(req);
+  const userEmail = req.session?.admin?.email || null;
+
+  // Super admin only
+  if (!isSuperAdmin(req)) {
+    logAdminEvent("warn", "admin_analytics_health_denied", {
+      requestId: requestId,
+      ip: ip,
+      userEmail: userEmail,
+      reason: "not_super_admin",
+    });
+    return res.status(403).json({ error: "Access denied", message: "Only super administrators can access this endpoint" });
+  }
+
+  try {
+    // Run a simple test query: count chats in last 1 day
+    const endDate = new Date();
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - 1);
+
+    const testQueryText = `['advantum-prod-log']
+| where event == "request_end"
+| where route == "/chat"
+| where _time >= datetime("${startDate.toISOString()}") and _time <= datetime("${endDate.toISOString()}")
+| summarize totalChats = count()`;
+
+    const { runQuery } = require("../lib/axiomClient");
+    const rows = await runQuery({
+      queryText: testQueryText,
+      params: {
+        start_time: startDate.toISOString(),
+        end_time: endDate.toISOString(),
+      },
+    });
+
+    const result = {
+      status: "ok",
+      timestamp: new Date().toISOString(),
+      testQuery: {
+        startTime: startDate.toISOString(),
+        endTime: endDate.toISOString(),
+        rowsReturned: rows.length,
+        sampleRow: rows[0] || null,
+      },
+      config: {
+        hasApiToken: !!process.env.AXIOM_API_TOKEN,
+        hasApiUrl: !!process.env.AXIOM_API_URL,
+        hasOrgId: !!process.env.AXIOM_ORG_ID,
+        apiUrl: process.env.AXIOM_API_URL || "https://api.axiom.co",
+      },
+    };
+
+    logAdminEvent("info", "admin_analytics_health_check", {
+      requestId: requestId,
+      ip: ip,
+      userEmail: userEmail,
+      rowsReturned: rows.length,
+    });
+
+    return res.json(result);
+  } catch (error) {
+    logAdminEvent("error", "admin_analytics_health_check_error", {
+      requestId: requestId,
+      ip: ip,
+      userEmail: userEmail,
+      error: error?.message || String(error),
+      stack: error?.stack ? String(error.stack).slice(0, 500) : null,
+    });
+
+    return res.status(500).json({
+      status: "error",
+      error: error?.message || String(error),
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
 module.exports = router;
 
 /*
