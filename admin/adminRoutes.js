@@ -2633,13 +2633,33 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
         dataset: dataset,
       });
       
-      smokeTestResult = {
-        rowsReturned: smokeTestRows.length,
-        dataset: dataset,
-        timeRange: {
-          start: kpiStartDate.toISOString(),
-          end: kpiEndDate.toISOString(),
+      // Smoke test 2: Without time window (diagnostic - to see if time filtering is the issue)
+      const smokeTestQueryNoTime = `['${dataset}']
+| where route == "/chat"
+| where event == "request_end"
+| take 1`;
+      
+      const smokeTestRowsNoTime = await runQuery({
+        queryText: smokeTestQueryNoTime,
+        params: {
+          dataset: dataset,
+          // Explicitly omit start_time and end_time
         },
+        dataset: dataset,
+      });
+      
+      smokeTestResult = {
+        withTimeWindow: {
+          rowsReturned: smokeTestRows.length,
+          timeRange: {
+            start: kpiStartDate.toISOString(),
+            end: kpiEndDate.toISOString(),
+          },
+        },
+        withoutTimeWindow: {
+          rowsReturned: smokeTestRowsNoTime.length,
+        },
+        dataset: dataset,
       };
       
       logAdminEvent("info", "admin_analytics_smoke_test", {
@@ -2648,7 +2668,7 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
         userEmail: userEmail,
         clientId: selectedClientId,
         smokeTestResult: smokeTestResult,
-        note: "Smoke test query completed (server-side diagnostic)",
+        note: "Smoke test queries completed (server-side diagnostic)",
       });
     } catch (smokeError) {
       // Fail-safe: don't block analytics page if smoke test fails
@@ -2657,7 +2677,7 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
         ip: ip,
         userEmail: userEmail,
         clientId: selectedClientId,
-        error: smokeError?.message || String(smokeError),
+        error: smokeError?.message | String(smokeError),
         note: "Smoke test failed (non-blocking)",
       });
     }
@@ -2671,11 +2691,11 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
     ]);
 
     kpiData = {
-      totalChats: totalChats.totalChats || 0,
-      botHandledPct: botHandledPct.botHandledPct || 0,
-      totalEscalations: totalEscalations.totalEscalations || 0,
-      moneySaved: moneySaved.estimatedSavedEURDisplay || "€0.00",
-      avgResponseTime: avgResponseTimeData.weightedAvg || 0,
+      totalChats: totalChats.totalChats | 0,
+      botHandledPct: botHandledPct.botHandledPct | 0,
+      totalEscalations: totalEscalations.totalEscalations | 0,
+      moneySaved: moneySaved.estimatedSavedEURDisplay | "€0.00",
+      avgResponseTime: avgResponseTimeData.weightedAvg | 0,
     };
 
     // Volume & Trends (using trends date range)
@@ -2688,11 +2708,11 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
     ]);
 
     trendsData = {
-      chatsPerDay: chatsPerDay.series || [],
-      botHandlingOverTime: botHandlingOverTime.series || [],
-      escalationsPerDay: escalationsPerDay.series || [],
-      moneySavedPerDay: moneySavedPerDay.series || [],
-      avgResponseTimeSeries: avgResponseTimeSeries.series || [],
+      chatsPerDay: chatsPerDay.series | [],
+      botHandlingOverTime: botHandlingOverTime.series | [],
+      escalationsPerDay: escalationsPerDay.series | [],
+      moneySavedPerDay: moneySavedPerDay.series | [],
+      avgResponseTimeSeries: avgResponseTimeSeries.series | [],
     };
 
     // Escalation Insights (using reasons date range for breakdown, kpi range for rate)
@@ -2702,14 +2722,14 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
     ]);
 
     escalationData = {
-      escalationRate: escalationRate.escalationPercentage || 0,
-      reasonsBreakdown: escalationReasons.breakdown || [],
+      escalationRate: escalationRate.escalationPercentage | 0,
+      reasonsBreakdown: escalationReasons.breakdown | [],
     };
 
     // Intent & Usage (using intents date range)
     const topIntents = await executeQuery("top_intents_v1", selectedClientId, intentsStartDate, intentsEndDate).catch(() => ({ intents: [] }));
     intentData = {
-      topIntents: topIntents.intents || [],
+      topIntents: topIntents.intents | [],
     };
 
     logAdminEvent("info", "admin_analytics_view", {
@@ -2728,7 +2748,7 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
       ip: ip,
       userEmail: userEmail,
       clientId: selectedClientId,
-      error: error?.message || String(error),
+      error: error?.message | String(error),
       stack: error?.stack ? String(error.stack).slice(0, 500) : null,
     });
     // Continue with empty data (fail-safe)
@@ -2811,23 +2831,23 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
     <div class="kpi-grid">
       <div class="kpi-card">
         <div class="kpi-label">Total Conversations</div>
-        <div class="kpi-value">${kpiData.totalChats || 0}</div>
+        <div class="kpi-value">${kpiData.totalChats | 0}</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Bot Handling Rate</div>
-        <div class="kpi-value">${(kpiData.botHandledPct || 0).toFixed(1)}%</div>
+        <div class="kpi-value">${(kpiData.botHandledPct | 0).toFixed(1)}%</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Total Escalations</div>
-        <div class="kpi-value">${kpiData.totalEscalations || 0}</div>
+        <div class="kpi-value">${kpiData.totalEscalations | 0}</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Estimated Money Saved</div>
-        <div class="kpi-value">${kpiData.moneySaved || "€0.00"}</div>
+        <div class="kpi-value">${kpiData.moneySaved | "€0.00"}</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Average Response Time</div>
-        <div class="kpi-value">${kpiData.avgResponseTime || 0}ms</div>
+        <div class="kpi-value">${kpiData.avgResponseTime | 0}ms</div>
       </div>
     </div>
 
@@ -2838,7 +2858,7 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
       <thead><tr><th>Date</th><th>Chats</th></tr></thead>
       <tbody>
         ${trendsData.chatsPerDay.map(item => `
-          <tr><td>${item.date ? new Date(item.date).toLocaleDateString() : "N/A"}</td><td>${item.chats || 0}</td></tr>
+          <tr><td>${item.date ? new Date(item.date).toLocaleDateString() : "N/A"}</td><td>${item.chats | 0}</td></tr>
         `).join("")}
       </tbody>
     </table>
@@ -2852,10 +2872,10 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
         ${trendsData.botHandlingOverTime.map(item => `
           <tr>
             <td>${item.date ? new Date(item.date).toLocaleDateString() : "N/A"}</td>
-            <td>${(item.botHandlingRatePct || 0).toFixed(1)}%</td>
-            <td>${item.botHandledChats || 0}</td>
-            <td>${item.escalatedChats || 0}</td>
-            <td>${item.totalChats || 0}</td>
+            <td>${(item.botHandlingRatePct | 0).toFixed(1)}%</td>
+            <td>${item.botHandledChats | 0}</td>
+            <td>${item.escalatedChats | 0}</td>
+            <td>${item.totalChats | 0}</td>
           </tr>
         `).join("")}
       </tbody>
@@ -2868,7 +2888,7 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
       <thead><tr><th>Date</th><th>Escalations</th></tr></thead>
       <tbody>
         ${trendsData.escalationsPerDay.map(item => `
-          <tr><td>${item.date ? new Date(item.date).toLocaleDateString() : "N/A"}</td><td>${item.escalations || 0}</td></tr>
+          <tr><td>${item.date ? new Date(item.date).toLocaleDateString() : "N/A"}</td><td>${item.escalations | 0}</td></tr>
         `).join("")}
       </tbody>
     </table>
@@ -2880,7 +2900,7 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
       <thead><tr><th>Date</th><th>Money Saved</th></tr></thead>
       <tbody>
         ${trendsData.moneySavedPerDay.map(item => `
-          <tr><td>${item.date ? new Date(item.date).toLocaleDateString() : "N/A"}</td><td>${item.estimatedSavedEUR || "€0.00"}</td></tr>
+          <tr><td>${item.date ? new Date(item.date).toLocaleDateString() : "N/A"}</td><td>${item.estimatedSavedEUR | "€0.00"}</td></tr>
         `).join("")}
       </tbody>
     </table>
@@ -2892,7 +2912,7 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
       <thead><tr><th>Date</th><th>Avg Response Time (ms)</th></tr></thead>
       <tbody>
         ${trendsData.avgResponseTimeSeries.map(item => `
-          <tr><td>${item.date ? new Date(item.date).toLocaleDateString() : "N/A"}</td><td>${item.avgLatencyMs || 0}</td></tr>
+          <tr><td>${item.date ? new Date(item.date).toLocaleDateString() : "N/A"}</td><td>${item.avgLatencyMs | 0}</td></tr>
         `).join("")}
       </tbody>
     </table>
@@ -2901,7 +2921,7 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
     <h2>Escalation Insights</h2>
     <div class="kpi-card" style="max-width: 300px;">
       <div class="kpi-label">Escalation Rate (Last ${kpiRangeDays} days)</div>
-      <div class="kpi-value">${(escalationData.escalationRate || 0).toFixed(1)}%</div>
+      <div class="kpi-value">${(escalationData.escalationRate | 0).toFixed(1)}%</div>
     </div>
 
     ${escalationData.reasonsBreakdown && escalationData.reasonsBreakdown.length > 0 ? `
@@ -2910,7 +2930,7 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
       <thead><tr><th>Reason</th><th>Escalations</th></tr></thead>
       <tbody>
         ${escalationData.reasonsBreakdown.map(item => `
-          <tr><td>${escapeHtml(item.reason || "Unknown")}</td><td>${item.escalations || 0}</td></tr>
+          <tr><td>${escapeHtml(item.reason | "Unknown")}</td><td>${item.escalations | 0}</td></tr>
         `).join("")}
       </tbody>
     </table>
@@ -2923,7 +2943,7 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
       <thead><tr><th>Intent</th><th>Chats</th></tr></thead>
       <tbody>
         ${intentData.topIntents.map(item => `
-          <tr><td>${escapeHtml(item.intent || "Unknown")}</td><td>${item.chats || 0}</td></tr>
+          <tr><td>${escapeHtml(item.intent | "Unknown")}</td><td>${item.chats | 0}</td></tr>
         `).join("")}
       </tbody>
     </table>
@@ -2938,9 +2958,9 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
 
 // Analytics health check (GET /admin/analytics/health) - super_admin only, for debugging Axiom connectivity
 router.get("/analytics/health", requireAdminAuth, requireCsrf, async (req, res) => {
-  const requestId = req.requestId || "unknown";
+  const requestId = req.requestId | "unknown";
   const ip = getClientIp(req);
-  const userEmail = req.session?.admin?.email || null;
+  const userEmail = req.session?.admin?.email | null;
 
   // Super admin only
   if (!isSuperAdmin(req)) {
@@ -2980,13 +3000,13 @@ router.get("/analytics/health", requireAdminAuth, requireCsrf, async (req, res) 
         startTime: startDate.toISOString(),
         endTime: endDate.toISOString(),
         rowsReturned: rows.length,
-        sampleRow: rows[0] || null,
+        sampleRow: rows[0] | null,
       },
       config: {
         hasApiToken: !!process.env.AXIOM_API_TOKEN,
         hasApiUrl: !!process.env.AXIOM_API_URL,
         hasOrgId: !!process.env.AXIOM_ORG_ID,
-        apiUrl: process.env.AXIOM_API_URL || "https://api.axiom.co",
+        apiUrl: process.env.AXIOM_API_URL | "https://api.axiom.co",
       },
     };
 
@@ -3003,13 +3023,13 @@ router.get("/analytics/health", requireAdminAuth, requireCsrf, async (req, res) 
       requestId: requestId,
       ip: ip,
       userEmail: userEmail,
-      error: error?.message || String(error),
+      error: error?.message | String(error),
       stack: error?.stack ? String(error.stack).slice(0, 500) : null,
     });
 
     return res.status(500).json({
       status: "error",
-      error: error?.message || String(error),
+      error: error?.message | String(error),
       timestamp: new Date().toISOString(),
     });
   }
@@ -3017,9 +3037,9 @@ router.get("/analytics/health", requireAdminAuth, requireCsrf, async (req, res) 
 
 // Axiom ingestion health check (GET /admin/axiom/ingest-health) - super_admin only
 router.get("/axiom/ingest-health", requireAdminAuth, requireCsrf, async (req, res) => {
-  const requestId = req.requestId || "unknown";
+  const requestId = req.requestId | "unknown";
   const ip = getClientIp(req);
-  const userEmail = req.session?.admin?.email || null;
+  const userEmail = req.session?.admin?.email | null;
 
   // Super admin only
   if (!isSuperAdmin(req)) {
@@ -3033,7 +3053,7 @@ router.get("/axiom/ingest-health", requireAdminAuth, requireCsrf, async (req, re
   }
 
   // Check Axiom ingestion configuration (read from index.js env vars)
-  const AXIOM_TOKEN = process.env.AXIOM_API_TOKEN || process.env.AXIOM_TOKEN;
+  const AXIOM_TOKEN = process.env.AXIOM_API_TOKEN | process.env.AXIOM_TOKEN;
   const AXIOM_DATASET = process.env.AXIOM_DATASET;
   const AXIOM_ENABLED = Boolean(AXIOM_TOKEN && AXIOM_DATASET);
 
@@ -3050,7 +3070,7 @@ router.get("/axiom/ingest-health", requireAdminAuth, requireCsrf, async (req, re
     enabled: AXIOM_ENABLED,
     hasToken: !!AXIOM_TOKEN,
     hasDataset: !!AXIOM_DATASET,
-    dataset: AXIOM_DATASET || null,
+    dataset: AXIOM_DATASET | null,
   });
 });
 
