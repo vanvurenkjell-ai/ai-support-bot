@@ -2966,6 +2966,45 @@ router.get("/analytics/health", requireAdminAuth, requireCsrf, async (req, res) 
   }
 });
 
+// Axiom ingestion health check (GET /admin/axiom/ingest-health) - super_admin only
+router.get("/axiom/ingest-health", requireAdminAuth, requireCsrf, async (req, res) => {
+  const requestId = req.requestId || "unknown";
+  const ip = getClientIp(req);
+  const userEmail = req.session?.admin?.email || null;
+
+  // Super admin only
+  if (!isSuperAdmin(req)) {
+    logAdminEvent("warn", "admin_axiom_ingest_health_denied", {
+      requestId: requestId,
+      ip: ip,
+      userEmail: userEmail,
+      reason: "not_super_admin",
+    });
+    return res.status(403).json({ error: "Access denied", message: "Only super administrators can access this endpoint" });
+  }
+
+  // Check Axiom ingestion configuration (read from index.js env vars)
+  const AXIOM_TOKEN = process.env.AXIOM_API_TOKEN || process.env.AXIOM_TOKEN;
+  const AXIOM_DATASET = process.env.AXIOM_DATASET;
+  const AXIOM_ENABLED = Boolean(AXIOM_TOKEN && AXIOM_DATASET);
+
+  logAdminEvent("info", "admin_axiom_ingest_health_check", {
+    requestId: requestId,
+    ip: ip,
+    userEmail: userEmail,
+    enabled: AXIOM_ENABLED,
+    hasToken: !!AXIOM_TOKEN,
+    hasDataset: !!AXIOM_DATASET,
+  });
+
+  return res.json({
+    enabled: AXIOM_ENABLED,
+    hasToken: !!AXIOM_TOKEN,
+    hasDataset: !!AXIOM_DATASET,
+    dataset: AXIOM_DATASET || null,
+  });
+});
+
 module.exports = router;
 
 /*

@@ -16,7 +16,8 @@ const port = Number(process.env.PORT) || 3000;
 const BUILD_VERSION = process.env.BUILD_VERSION || "dev";
 
 // ---- Axiom log ingestion config ----
-const AXIOM_TOKEN = process.env.AXIOM_TOKEN;
+// Backward compatible: support both AXIOM_TOKEN (legacy) and AXIOM_API_TOKEN (current)
+const AXIOM_TOKEN = process.env.AXIOM_API_TOKEN || process.env.AXIOM_TOKEN;
 const AXIOM_DATASET = process.env.AXIOM_DATASET;
 const AXIOM_URL = process.env.AXIOM_URL || "https://api.axiom.co";
 const AXIOM_ENABLED = Boolean(AXIOM_TOKEN && AXIOM_DATASET);
@@ -298,6 +299,20 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+// Rate limiting for Axiom ingestion error logs (prevent spam)
+const axiomErrorLogDedup = new Map();
+const AXIOM_ERROR_LOG_WINDOW_MS = 60000; // 1 minute
+
+// Clean up old dedup entries periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, timestamp] of axiomErrorLogDedup.entries()) {
+    if (now - timestamp > AXIOM_ERROR_LOG_WINDOW_MS) {
+      axiomErrorLogDedup.delete(key);
+    }
+  }
+}, 30000); // Clean every 30 seconds
+
 function sendEventToAxiom(eventObj) {
   if (!AXIOM_ENABLED) return;
 
@@ -320,25 +335,96 @@ function sendEventToAxiom(eventObj) {
     };
 
     const req = https.request(options, (res) => {
-      // Consume response to prevent memory leaks, but ignore result
+      // Check response status
+      if (res.statusCode && res.statusCode >= 400) {
+        // Rate-limited error logging for failed requests
+        const errorKey = `axiom_ingest_${res.statusCode}`;
+        const now = Date.now();
+        const lastLogged = axiomErrorLogDedup.get(errorKey);
+        
+        if (!lastLogged || (now - lastLogged > AXIOM_ERROR_LOG_WINDOW_MS)) {
+          safeLogJson({
+            level: "warn",
+            event: "axiom_ingest_failed",
+            statusCode: res.statusCode,
+            dataset: AXIOM_DATASET,
+            note: "Failed to send event to Axiom (rate-limited log)",
+            timestamp: nowIso(),
+          });
+          axiomErrorLogDedup.set(errorKey, now);
+        }
+      }
+      
+      // Consume response to prevent memory leaks
       res.on("data", () => {});
       res.on("end", () => {});
     });
 
-    req.on("error", () => {
-      // Silently ignore errors - don't log sensitive data
+    req.on("error", (err) => {
+      // Rate-limited error logging for network errors
+      const errorKey = "axiom_ingest_network_error";
+      const now = Date.now();
+      const lastLogged = axiomErrorLogDedup.get(errorKey);
+      
+      if (!lastLogged || (now - lastLogged > AXIOM_ERROR_LOG_WINDOW_MS)) {
+        safeLogJson({
+          level: "warn",
+          event: "axiom_ingest_network_error",
+          error: err?.message || String(err),
+          dataset: AXIOM_DATASET,
+          note: "Network error sending event to Axiom (rate-limited log)",
+          timestamp: nowIso(),
+        });
+        axiomErrorLogDedup.set(errorKey, now);
+      }
     });
 
     req.on("timeout", () => {
       req.destroy();
+      
+      // Rate-limited error logging for timeouts
+      const errorKey = "axiom_ingest_timeout";
+      const now = Date.now();
+      const lastLogged = axiomErrorLogDedup.get(errorKey);
+      
+      if (!lastLogged || (now - lastLogged > AXIOM_ERROR_LOG_WINDOW_MS)) {
+        safeLogJson({
+          level: "warn",
+          event: "axiom_ingest_timeout",
+          dataset: AXIOM_DATASET,
+          timeoutMs: 1500,
+          note: "Timeout sending event to Axiom (rate-limited log)",
+          timestamp: nowIso(),
+        });
+        axiomErrorLogDedup.set(errorKey, now);
+      }
     });
 
     req.write(payload);
     req.end();
   } catch (e) {
-    // Silently ignore all errors
+    // Rate-limited error logging for exceptions
+    const errorKey = "axiom_ingest_exception";
+    const now = Date.now();
+    const lastLogged = axiomErrorLogDedup.get(errorKey);
+    
+    if (!lastLogged || (now - lastLogged > AXIOM_ERROR_LOG_WINDOW_MS)) {
+      safeLogJson({
+        level: "warn",
+        event: "axiom_ingest_exception",
+        error: e?.message || String(e),
+        dataset: AXIOM_DATASET,
+        note: "Exception sending event to Axiom (rate-limited log)",
+        timestamp: nowIso(),
+      });
+      axiomErrorLogDedup.set(errorKey, now);
+    }
   }
 }
+
+// Rate limiting for Axiom enqueue debug logs (prevent spam)
+const axiomEnqueueLogDedup = new Map();
+const AXIOM_ENQUEUE_LOG_WINDOW_MS = 60000; // 1 minute
 
 function logJson(level, event, fields) {
   try {
@@ -352,6 +438,29 @@ function logJson(level, event, fields) {
 
     // Send to Axiom for request_end, conversation_end, knowledge_gap, and error events
     if (event === "request_end" || event === "conversation_end" || event === "knowledge_gap" || level === "error") {
+      // Rate-limited debug log when queueing event for Axiom
+      if (AXIOM_ENABLED && (event === "request_end")) {
+        const route = fields?.route || "unknown";
+        const clientId = fields?.clientId || null;
+        const requestId = fields?.requestId || null;
+        const errorKey = `enqueue_${route}`;
+        const now = Date.now();
+        const lastLogged = axiomEnqueueLogDedup.get(errorKey);
+        
+        if (!lastLogged || (now - lastLogged > AXIOM_ENQUEUE_LOG_WINDOW_MS)) {
+          safeLogJson({
+            level: "debug",
+            event: "axiom_ingest_enqueue",
+            route: route,
+            clientId: clientId,
+            requestId: requestId,
+            note: "Queueing event for Axiom ingestion (rate-limited log)",
+            timestamp: nowIso(),
+          });
+          axiomEnqueueLogDedup.set(errorKey, now);
+        }
+      }
+      
       sendEventToAxiom(logObj);
     }
   } catch {
@@ -5502,6 +5611,28 @@ initializeClientRegistry();
 // Start server - bind to 0.0.0.0 for Render compatibility
 app.listen(port, "0.0.0.0", () => {
   const version = process.env.VERSION || process.env.RENDER_GIT_COMMIT || BUILD_VERSION || "unknown";
+  
+  // Axiom ingestion startup diagnostics
+  if (AXIOM_ENABLED) {
+    logJson("info", "axiom_ingest_enabled", {
+      event: "axiom_ingest_enabled",
+      hasToken: !!AXIOM_TOKEN,
+      hasDataset: !!AXIOM_DATASET,
+      dataset: AXIOM_DATASET,
+      baseUrl: AXIOM_URL,
+      note: "Axiom log ingestion is enabled and configured",
+      timestamp: nowIso(),
+    });
+  } else {
+    logJson("warn", "axiom_ingest_disabled", {
+      event: "axiom_ingest_disabled",
+      hasToken: !!AXIOM_TOKEN,
+      hasDataset: !!AXIOM_DATASET,
+      note: "Axiom log ingestion is disabled (missing token or dataset)",
+      timestamp: nowIso(),
+    });
+  }
+  
   logJson("info", "server_listening", {
     event: "server_listening",
     version: version,
