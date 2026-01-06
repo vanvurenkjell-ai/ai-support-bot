@@ -2610,8 +2610,57 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
   let trendsData = {};
   let escalationData = {};
   let intentData = {};
+  let smokeTestResult = null;
 
   try {
+    // Smoke test: run a simple query to validate dataset/time window connectivity
+    // This helps diagnose if the issue is dataset/time range or query-specific
+    try {
+      const { runQuery } = require("../lib/axiomClient");
+      const dataset = process.env.AXIOM_DATASET || "advantum-prod-log";
+      const smokeTestQuery = `['${dataset}']
+| where event == "request_end"
+| where route == "/chat"
+| take 1`;
+      
+      const smokeTestRows = await runQuery({
+        queryText: smokeTestQuery,
+        params: {
+          start_time: kpiStartDate.toISOString(),
+          end_time: kpiEndDate.toISOString(),
+          dataset: dataset,
+        },
+        dataset: dataset,
+      });
+      
+      smokeTestResult = {
+        rowsReturned: smokeTestRows.length,
+        dataset: dataset,
+        timeRange: {
+          start: kpiStartDate.toISOString(),
+          end: kpiEndDate.toISOString(),
+        },
+      };
+      
+      logAdminEvent("info", "admin_analytics_smoke_test", {
+        requestId: requestId,
+        ip: ip,
+        userEmail: userEmail,
+        clientId: selectedClientId,
+        smokeTestResult: smokeTestResult,
+        note: "Smoke test query completed (server-side diagnostic)",
+      });
+    } catch (smokeError) {
+      // Fail-safe: don't block analytics page if smoke test fails
+      logAdminEvent("warn", "admin_analytics_smoke_test_failed", {
+        requestId: requestId,
+        ip: ip,
+        userEmail: userEmail,
+        clientId: selectedClientId,
+        error: smokeError?.message || String(smokeError),
+        note: "Smoke test failed (non-blocking)",
+      });
+    }
     // Headline KPIs (using kpi date range)
     const [totalChats, botHandledPct, totalEscalations, moneySaved, avgResponseTimeData] = await Promise.all([
       executeQuery("total_chats_v1", selectedClientId, kpiStartDate, kpiEndDate).catch(() => ({ totalChats: 0 })),
