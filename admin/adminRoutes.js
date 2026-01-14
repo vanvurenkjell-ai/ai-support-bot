@@ -2618,7 +2618,8 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
     try {
       const { runQuery } = require("../lib/axiomClient");
       const dataset = process.env.AXIOM_DATASET || "advantum-prod-log";
-      const smokeTestQuery = `\`${dataset}\`
+      // APL query includes dataset using ['dataset-name'] syntax
+      const smokeTestQuery = `['${dataset}']
 | where event == "request_end"
 | where route == "/chat"
 | take 1`;
@@ -2634,7 +2635,8 @@ router.get("/analytics", requireAdminAuth, async (req, res) => {
       });
       
       // Smoke test 2: Without time window (diagnostic - to see if time filtering is the issue)
-      const smokeTestQueryNoTime = `\`${dataset}\`
+      // APL query includes dataset using ['dataset-name'] syntax
+      const smokeTestQueryNoTime = `['${dataset}']
 | where route == "/chat"
 | where event == "request_end"
 | take 1`;
@@ -2979,7 +2981,9 @@ router.get("/analytics/health", requireAdminAuth, requireCsrf, async (req, res) 
     const startDate = new Date();
     startDate.setDate(startDate.getDate() - 1);
 
-    const testQueryText = `\`advantum-prod-log\`
+    // APL query includes dataset using ['dataset-name'] syntax
+    const dataset = process.env.AXIOM_DATASET || "advantum-prod-log";
+    const testQueryText = `['${dataset}']
 | where event == "request_end"
 | where route == "/chat"
 | summarize totalChats = count()`;
@@ -2991,6 +2995,7 @@ router.get("/analytics/health", requireAdminAuth, requireCsrf, async (req, res) 
         start_time: startDate.toISOString(),
         end_time: endDate.toISOString(),
       },
+      dataset: dataset,
     });
 
     const result = {
